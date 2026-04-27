@@ -1,0 +1,858 @@
+use crate::ast::{Block, Document, Inline, ListItem, Row, ShortArgs};
+use crate::diag::{Code, Diagnostic};
+use crate::inline::{parse_args, parse_inline};
+use crate::span::{SourceMap, Span};
+use crate::token::{Token, TokenKind};
+
+pub fn parse(tokens: Vec<Token>, src: &SourceMap) -> (Document, Vec<Diagnostic>) {
+    let mut p = Parser {
+        _src: src,
+        toks: tokens,
+        pos: 0,
+        diags: Vec::new(),
+    };
+    let mut blocks = p.parse_blocks(0, None);
+    // Anything left after a top-level parse must be a stray `@end`.
+    while !p.at_eof() {
+        let span = p.peek().span;
+        match &p.peek().kind {
+            TokenKind::Eof => break,
+            TokenKind::Blank => {
+                p.pos += 1;
+            }
+            TokenKind::Line(s) if s.trim() == "@end" => {
+                p.diags.push(Diagnostic::new(Code::StrayEnd, span));
+                p.pos += 1;
+            }
+            _ => {
+                blocks.append(&mut p.parse_blocks(0, None));
+            }
+        }
+    }
+    (Document { blocks }, p.diags)
+}
+
+struct Parser<'a> {
+    _src: &'a SourceMap,
+    toks: Vec<Token>,
+    pos: usize,
+    diags: Vec<Diagnostic>,
+}
+
+impl<'a> Parser<'a> {
+    fn peek(&self) -> &Token {
+        &self.toks[self.pos]
+    }
+    fn at_eof(&self) -> bool {
+        matches!(self.peek().kind, TokenKind::Eof)
+    }
+
+    fn parse_blocks(&mut self, base_indent: u16, end_at_indent_below: Option<u16>) -> Vec<Block> {
+        let mut out = Vec::new();
+        loop {
+            if self.at_eof() {
+                break;
+            }
+            match &self.peek().kind {
+                TokenKind::Eof => break,
+                TokenKind::Blank => {
+                    self.pos += 1;
+                    continue;
+                }
+                TokenKind::Line(_) => {
+                    let indent = self.peek().indent;
+                    if indent < base_indent {
+                        break;
+                    }
+                    if let Some(min) = end_at_indent_below {
+                        if indent < min {
+                            break;
+                        }
+                    }
+                    let line = if let TokenKind::Line(s) = &self.peek().kind {
+                        s.clone()
+                    } else {
+                        unreachable!()
+                    };
+                    let trimmed = line[indent as usize..].to_string();
+
+                    // `@end` is always a terminator for the parent block-shortcode;
+                    // stop here so the caller can consume it. Stray @ends are
+                    // surfaced by the top-level driver in `parse()`.
+                    if trimmed.trim() == "@end" {
+                        break;
+                    }
+                    if trimmed.starts_with("//") {
+                        self.pos += 1;
+                        continue;
+                    }
+                    if trimmed.starts_with("/*") {
+                        self.consume_block_comment(&trimmed);
+                        continue;
+                    }
+                    if let Some(b) = self.try_block_at(&trimmed, indent) {
+                        out.push(b);
+                    } else {
+                        out.push(self.parse_paragraph(indent));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn try_block_at(&mut self, trimmed: &str, indent: u16) -> Option<Block> {
+        if trimmed.starts_with('#') {
+            return Some(self.parse_heading());
+        }
+        if trimmed == "---" {
+            return Some(self.parse_hr());
+        }
+        if trimmed.starts_with("```") {
+            return Some(self.parse_code_fence());
+        }
+        if trimmed.starts_with("- ") {
+            return Some(self.parse_unordered_list(indent));
+        }
+        if leading_ordered_marker(trimmed).is_some() {
+            return Some(self.parse_ordered_list(indent));
+        }
+        if trimmed.starts_with('>') {
+            return Some(self.parse_blockquote(indent));
+        }
+        if trimmed == "@t" || trimmed.starts_with("@t ") || trimmed.starts_with("@t(") {
+            return Some(self.parse_table(indent));
+        }
+        if trimmed.starts_with('@') {
+            return self.parse_block_shortcode_or_inline(indent);
+        }
+        if trimmed.starts_with('|') {
+            let span = self.peek().span;
+            self.diags.push(
+                Diagnostic::new(Code::StrayContent, span)
+                    .label("`|` only appears inside a `@t` table"),
+            );
+            self.pos += 1;
+            return Some(Block::Paragraph {
+                content: vec![],
+                span,
+            });
+        }
+        None
+    }
+
+    fn consume_block_comment(&mut self, trimmed: &str) {
+        if trimmed.ends_with("*/") && trimmed.len() >= 4 {
+            self.pos += 1;
+            return;
+        }
+        self.pos += 1;
+        loop {
+            match &self.peek().kind {
+                TokenKind::Eof => {
+                    self.diags.push(
+                        Diagnostic::new(Code::UnterminatedBlock, self.peek().span)
+                            .label("unterminated /* */ comment"),
+                    );
+                    return;
+                }
+                TokenKind::Blank => {
+                    self.pos += 1;
+                }
+                TokenKind::Line(s) => {
+                    let s = s.clone();
+                    self.pos += 1;
+                    if s.trim_end().ends_with("*/") {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_heading(&mut self) -> Block {
+        let tok = self.peek().clone();
+        let line = if let TokenKind::Line(ref s) = tok.kind {
+            s.clone()
+        } else {
+            unreachable!()
+        };
+        self.pos += 1;
+        let indent = tok.indent as usize;
+        let s = &line[indent..];
+        let mut level = 0u8;
+        let bytes = s.as_bytes();
+        while (level as usize) < bytes.len() && bytes[level as usize] == b'#' {
+            level += 1;
+            if level > 6 {
+                break;
+            }
+        }
+        let mut hash_count = level as usize;
+        while hash_count < bytes.len() && bytes[hash_count] == b'#' {
+            hash_count += 1;
+        }
+        if hash_count > 6 {
+            let span = Span::new(tok.span.start as usize + indent, hash_count);
+            self.diags.push(
+                Diagnostic::new(Code::HeadingTooDeep, span)
+                    .label("Brief supports heading levels 1-6 only"),
+            );
+            return Block::Paragraph {
+                content: vec![],
+                span: tok.span,
+            };
+        }
+        if bytes.get(level as usize) != Some(&b' ') {
+            self.diags.push(
+                Diagnostic::new(Code::HeadingNoSpace, tok.span)
+                    .help("write `# heading` with exactly one space after the `#`s"),
+            );
+            return Block::Paragraph {
+                content: vec![],
+                span: tok.span,
+            };
+        }
+        if bytes.get(level as usize + 1) == Some(&b' ') {
+            self.diags.push(
+                Diagnostic::new(Code::HeadingNoSpace, tok.span)
+                    .label("multiple spaces after heading marker"),
+            );
+        }
+        let text_offset = indent + level as usize + 1;
+        let text = &line[text_offset..];
+        let (content, idiags) = parse_inline(text, tok.span.start + text_offset as u32);
+        self.diags.extend(idiags);
+        Block::Heading {
+            level,
+            content,
+            span: tok.span,
+        }
+    }
+
+    fn parse_paragraph(&mut self, indent: u16) -> Block {
+        let first = self.peek().clone();
+        let mut span = first.span;
+        let mut text = String::new();
+        let mut hard_break_indices: Vec<usize> = Vec::new();
+        let mut first_line = true;
+        loop {
+            match &self.peek().kind {
+                TokenKind::Line(s) => {
+                    let tok_indent = self.peek().indent;
+                    if tok_indent != indent {
+                        break;
+                    }
+                    let trimmed = &s[indent as usize..];
+                    // The first paragraph line is always consumed: the dispatcher
+                    // already decided this isn't a block. Subsequent continuation
+                    // lines stop at any block-starting sigil.
+                    if !first_line && leading_block_sigil(trimmed) {
+                        break;
+                    }
+                    first_line = false;
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    let mut line_text = trimmed.to_string();
+                    let hard = line_text.ends_with('\\');
+                    if hard {
+                        line_text.pop();
+                        hard_break_indices.push(text.len() + line_text.len());
+                    }
+                    text.push_str(&line_text);
+                    span = span.join(self.peek().span);
+                    self.pos += 1;
+                }
+                _ => break,
+            }
+        }
+        let mut content: Vec<Inline> = Vec::new();
+        let mut cursor = 0usize;
+        let base = first.span.start + first.indent as u32;
+        for hb in &hard_break_indices {
+            let chunk = &text[cursor..*hb];
+            let (mut inl, d) = parse_inline(chunk, base + cursor as u32);
+            self.diags.extend(d);
+            content.append(&mut inl);
+            content.push(Inline::HardBreak {
+                span: Span::new(base as usize + *hb, 1),
+            });
+            cursor = *hb;
+        }
+        let chunk = &text[cursor..];
+        let (mut inl, d) = parse_inline(chunk, base + cursor as u32);
+        self.diags.extend(d);
+        content.append(&mut inl);
+        Block::Paragraph { content, span }
+    }
+
+    fn parse_hr(&mut self) -> Block {
+        let tok = self.peek().clone();
+        self.pos += 1;
+        Block::HorizontalRule { span: tok.span }
+    }
+
+    fn parse_code_fence(&mut self) -> Block {
+        let open = self.peek().clone();
+        let line = if let TokenKind::Line(ref s) = open.kind {
+            s.clone()
+        } else {
+            unreachable!()
+        };
+        self.pos += 1;
+        let indent = open.indent as usize;
+        let after = &line[indent + 3..];
+        if after.starts_with('`') {
+            self.diags.push(
+                Diagnostic::new(Code::UnterminatedFence, open.span)
+                    .label("opening fence must be exactly three backticks"),
+            );
+        }
+        let lang = if after.is_empty() {
+            None
+        } else {
+            Some(after.trim().to_string())
+        };
+        let mut body = String::new();
+        let mut span = open.span;
+        loop {
+            match &self.peek().kind {
+                TokenKind::Eof => {
+                    self.diags.push(
+                        Diagnostic::new(Code::UnterminatedFence, open.span)
+                            .label("fence opened here is never closed"),
+                    );
+                    break;
+                }
+                TokenKind::Blank => {
+                    body.push('\n');
+                    span = span.join(self.peek().span);
+                    self.pos += 1;
+                }
+                TokenKind::Line(s) => {
+                    if s.trim() == "```" {
+                        span = span.join(self.peek().span);
+                        self.pos += 1;
+                        break;
+                    }
+                    body.push_str(s);
+                    body.push('\n');
+                    span = span.join(self.peek().span);
+                    self.pos += 1;
+                }
+            }
+        }
+        if body.ends_with('\n') {
+            body.pop();
+        }
+        Block::CodeBlock { lang, body, span }
+    }
+
+    fn parse_unordered_list(&mut self, indent: u16) -> Block {
+        let start_span = self.peek().span;
+        let mut items: Vec<ListItem> = Vec::new();
+        loop {
+            if self.at_eof() {
+                break;
+            }
+            let tok = self.peek().clone();
+            let line = if let TokenKind::Line(ref s) = tok.kind {
+                s.clone()
+            } else {
+                break;
+            };
+            if tok.indent != indent {
+                break;
+            }
+            let trimmed = &line[indent as usize..];
+            if !trimmed.starts_with("- ") {
+                break;
+            }
+            let item_text = &trimmed[2..];
+            let (content, d) = parse_inline(item_text, tok.span.start + indent as u32 + 2);
+            self.diags.extend(d);
+            self.pos += 1;
+            let mut children: Vec<Block> = Vec::new();
+            self.skip_blanks();
+            if let TokenKind::Line(_) = &self.peek().kind {
+                if self.peek().indent >= indent + 2 {
+                    children = self.parse_blocks(indent + 2, Some(indent + 2));
+                }
+            }
+            items.push(ListItem {
+                content,
+                children,
+                span: tok.span,
+            });
+        }
+        let span = items.iter().fold(start_span, |a, it| a.join(it.span));
+        Block::List {
+            ordered: false,
+            items,
+            span,
+        }
+    }
+
+    fn parse_ordered_list(&mut self, indent: u16) -> Block {
+        let start_span = self.peek().span;
+        let mut items: Vec<ListItem> = Vec::new();
+        let mut expected: u32 = 1;
+        loop {
+            if self.at_eof() {
+                break;
+            }
+            let tok = self.peek().clone();
+            let line = if let TokenKind::Line(ref s) = tok.kind {
+                s.clone()
+            } else {
+                break;
+            };
+            if tok.indent != indent {
+                break;
+            }
+            let trimmed = &line[indent as usize..];
+            let Some((num, marker_len)) = leading_ordered_marker(trimmed) else {
+                break;
+            };
+            if num != expected {
+                let span = Span::new(tok.span.start as usize + indent as usize, marker_len);
+                self.diags.push(
+                    Diagnostic::new(Code::OrderedListSequence, span)
+                        .label(format!("got `{}.`, expected `{}.`", num, expected))
+                        .help("ordered lists must number sequentially starting from 1"),
+                );
+            }
+            expected = expected.saturating_add(1);
+            let item_text = &trimmed[marker_len..];
+            let (content, d) = parse_inline(
+                item_text,
+                tok.span.start + indent as u32 + marker_len as u32,
+            );
+            self.diags.extend(d);
+            self.pos += 1;
+            let mut children: Vec<Block> = Vec::new();
+            self.skip_blanks();
+            if let TokenKind::Line(_) = &self.peek().kind {
+                if self.peek().indent >= indent + 2 {
+                    children = self.parse_blocks(indent + 2, Some(indent + 2));
+                }
+            }
+            items.push(ListItem {
+                content,
+                children,
+                span: tok.span,
+            });
+        }
+        let span = items.iter().fold(start_span, |a, it| a.join(it.span));
+        Block::List {
+            ordered: true,
+            items,
+            span,
+        }
+    }
+
+    fn parse_blockquote(&mut self, indent: u16) -> Block {
+        let mut lines: Vec<(u8, String, Span)> = Vec::new();
+        let start = self.peek().span;
+        loop {
+            if self.at_eof() {
+                break;
+            }
+            let tok = self.peek().clone();
+            let line = if let TokenKind::Line(ref s) = tok.kind {
+                s.clone()
+            } else {
+                break;
+            };
+            if tok.indent != indent {
+                break;
+            }
+            let trimmed = &line[indent as usize..];
+            let mut depth: u8 = 0;
+            let mut idx = 0usize;
+            let bytes = trimmed.as_bytes();
+            while idx < bytes.len() && bytes[idx] == b'>' {
+                depth += 1;
+                idx += 1;
+            }
+            if depth == 0 {
+                break;
+            }
+            if bytes.get(idx) != Some(&b' ') {
+                self.diags.push(
+                    Diagnostic::new(Code::BadBlockquote, tok.span)
+                        .label("expected one space after `>`"),
+                );
+                self.pos += 1;
+                break;
+            }
+            let body = trimmed[idx + 1..].to_string();
+            lines.push((depth, body, tok.span));
+            self.pos += 1;
+        }
+        let (children, span) = build_blockquote(&lines, 1);
+        Block::Blockquote {
+            children,
+            span: if span == Span::DUMMY { start } else { span },
+        }
+    }
+
+    fn parse_table(&mut self, indent: u16) -> Block {
+        let directive = self.peek().clone();
+        let line = if let TokenKind::Line(ref s) = directive.kind {
+            s.clone()
+        } else {
+            unreachable!()
+        };
+        self.pos += 1;
+        let trimmed = &line[indent as usize..];
+        let mut cursor = 2usize;
+        let args = if trimmed.as_bytes().get(cursor) == Some(&b'(') {
+            match parse_args(trimmed, &mut cursor) {
+                Ok(a) => a,
+                Err(d) => {
+                    self.diags.push(d);
+                    ShortArgs::default()
+                }
+            }
+        } else {
+            ShortArgs::default()
+        };
+        let mut rows: Vec<Row> = Vec::new();
+        loop {
+            if self.at_eof() {
+                break;
+            }
+            let tok = self.peek().clone();
+            let row_line = if let TokenKind::Line(ref s) = tok.kind {
+                s.clone()
+            } else {
+                break;
+            };
+            let trimmed = row_line.trim_start();
+            if !trimmed.starts_with('|') {
+                break;
+            }
+            let cells = split_cells(trimmed);
+            let mut parsed_cells: Vec<Vec<Inline>> = Vec::new();
+            for c in cells {
+                let (inl, d) = parse_inline(c.trim(), tok.span.start);
+                self.diags.extend(d);
+                parsed_cells.push(inl);
+            }
+            rows.push(Row {
+                cells: parsed_cells,
+                span: tok.span,
+            });
+            self.pos += 1;
+        }
+        if rows.is_empty() {
+            self.diags.push(
+                Diagnostic::new(Code::StrayContent, directive.span)
+                    .label("`@t` must be followed by at least a header row"),
+            );
+            return Block::Paragraph {
+                content: vec![],
+                span: directive.span,
+            };
+        }
+        let header = rows.remove(0);
+        let cols = header.cells.len();
+        for r in &rows {
+            if r.cells.len() != cols {
+                self.diags.push(
+                    Diagnostic::new(Code::TableColumnMismatch, r.span).label(format!(
+                        "table row has {} cells, expected {}",
+                        r.cells.len(),
+                        cols
+                    )),
+                );
+            }
+        }
+        if let Some(crate::shortcode::ArgValue::Array(a)) = args.keyword.get("align") {
+            if a.len() != cols {
+                self.diags.push(
+                    Diagnostic::new(Code::AlignArrayLength, directive.span).label(format!(
+                        "`align` has {} entries but table has {} columns",
+                        a.len(),
+                        cols
+                    )),
+                );
+            }
+        }
+        let span = rows
+            .iter()
+            .fold(directive.span.join(header.span), |a, r| a.join(r.span));
+        Block::Table {
+            args,
+            header,
+            rows,
+            span,
+        }
+    }
+
+    fn parse_block_shortcode_or_inline(&mut self, indent: u16) -> Option<Block> {
+        let tok = self.peek().clone();
+        let line = if let TokenKind::Line(ref s) = tok.kind {
+            s.clone()
+        } else {
+            return None;
+        };
+        let trimmed = &line[indent as usize..];
+        let mut cursor = 1usize;
+        let bytes = trimmed.as_bytes();
+        if cursor >= bytes.len() || !bytes[cursor].is_ascii_alphabetic() {
+            return None;
+        }
+        let name_start = cursor;
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'-')
+        {
+            cursor += 1;
+        }
+        let name = trimmed[name_start..cursor].to_string();
+        let mut args = ShortArgs::default();
+        if bytes.get(cursor) == Some(&b'(') {
+            match parse_args(trimmed, &mut cursor) {
+                Ok(a) => args = a,
+                Err(d) => self.diags.push(d),
+            }
+        }
+        if !trimmed[cursor..].trim().is_empty() {
+            return None;
+        }
+        self.pos += 1;
+        let children = self.parse_blocks(indent, Some(indent));
+        let mut end_span = tok.span;
+        match &self.peek().kind {
+            TokenKind::Line(s) if s.trim() == "@end" && self.peek().indent == indent => {
+                end_span = self.peek().span;
+                self.pos += 1;
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::new(Code::UnterminatedBlock, tok.span)
+                        .label(format!("`@{}` block was never closed with `@end`", name)),
+                );
+            }
+        }
+        Some(Block::BlockShortcode {
+            name,
+            args,
+            children,
+            span: tok.span.join(end_span),
+        })
+    }
+
+    fn skip_blanks(&mut self) {
+        while matches!(self.peek().kind, TokenKind::Blank) {
+            self.pos += 1;
+        }
+    }
+}
+
+fn build_blockquote(items: &[(u8, String, Span)], depth: u8) -> (Vec<Block>, Span) {
+    let mut paras: Vec<Block> = Vec::new();
+    let mut full_span = Span::DUMMY;
+    let mut i = 0;
+    while i < items.len() {
+        let (d, body, span) = &items[i];
+        if *d < depth {
+            break;
+        }
+        full_span = if full_span == Span::DUMMY {
+            *span
+        } else {
+            full_span.join(*span)
+        };
+        if *d == depth {
+            let (content, _) = parse_inline(body, span.start);
+            paras.push(Block::Paragraph {
+                content,
+                span: *span,
+            });
+            i += 1;
+        } else {
+            let mut j = i;
+            while j < items.len() && items[j].0 > depth {
+                j += 1;
+            }
+            let (children, child_span) = build_blockquote(&items[i..j], depth + 1);
+            paras.push(Block::Blockquote {
+                children,
+                span: child_span,
+            });
+            i = j;
+        }
+    }
+    (paras, full_span)
+}
+
+fn leading_block_sigil(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let b = s.as_bytes()[0];
+    if b == b'#' || b == b'>' || b == b'|' || b == b'`' {
+        return true;
+    }
+    if s == "---" {
+        return true;
+    }
+    if s.starts_with("- ") {
+        return true;
+    }
+    if leading_ordered_marker(s).is_some() {
+        return true;
+    }
+    if s.starts_with("//") || s.starts_with("/*") {
+        return true;
+    }
+    if s == "@end" || s.starts_with("@end ") {
+        return true;
+    }
+    if b == b'@' {
+        // a leading directive starts a block; non-directive @ inside text wouldn't appear at line start
+        return true;
+    }
+    false
+}
+
+fn leading_ordered_marker(s: &str) -> Option<(u32, usize)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    if bytes.get(i) != Some(&b'.') {
+        return None;
+    }
+    if bytes.get(i + 1) != Some(&b' ') {
+        return None;
+    }
+    let n: u32 = s[..i].parse().ok()?;
+    Some((n, i + 2))
+}
+
+fn split_cells(line: &str) -> Vec<&str> {
+    let trimmed = line.trim_end_matches('|');
+    let body = if trimmed.starts_with('|') {
+        &trimmed[1..]
+    } else {
+        trimmed
+    };
+    body.split('|').map(|s| s.trim()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::lex;
+
+    fn p(s: &str) -> (Document, Vec<Diagnostic>) {
+        let src = SourceMap::new("d.brf", s);
+        let toks = lex(&src).unwrap();
+        parse(toks, &src)
+    }
+
+    #[test]
+    fn heading_levels() {
+        let (doc, d) = p("# A\n## B\n");
+        assert!(d.is_empty(), "{:?}", d);
+        assert_eq!(doc.blocks.len(), 2);
+        if let Block::Heading { level, .. } = doc.blocks[0] {
+            assert_eq!(level, 1);
+        }
+        if let Block::Heading { level, .. } = doc.blocks[1] {
+            assert_eq!(level, 2);
+        }
+    }
+
+    #[test]
+    fn heading_too_deep() {
+        let (_, d) = p("####### x\n");
+        assert!(d.iter().any(|x| x.code == Code::HeadingTooDeep));
+    }
+
+    #[test]
+    fn ordered_sequence() {
+        let (_, d) = p("1. one\n3. three\n");
+        assert!(d.iter().any(|x| x.code == Code::OrderedListSequence));
+    }
+
+    #[test]
+    fn ordered_ok() {
+        let (doc, d) = p("1. one\n2. two\n");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(matches!(doc.blocks[0], Block::List { ordered: true, .. }));
+    }
+
+    #[test]
+    fn unordered_nested() {
+        let (doc, d) = p("- a\n  - a1\n- b\n");
+        assert!(d.is_empty(), "{:?}", d);
+        if let Block::List { items, .. } = &doc.blocks[0] {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].children.len(), 1);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn paragraph_join() {
+        let (doc, d) = p("one\ntwo\n");
+        assert!(d.is_empty());
+        if let Block::Paragraph { content, .. } = &doc.blocks[0] {
+            if let Inline::Text { value, .. } = &content[0] {
+                assert_eq!(value, "one two");
+            }
+        }
+    }
+
+    #[test]
+    fn code_block() {
+        let (doc, d) = p("```rust\nfn x() {}\n```\n");
+        assert!(d.is_empty(), "{:?}", d);
+        if let Block::CodeBlock { lang, body, .. } = &doc.blocks[0] {
+            assert_eq!(lang.as_deref(), Some("rust"));
+            assert_eq!(body, "fn x() {}");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn table_basic() {
+        let (doc, d) = p("@t\n| A | B\n| 1 | 2\n");
+        assert!(d.is_empty(), "{:?}", d);
+        if let Block::Table { rows, .. } = &doc.blocks[0] {
+            assert_eq!(rows.len(), 1);
+        } else {
+            panic!("{:?}", doc.blocks);
+        }
+    }
+
+    #[test]
+    fn table_column_mismatch() {
+        let (_, d) = p("@t\n| A | B | C\n| 1 | 2\n");
+        assert!(d.iter().any(|x| x.code == Code::TableColumnMismatch));
+    }
+
+    #[test]
+    fn block_shortcode() {
+        let (doc, d) = p("@callout(kind: warning)\nbody\n@end\n");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(matches!(doc.blocks[0], Block::BlockShortcode { .. }));
+    }
+
+    #[test]
+    fn hr() {
+        let (doc, _) = p("---\n");
+        assert!(matches!(doc.blocks[0], Block::HorizontalRule { .. }));
+    }
+}

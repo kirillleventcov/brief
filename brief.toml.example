@@ -1,0 +1,11 @@
+[project]
+name = "example"
+version = "0.1.0"
+
+[compile]
+strict_heading_levels = true
+default_target = "html"
+
+[shortcodes.note]
+kind = "block"
+template_html = "<aside>{{content}}</aside>"

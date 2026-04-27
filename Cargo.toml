@@ -1,0 +1,21 @@
+[package]
+name = "brief"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[lib]
+name = "brief"
+path = "src/lib.rs"
+
+[[bin]]
+name = "brief"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
