@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod config;
+pub mod convert;
 pub mod diag;
 pub mod emit;
 pub mod inline;

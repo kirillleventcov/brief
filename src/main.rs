@@ -38,6 +38,19 @@ enum Cmd {
     Explain {
         code: String,
     },
+    Convert {
+        /// One or more Markdown input files.
+        inputs: Vec<PathBuf>,
+        /// Override output path. Single-input only.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Write Brief to stdout instead of a file. Single-input only.
+        #[arg(long)]
+        stdout: bool,
+        /// Overwrite existing destination files.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -61,6 +74,12 @@ fn main() -> ExitCode {
             keep_asset_urls,
         ),
         Cmd::Explain { code } => run_explain(&code),
+        Cmd::Convert {
+            inputs,
+            output,
+            stdout,
+            force,
+        } => run_convert(inputs, output, stdout, force),
     }
 }
 
@@ -198,4 +217,135 @@ fn run_explain(code: &str) -> ExitCode {
     }
     eprintln!("brief: unknown error code `{}`", code);
     ExitCode::from(2)
+}
+
+fn run_convert(
+    inputs: Vec<PathBuf>,
+    output: Option<PathBuf>,
+    use_stdout: bool,
+    force: bool,
+) -> ExitCode {
+    if inputs.is_empty() {
+        eprintln!("brief: convert requires at least one input file");
+        return ExitCode::from(2);
+    }
+    if inputs.len() > 1 && output.is_some() {
+        eprintln!("brief: -o cannot be used with multiple inputs");
+        return ExitCode::from(2);
+    }
+    if inputs.len() > 1 && use_stdout {
+        eprintln!("brief: --stdout cannot be used with multiple inputs");
+        return ExitCode::from(2);
+    }
+    if use_stdout && output.is_some() {
+        eprintln!("brief: --stdout and -o are mutually exclusive");
+        return ExitCode::from(2);
+    }
+
+    let mut failed: usize = 0;
+    let mut total_holes: usize = 0;
+    let multi = inputs.len() > 1;
+
+    for input in &inputs {
+        let src = match std::fs::read_to_string(input) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "brief: {} → FAILED: cannot read input: {}",
+                    input.display(),
+                    e
+                );
+                failed += 1;
+                continue;
+            }
+        };
+        let result = brief::convert::convert(&src, &input.to_string_lossy());
+
+        let dest = if use_stdout {
+            None
+        } else if let Some(o) = &output {
+            Some(o.clone())
+        } else {
+            Some(default_output_path(input))
+        };
+
+        match dest {
+            None => {
+                print!("{}", result.brief_source);
+            }
+            Some(path) => {
+                if path.exists() && !force {
+                    eprintln!(
+                        "brief: {} → FAILED: output {} exists (use --force to overwrite)",
+                        input.display(),
+                        path.display()
+                    );
+                    failed += 1;
+                    continue;
+                }
+                if let Err(e) = std::fs::write(&path, &result.brief_source) {
+                    eprintln!(
+                        "brief: {} → FAILED: cannot write {}: {}",
+                        input.display(),
+                        path.display(),
+                        e
+                    );
+                    failed += 1;
+                    continue;
+                }
+                let n = result.diagnostics.len();
+                if n == 0 {
+                    eprintln!("brief: {} → {} (clean)", input.display(), path.display());
+                } else {
+                    eprintln!(
+                        "brief: {} → {} ({} hole{})",
+                        input.display(),
+                        path.display(),
+                        n,
+                        if n == 1 { "" } else { "s" }
+                    );
+                }
+            }
+        }
+
+        for d in &result.diagnostics {
+            eprintln!(
+                "  note[{}]: {}:{}:{}: {}",
+                d.hole.slug(),
+                input.display(),
+                d.line,
+                d.col,
+                d.note
+            );
+        }
+        total_holes += result.diagnostics.len();
+    }
+
+    if multi {
+        eprintln!(
+            "brief: {} of {} files converted, {} hole{} flagged total",
+            inputs.len() - failed,
+            inputs.len(),
+            total_holes,
+            if total_holes == 1 { "" } else { "s" }
+        );
+    }
+
+    if failed > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn default_output_path(input: &std::path::Path) -> PathBuf {
+    if input.extension().and_then(|s| s.to_str()) == Some("md") {
+        input.with_extension("brf")
+    } else {
+        let mut p = input.to_path_buf();
+        let mut name = p.file_name().unwrap_or_default().to_os_string();
+        name.push(".brf");
+        p.set_file_name(name);
+        p
+    }
 }

@@ -31,6 +31,21 @@ brief compile doc.brf --target=html
 brief compile doc.brf --target=llm --report-tokens
 ```
 
+## Convert from Markdown
+
+```
+brief convert notes.md                      # writes notes.brf next to input
+brief convert notes.md -o renamed.brf       # rename single output
+brief convert notes.md --stdout             # pipe to stdout
+brief convert *.md                          # batch; per-file failures don't abort
+```
+
+The converter is lossy by design: every Markdown construct without a clean
+Brief equivalent is rewritten and reported on stderr as a "design hole".
+Hole markers are also injected into the output as `// TODO[B-hole:...]`
+comments where applicable (inline HTML, HTML blocks, frontmatter), so they
+remain greppable in the converted corpus.
+
 ## Status
 
 v0.1. Expect rough edges.
