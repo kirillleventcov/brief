@@ -39,7 +39,6 @@ pub enum Hole {
     HtmlBlock,
     Frontmatter,
     HtmlEntity,
-    FootnoteInlined,
 }
 
 impl Hole {
@@ -64,7 +63,6 @@ impl Hole {
             Hole::HtmlBlock => "html-block",
             Hole::Frontmatter => "frontmatter",
             Hole::HtmlEntity => "html-entity",
-            Hole::FootnoteInlined => "footnote-inlined",
         }
     }
 
@@ -89,7 +87,6 @@ impl Hole {
             Hole::HtmlBlock => "HTML block preserved inside Brief block comment",
             Hole::Frontmatter => "frontmatter dropped, replaced with TODO comment",
             Hole::HtmlEntity => "HTML entity decoded to literal character",
-            Hole::FootnoteInlined => "footnote definition inlined at reference site",
         }
     }
 }
@@ -113,44 +110,54 @@ pub fn convert(input: &str, source_path: &str) -> ConvertResult {
     let events: Vec<(Event<'_>, std::ops::Range<usize>)> =
         Parser::new_ext(input, opts).into_offset_iter().collect();
 
-    // Pass 1: collect footnote definitions. The body is the rendered text
-    // between Start(FootnoteDefinition(label)) and End(FootnoteDefinition).
+    // Pass 1: render each footnote definition's body to Brief using a fresh
+    // sub-Walker so inline formatting (emphasis, links, code, ...) inside the
+    // body is preserved. Markdown footnote definitions live elsewhere in the
+    // source; Brief's `@footnote[body]` is inline at the reference site, so
+    // we must have the rendered body ready before pass 2 visits the
+    // FootnoteReference event.
     let mut footnote_defs: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    let mut current_label: Option<String> = None;
-    let mut current_body = String::new();
-    for (event, _) in &events {
-        match event {
-            Event::Start(Tag::FootnoteDefinition(label)) => {
-                current_label = Some(label.to_string());
-                current_body.clear();
-            }
-            Event::End(TagEnd::FootnoteDefinition) => {
-                if let Some(label) = current_label.take() {
-                    footnote_defs.insert(label, current_body.trim().to_string());
-                    current_body.clear();
+    let mut footnote_diags: Vec<Diag> = Vec::new();
+    {
+        let mut current_label: Option<String> = None;
+        let mut current_events: Vec<(Event<'_>, std::ops::Range<usize>)> = Vec::new();
+        for (event, range) in &events {
+            match event {
+                Event::Start(Tag::FootnoteDefinition(label)) => {
+                    current_label = Some(label.to_string());
+                    current_events.clear();
+                }
+                Event::End(TagEnd::FootnoteDefinition) => {
+                    if let Some(label) = current_label.take() {
+                        let mut sub = Walker::new(input, source_path, line_offsets.clone());
+                        for (e, r) in current_events.drain(..) {
+                            sub.visit(e, r);
+                        }
+                        let body = sub.out.trim().to_string();
+                        footnote_diags.append(&mut sub.diags);
+                        footnote_defs.insert(label, body);
+                    }
+                }
+                _ => {
+                    if current_label.is_some() {
+                        current_events.push((event.clone(), range.clone()));
+                    }
                 }
             }
-            Event::Text(t) if current_label.is_some() => {
-                current_body.push_str(t);
-            }
-            _ => {}
         }
     }
 
-    // Pass 2: render.
+    // Pass 2: render the main document, skipping footnote definitions —
+    // their bodies are now inlined at the FootnoteReference site.
     let mut walker = Walker::new(input, source_path, line_offsets);
     walker.footnote_defs = footnote_defs;
+    walker.diags.extend(footnote_diags);
     let mut skip_until_footnote_end = false;
     for (event, range) in events {
         match (&event, skip_until_footnote_end) {
             (Event::Start(Tag::FootnoteDefinition(_)), _) => {
                 skip_until_footnote_end = true;
-                walker.push_diag(
-                    Hole::FootnoteInlined,
-                    range.clone(),
-                    "footnote definition inlined at reference site".into(),
-                );
                 continue;
             }
             (Event::End(TagEnd::FootnoteDefinition), _) => {

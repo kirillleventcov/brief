@@ -346,7 +346,44 @@ fn footnote_inlined() {
     let md = "claim[^1] here\n\n[^1]: source: Smith 2025\n";
     let (out, holes) = run(md);
     assert_eq!(out, "claim@footnote[source: Smith 2025] here\n");
-    assert_eq!(holes, vec![Hole::FootnoteInlined]);
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn footnote_body_preserves_emphasis() {
+    let md = "claim[^1].\n\n[^1]: see _ibid._, p. 5\n";
+    let (out, holes) = run(md);
+    assert_eq!(out, "claim@footnote[see _ibid._, p. 5].\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn footnote_body_preserves_link() {
+    let md = "claim[^1].\n\n[^1]: see [docs](https://example.com)\n";
+    let (out, holes) = run(md);
+    assert_eq!(
+        out,
+        "claim@footnote[see @link[docs](https://example.com)].\n"
+    );
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn footnote_body_preserves_code_span() {
+    let md = "claim[^1].\n\n[^1]: run `cargo build`\n";
+    let (out, holes) = run(md);
+    assert_eq!(out, "claim@footnote[run `cargo build`].\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn footnote_body_emphasis_diagnostics_propagate() {
+    // Markdown `**bold**` inside a footnote body must still raise the
+    // DoubleEmphasis diagnostic — the sub-walker's diags are merged.
+    let md = "claim[^1].\n\n[^1]: see **bold** text\n";
+    let (out, holes) = run(md);
+    assert_eq!(out, "claim@footnote[see *bold* text].\n");
+    assert_eq!(holes, vec![Hole::DoubleEmphasis]);
 }
 
 #[test]
