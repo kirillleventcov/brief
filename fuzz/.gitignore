@@ -1,0 +1,6 @@
+target
+artifacts
+coverage
+# corpus/ is intentionally tracked — seed inputs live there.
+# libfuzzer also writes mutated inputs into corpus/<target>/, ignore those.
+corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*

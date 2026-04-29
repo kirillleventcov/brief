@@ -30,9 +30,6 @@ impl<'a> Parser<'a> {
     fn peek(&self) -> Option<u8> {
         self.src.as_bytes().get(self.pos).copied()
     }
-    fn peek_at(&self, n: usize) -> Option<u8> {
-        self.src.as_bytes().get(self.pos + n).copied()
-    }
 
     fn parse_until(&mut self, terminator: Option<u8>) -> Vec<Inline> {
         let mut out: Vec<Inline> = Vec::new();
@@ -45,13 +42,14 @@ impl<'a> Parser<'a> {
             match c {
                 b'\\' => {
                     self.flush_text(&mut out, text_start);
-                    if let Some(esc) = self.peek_at(1) {
-                        let s = self.span(self.pos, 2);
+                    if let Some(esc_char) = self.src[self.pos + 1..].chars().next() {
+                        let w = esc_char.len_utf8();
+                        let s = self.span(self.pos, 1 + w);
                         out.push(Inline::Text {
-                            value: (esc as char).to_string(),
+                            value: esc_char.to_string(),
                             span: s,
                         });
-                        self.pos += 2;
+                        self.pos += 1 + w;
                     } else {
                         self.pos += 1;
                     }
@@ -79,7 +77,14 @@ impl<'a> Parser<'a> {
                     text_start = self.pos;
                 }
                 _ => {
-                    self.pos += 1;
+                    // Advance by full UTF-8 char width so `pos` stays on
+                    // a char boundary; otherwise a later sigil would slice
+                    // through a multibyte sequence.
+                    let w = self.src[self.pos..]
+                        .chars()
+                        .next()
+                        .map_or(1, |c| c.len_utf8());
+                    self.pos += w;
                 }
             }
         }
@@ -180,12 +185,13 @@ impl<'a> Parser<'a> {
                             span: self.span(text_start, self.pos - text_start),
                         });
                     }
-                    if let Some(esc) = self.peek_at(1) {
+                    if let Some(esc_char) = self.src[self.pos + 1..].chars().next() {
+                        let w = esc_char.len_utf8();
                         content.push(Inline::Text {
-                            value: (esc as char).to_string(),
-                            span: self.span(self.pos, 2),
+                            value: esc_char.to_string(),
+                            span: self.span(self.pos, 1 + w),
                         });
-                        self.pos += 2;
+                        self.pos += 1 + w;
                     } else {
                         self.pos += 1;
                     }
@@ -228,7 +234,11 @@ impl<'a> Parser<'a> {
                     text_start = self.pos;
                 }
                 _ => {
-                    self.pos += 1;
+                    let w = self.src[self.pos..]
+                        .chars()
+                        .next()
+                        .map_or(1, |c| c.len_utf8());
+                    self.pos += w;
                 }
             }
         }
@@ -469,20 +479,28 @@ fn read_value(src: &str, cursor: &mut usize) -> Option<ArgValue> {
         b'"' => {
             *cursor += 1;
             let mut s = String::new();
-            while let Some(&b) = bytes.get(*cursor) {
+            while *cursor < bytes.len() {
+                let b = bytes[*cursor];
                 if b == b'"' {
                     *cursor += 1;
                     return Some(ArgValue::Str(s));
                 }
                 if b == b'\\' {
-                    if let Some(&e) = bytes.get(*cursor + 1) {
-                        s.push(e as char);
-                        *cursor += 2;
+                    if let Some(c) = src[*cursor + 1..].chars().next() {
+                        s.push(c);
+                        *cursor += 1 + c.len_utf8();
                         continue;
                     }
+                    // dangling backslash at EOF: treat as literal
+                    s.push('\\');
+                    *cursor += 1;
+                    continue;
                 }
-                s.push(b as char);
-                *cursor += 1;
+                // Take one full char so cursor stays UTF-8 aligned and the
+                // produced string preserves multibyte content correctly.
+                let c = src[*cursor..].chars().next().expect("cursor < len");
+                s.push(c);
+                *cursor += c.len_utf8();
             }
             None
         }
@@ -622,5 +640,54 @@ mod tests {
     fn double_marker_not_emphasis() {
         let (n, _d) = parse("**no**");
         assert!(!matches!(n[0], Inline::Bold { .. }));
+    }
+
+    #[test]
+    fn escape_before_multibyte_char() {
+        // Regression: escaping `\é` used to advance two bytes past `\` and
+        // land mid-codepoint, panicking the next slice. The escape must
+        // consume the full UTF-8 char.
+        let (n, d) = parse("a \\é b");
+        assert!(d.is_empty(), "{:?}", d);
+        let joined: String = n
+            .iter()
+            .filter_map(|x| {
+                if let Inline::Text { value, .. } = x {
+                    Some(value.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(joined, "a é b");
+    }
+
+    #[test]
+    fn multibyte_text_then_emph() {
+        // Regression: the byte-walking text scanner must land on a char
+        // boundary before any sigil, even when text is multibyte.
+        let (n, d) = parse("日本 *bold*");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(matches!(n.last().unwrap(), Inline::Bold { .. }));
+    }
+
+    #[test]
+    fn arg_string_preserves_multibyte() {
+        // Regression: read_value used to push raw bytes as Latin-1 chars,
+        // corrupting multibyte content inside a string argument.
+        let mut cursor = 0usize;
+        let s = "(label: \"日本 🦀\")";
+        let args = parse_args(s, &mut cursor).unwrap();
+        if let ArgValue::Str(v) = args.keyword.get("label").unwrap() {
+            assert_eq!(v, "日本 🦀");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn escape_at_end_of_input() {
+        // A trailing `\\` with nothing to escape must not panic.
+        let (_, _d) = parse("trailing\\");
     }
 }

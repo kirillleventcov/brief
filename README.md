@@ -46,6 +46,15 @@ Hole markers are also injected into the output as `// TODO[B-hole:...]`
 comments where applicable (inline HTML, HTML blocks, frontmatter), so they
 remain greppable in the converted corpus.
 
+## Fuzzing
+
+The parser is fuzzed with [cargo-fuzz][]. Four targets cover the lex/parse
+pipeline, the inline parser, the shortcode argument grammar, and the
+markdown→brief converter (round-trip). See [`fuzz/README.md`](./fuzz/README.md)
+for setup and run instructions.
+
+[cargo-fuzz]: https://rust-fuzz.github.io/book/cargo-fuzz.html
+
 ## Status
 
 v0.1. Expect rough edges.

@@ -1,0 +1,42 @@
+[package]
+name = "brief-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.brief]
+path = ".."
+
+[[bin]]
+name = "parse_full"
+path = "fuzz_targets/parse_full.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_inline"
+path = "fuzz_targets/parse_inline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_args"
+path = "fuzz_targets/parse_args.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "convert_md"
+path = "fuzz_targets/convert_md.rs"
+test = false
+doc = false
+bench = false

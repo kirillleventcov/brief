@@ -1,0 +1,379 @@
+# Learn Brief in Y Minutes
+
+Brief is a strict markup language designed to replace Markdown for documents
+written by humans and consumed by humans *and* LLMs. It has three goals:
+
+1. *One way to do it.* Every construct has a single canonical spelling.
+   Ambiguous input is a compile error, not a guess.
+2. *Token economy.* The source and the rendered LLM output are designed
+   to be cheaper than equivalent Markdown.
+3. *Real compiler.* Errors come with source spans, error codes, and help
+   text, like `rustc`. There are no warnings — just success or failure.
+
+There is no inline HTML. The single extension point is *shortcodes*.
+
+The whole language fits in one file. Read it top to bottom.
+
+## 1. Comments
+
+Line comments start with `//` and must occupy the whole line. They are
+stripped before any output.
+
+Block comments use C-style `/* */` delimiters. They cannot nest, and the
+opening `/*` and closing `*/` must each appear at the start or end of a
+line — never in the middle of text.
+
+## 2. Headings
+
+Brief supports six levels of headings, written with `#` through `######`,
+followed by exactly one space and the heading text.
+
+```brief
+# Heading level 1
+## Heading level 2
+### Heading level 3
+#### Heading level 4
+##### Heading level 5
+###### Heading level 6
+```
+
+Seven or more `#` is an error: B0301 "heading level exceeds maximum of
+6". Setext headings (`===` / `---` underlines) do NOT exist. Two spaces,
+zero spaces, or no text after the `#` run are all errors.
+
+## 3. Paragraphs and line breaks
+
+Multiple consecutive non-blank lines that don't begin with a block sigil
+get joined with a single space when rendered. A blank line separates
+paragraphs. A trailing backslash at the end of a line is the hard-break
+marker — it forces a line break inside a single paragraph.
+
+```brief
+This is one paragraph
+that spans two lines.
+
+This is the next paragraph.\
+And this line breaks within it.
+```
+
+## 4. Inline emphasis
+
+Each kind of emphasis uses a SINGLE-character marker on each side:
+
+- `*bold*` renders as strong
+- `_italic_` renders as em
+- `+underline+` renders as underline
+- `~strike~` renders as strikethrough
+
+Doubled markers (`**bold**`, `__italic__`) are NOT valid. Brief refuses
+them rather than treating them as a different style — this is the entire
+point.
+
+```brief
+A line with *bold*, _italic_, +underline+, and ~strikethrough~ words.
+
+*bold with _italic inside_ and back to bold*
+```
+
+Emphasis kinds nest freely with each other, but the SAME kind cannot
+nest (that would be B0204). Multi-line emphasis is also an error
+(B0205).
+
+A marker flanked by alphanumerics on both sides is treated as a literal
+character, not as emphasis:
+
+```brief
+snake_case_name              // literal — no italic
+file_with_underscores.txt    // literal
+3*4 = 12                     // literal asterisks
+```
+
+To force a marker to be literal in a position where it would otherwise
+be emphasis, escape it with `\`:
+
+```brief
+This costs \*5\* dollars.
+```
+
+## 5. Inline code
+
+Use the `printf` function. To include a literal backtick inside inline
+code, switch to the double-backtick form. This is the ONLY exception in
+the whole language to the "one canonical form" rule, and it exists
+because you cannot escape inside a verbatim region.
+
+```brief
+Run ``echo `whoami` `` to print the user.
+```
+
+## 6. Lists
+
+Two kinds — unordered and ordered — and they do NOT mix at the same
+level. Switching between them ends the previous list.
+
+The unordered marker is `-` followed by exactly one space. `*` and `+`
+are NOT valid unordered markers.
+
+```brief
+- first item
+- second item
+- third item
+```
+
+The ordered marker is digits, then `.`, then exactly one space.
+Numbering MUST be sequential starting from 1. Out-of-order is an error
+(B0501) — the renderer does not silently renumber for you.
+
+```brief
+1. step one
+2. step two
+3. step three
+```
+
+Nested lists use exactly TWO spaces of indentation per level. One space,
+three spaces, or tabs are all errors.
+
+```brief
+- top level
+  - nested
+    - deeper still
+  - back to nested
+- another top
+```
+
+You can mix list types between levels:
+
+```brief
+1. ordered top
+  - bullet inside
+  - another bullet
+2. ordered top again
+```
+
+A list item can have continuation lines, indented to match the content
+column (the marker plus its space):
+
+```brief
+- this item has
+  a continuation line
+- next item
+```
+
+## 7. Blockquotes
+
+A blockquote starts with `>` followed by exactly one space. Subsequent
+lines beginning the same way continue it. Nested blockquotes use
+additional `>` markers. A blank line ends the blockquote.
+
+```brief
+> An outer quote.
+>> A nested quote.
+> Back to the outer.
+```
+
+## 8. Code blocks
+
+Triple-backtick fences only. Tilde fences (`~~~`) and four-space-indent
+code blocks are NOT supported. The opening fence may include a language
+tag. Content between the fences is verbatim — no escaping, no inline
+parsing. Unterminated fences are an error (B0305) at end of file.
+
+For example, here is a real fenced Rust block:
+
+```rust
+fn main() {
+    println!("hi");
+}
+```
+
+## 9. Horizontal rule
+
+Exactly three dashes, on a line by themselves. Two or four dashes are
+errors.
+
+---
+
+## 10. Tables
+
+Tables are introduced by the `@t` directive. The first `|`-row is the
+header. There is NO separator row.
+
+@t
+| Name | Age | City
+| John | 30 | NYC
+| Jane | 25 | LA
+
+The trailing `|` is optional. Cells are trimmed of leading and trailing
+whitespace. Every row must have the same number of cells as the header
+— mismatches are an error (B0502).
+
+Column alignment is set on the directive:
+
+@t(align: [left, right, center])
+| Name | Score | Status
+| Ada | 1024 | active
+| Bob | 42 | idle
+
+Alignment array length must match the column count (B0504).
+
+## 11. Shortcodes — the single extension point
+
+Shortcodes are how Brief replaces inline HTML. Two forms exist: an
+inline form `@name(args)[content]` and a block form that opens with
+`@name(args)`, has a body, and closes with `@end`.
+
+Arguments inside `(...)` are positional or keyword (mixed allowed,
+positionals first). Argument values are bare idents, integers,
+double-quoted strings, or arrays. The `[content]` of an inline
+shortcode is parsed as inline. Block bodies are parsed as full blocks
+(recursively). All shortcodes must be REGISTERED — using an unknown
+one is an error (B0401).
+
+Built-in shortcodes that ship with the reference compiler:
+
+@t
+| Name | Form | Purpose
+| link | inline | hyperlink
+| image | inline | image
+| kbd | inline | keyboard input
+| t | block | tables (special-cased)
+| code | block | same as triple-backtick fence
+| callout | block | boxed note
+| math | both | LaTeX math, inline or block
+| footnote | inline | footnote text
+
+An inline link — note the markdown-style `[text](url)` sugar that
+supplies the URL as positional arg #1:
+
+See @link[the spec](https://example.com/brief) for details.
+
+An image with required keyword args (inline, embedded in a paragraph):
+
+The architecture is shown here: @image(src: "diagram.png", alt: "architecture diagram")[].
+
+Keyboard input: press @kbd[Ctrl+C] to abort.
+
+Inline math: the energy is @math[E = m c^2].
+
+A footnote: this claim is contested.@footnote[See Smith, 2025.]
+
+A block callout — the `kind` argument is constrained to one of `info`,
+`warning`, or `danger`; anything else is B0404 BadEnumValue.
+
+@callout(kind: warning)
+Watch out for the @kbd[Shift+Delete] shortcut on Linux.
+It can wipe data without going through the trash.
+@end
+
+Custom shortcodes are registered in `brief.toml` (see §13).
+User-defined shortcodes can NEVER be self-terminating — only `@t` and
+the triple-backtick fence are allowed that special form.
+
+## 12. Escapes
+
+`\` escapes the next character, treating it as a literal. `\\` produces
+a literal backslash. Escapes are honored everywhere EXCEPT inside code
+spans and code blocks, which are verbatim by definition.
+
+```brief
+\*not bold\* \[not a bracket\] \\\\backslash
+```
+
+## 13. Compiling
+
+```
+brief compile doc.brf --target=html
+brief compile doc.brf --target=llm --report-tokens
+brief compile doc.brf --target=json
+```
+
+The `--target=llm` mode produces a deterministic, token-minimized
+rendering for inclusion in LLM prompts. Comments are stripped, blank
+lines are collapsed, indentation drops to one space per level, emphasis
+markers are preserved (use `--strip-emphasis` to drop them), and
+shortcodes render to compact forms:
+
+- `@link[text](url)` becomes `[text](url)`
+- `@image(src, alt)` becomes `[image: alt]` (`--keep-asset-urls` preserves the URL)
+- `@callout(kind: warning) ...` becomes `[!warning] ... [/!]`
+- `@math[x^2]` becomes `$x^2$`
+
+`--report-tokens` prints a stderr line with a cl100k character/token
+estimate. The estimate is best-effort and not normative.
+
+## 14. Configuration: brief.toml
+
+At the project root, place a `brief.toml`. It declares custom
+shortcodes, enables strictness flags, and points to templates.
+
+```toml
+[project]
+name = "my-docs"
+version = "0.1.0"
+
+[compile]
+strict_heading_levels = true
+default_target = "html"
+
+[shortcodes.note]
+kind = "block"
+template_html = "<aside class=\"note\">{{content}}</aside>"
+template_llm = "[note] {{content}} [/note]"
+
+[shortcodes.callout]
+kind = "block"
+arguments = { kind = { type = "string", required = true,
+  oneof = ["info", "warning", "danger"] } }
+template_html = "templates/callout.html"
+```
+
+Templates are minimal mustache: only `{{content}}` (rendered children)
+and `{{args.name}}` (argument values). No conditionals, no loops, no
+embedded code. Logic belongs in build hooks, not templates.
+
+## 15. Diagnostics and error codes
+
+Errors come out in `rustc` form:
+
+```
+error[B0204]: emphasis cannot nest with the same marker
+  --> doc.brf:14:23
+   |
+14 | This is *outer *inner* outer*.
+   |        ^^^^^^^ inner emphasis re-uses the `*` marker
+   |
+   = help: use a different emphasis marker for the inner span,
+           e.g. _outer *inner* outer_
+```
+
+Code ranges:
+
+- B01xx — lexical (tabs, BOM, encoding)
+- B02xx — inline parsing (emphasis, code spans)
+- B03xx — block parsing (headings, fences, comments)
+- B04xx — shortcode resolution (unknown, type, enum, form)
+- B05xx — semantic / cross-cutting (list sequence, table columns)
+
+`brief explain B0204` prints the long-form explanation. There is no
+`--allow-warnings`. There never will be.
+
+## 16. The whole list of things that are intentionally NOT here
+
+- Inline HTML — use a shortcode.
+- `**bold**` / `__italic__` — one marker on each side; period.
+- `*` or `+` for bullets — only `-` is valid.
+- Setext headings — only `#`-prefixed.
+- Indented code blocks — use triple-backtick fences.
+- Reference-style links — use `@link[text](url)`.
+- Table separator row — `@t` header is implicit.
+- Renumbering ordered lists — 1, 2, 3 or it's an error.
+- Tab characters anywhere — two-space indent only.
+- Inline trailing comments — comments are whole lines.
+
+If a thing isn't on this page, it isn't in the language.
+
+## Further reading
+
+- The full language specification (the source of truth).
+- `brief explain <CODE>` for any error code.
+- The reference compiler's conformance suite under `tests/conformance.rs`.

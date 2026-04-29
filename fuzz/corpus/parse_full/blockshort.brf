@@ -1,0 +1,5 @@
+@callout(kind: warning)
+This is a body.
+
+It has multiple paragraphs.
+@end

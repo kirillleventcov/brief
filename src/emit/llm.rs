@@ -114,7 +114,10 @@ fn render_table(header: &Row, rows: &[Row], reg: &Registry, opts: &Opts, out: &m
         }
         row_strs.push(row);
     }
-    let cols = row_strs[0].len();
+    // The parser flags table-column mismatch as a diagnostic, but the
+    // renderer must still be panic-free on any AST it's handed. Size column
+    // widths to the widest row, not the header.
+    let cols = row_strs.iter().map(|r| r.len()).max().unwrap_or(0);
     let widths: Vec<usize> = (0..cols)
         .map(|c| {
             row_strs
@@ -127,7 +130,7 @@ fn render_table(header: &Row, rows: &[Row], reg: &Registry, opts: &Opts, out: &m
     for (i, row) in row_strs.iter().enumerate() {
         out.push('|');
         for (c, cell) in row.iter().enumerate() {
-            let w = widths[c];
+            let w = widths.get(c).copied().unwrap_or(0);
             let _ = write!(out, " {:width$} |", cell, width = w);
         }
         out.push('\n');
