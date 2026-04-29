@@ -3,18 +3,33 @@ use crate::shortcode::{ArgValue, Registry};
 use std::fmt::Write;
 
 pub fn render(doc: &Document, reg: &Registry) -> String {
+    let footnotes = collect_footnotes(doc);
+    let mut ctx = Ctx {
+        reg,
+        counter: 0,
+        in_footnote: false,
+    };
     let mut out = String::new();
     for b in &doc.blocks {
-        render_block(b, reg, &mut out);
+        render_block(b, &mut ctx, &mut out);
+    }
+    if !footnotes.is_empty() {
+        emit_footnotes_section(&footnotes, reg, &mut out);
     }
     out
 }
 
-fn render_block(block: &Block, reg: &Registry, out: &mut String) {
+struct Ctx<'a> {
+    reg: &'a Registry,
+    counter: u32,
+    in_footnote: bool,
+}
+
+fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
     match block {
         Block::Heading { level, content, .. } => {
             let _ = write!(out, "<h{}>", level);
-            render_inline_seq(content, reg, out);
+            render_inline_seq(content, ctx, out);
             let _ = writeln!(out, "</h{}>", level);
         }
         Block::Paragraph { content, .. } => {
@@ -22,21 +37,21 @@ fn render_block(block: &Block, reg: &Registry, out: &mut String) {
                 return;
             }
             out.push_str("<p>");
-            render_inline_seq(content, reg, out);
+            render_inline_seq(content, ctx, out);
             out.push_str("</p>\n");
         }
         Block::List { ordered, items, .. } => {
             let tag = if *ordered { "ol" } else { "ul" };
             let _ = writeln!(out, "<{}>", tag);
             for it in items {
-                render_item(it, reg, out);
+                render_item(it, ctx, out);
             }
             let _ = writeln!(out, "</{}>", tag);
         }
         Block::Blockquote { children, .. } => {
             out.push_str("<blockquote>\n");
             for c in children {
-                render_block(c, reg, out);
+                render_block(c, ctx, out);
             }
             out.push_str("</blockquote>\n");
         }
@@ -53,7 +68,7 @@ fn render_block(block: &Block, reg: &Registry, out: &mut String) {
         Block::Table {
             args, header, rows, ..
         } => {
-            render_table(args, header, rows, reg, out);
+            render_table(args, header, rows, ctx, out);
         }
         Block::HorizontalRule { .. } => out.push_str("<hr>\n"),
         Block::BlockShortcode {
@@ -65,28 +80,28 @@ fn render_block(block: &Block, reg: &Registry, out: &mut String) {
             let inner = {
                 let mut s = String::new();
                 for c in children {
-                    render_block(c, reg, &mut s);
+                    render_block(c, ctx, &mut s);
                 }
                 s
             };
-            render_shortcode_html(name, args, Some(&inner), reg, out);
+            render_shortcode_html(name, args, Some(&inner), ctx, out);
         }
     }
 }
 
-fn render_item(it: &ListItem, reg: &Registry, out: &mut String) {
+fn render_item(it: &ListItem, ctx: &mut Ctx, out: &mut String) {
     out.push_str("<li>");
-    render_inline_seq(&it.content, reg, out);
+    render_inline_seq(&it.content, ctx, out);
     if !it.children.is_empty() {
         out.push('\n');
         for c in &it.children {
-            render_block(c, reg, out);
+            render_block(c, ctx, out);
         }
     }
     out.push_str("</li>\n");
 }
 
-fn render_table(args: &ShortArgs, header: &Row, rows: &[Row], reg: &Registry, out: &mut String) {
+fn render_table(args: &ShortArgs, header: &Row, rows: &[Row], ctx: &mut Ctx, out: &mut String) {
     let aligns: Vec<&str> = if let Some(ArgValue::Array(a)) = args.keyword.get("align") {
         a.iter()
             .map(|v| match v {
@@ -101,7 +116,7 @@ fn render_table(args: &ShortArgs, header: &Row, rows: &[Row], reg: &Registry, ou
     for (i, c) in header.cells.iter().enumerate() {
         let a = aligns.get(i).copied().unwrap_or("left");
         let _ = write!(out, "<th style=\"text-align:{}\">", a);
-        render_inline_seq(c, reg, out);
+        render_inline_seq(c, ctx, out);
         out.push_str("</th>");
     }
     out.push_str("</tr></thead>\n<tbody>\n");
@@ -110,7 +125,7 @@ fn render_table(args: &ShortArgs, header: &Row, rows: &[Row], reg: &Registry, ou
         for (i, c) in r.cells.iter().enumerate() {
             let a = aligns.get(i).copied().unwrap_or("left");
             let _ = write!(out, "<td style=\"text-align:{}\">", a);
-            render_inline_seq(c, reg, out);
+            render_inline_seq(c, ctx, out);
             out.push_str("</td>");
         }
         out.push_str("</tr>\n");
@@ -118,34 +133,34 @@ fn render_table(args: &ShortArgs, header: &Row, rows: &[Row], reg: &Registry, ou
     out.push_str("</tbody>\n</table>\n");
 }
 
-fn render_inline_seq(seq: &[Inline], reg: &Registry, out: &mut String) {
+fn render_inline_seq(seq: &[Inline], ctx: &mut Ctx, out: &mut String) {
     for n in seq {
-        render_inline(n, reg, out);
+        render_inline(n, ctx, out);
     }
 }
 
-fn render_inline(node: &Inline, reg: &Registry, out: &mut String) {
+fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
     match node {
         Inline::Text { value, .. } => out.push_str(&escape_html(value)),
         Inline::HardBreak { .. } => out.push_str("<br>"),
         Inline::Bold { content, .. } => {
             out.push_str("<strong>");
-            render_inline_seq(content, reg, out);
+            render_inline_seq(content, ctx, out);
             out.push_str("</strong>");
         }
         Inline::Italic { content, .. } => {
             out.push_str("<em>");
-            render_inline_seq(content, reg, out);
+            render_inline_seq(content, ctx, out);
             out.push_str("</em>");
         }
         Inline::Underline { content, .. } => {
             out.push_str("<u>");
-            render_inline_seq(content, reg, out);
+            render_inline_seq(content, ctx, out);
             out.push_str("</u>");
         }
         Inline::Strike { content, .. } => {
             out.push_str("<s>");
-            render_inline_seq(content, reg, out);
+            render_inline_seq(content, ctx, out);
             out.push_str("</s>");
         }
         Inline::InlineCode { value, .. } => {
@@ -159,12 +174,37 @@ fn render_inline(node: &Inline, reg: &Registry, out: &mut String) {
             content,
             ..
         } => {
+            // Footnote refs are auto-numbered during the main render pass.
+            // Inside a footnote body we degrade nested footnotes to plain
+            // bracketed text so they don't disturb the document-level
+            // numbering scheme.
+            if name == "footnote" {
+                if content.is_none() {
+                    return;
+                }
+                if ctx.in_footnote {
+                    out.push('[');
+                    if let Some(c) = content {
+                        render_inline_seq(c, ctx, out);
+                    }
+                    out.push(']');
+                    return;
+                }
+                ctx.counter += 1;
+                let n = ctx.counter;
+                let _ = write!(
+                    out,
+                    "<sup class=\"fn-ref\"><a id=\"fn-ref-{}\" href=\"#fn-{}\">{}</a></sup>",
+                    n, n, n
+                );
+                return;
+            }
             let inner = content.as_ref().map(|c| {
                 let mut s = String::new();
-                render_inline_seq(c, reg, &mut s);
+                render_inline_seq(c, ctx, &mut s);
                 s
             });
-            render_shortcode_html(name, args, inner.as_deref(), reg, out);
+            render_shortcode_html(name, args, inner.as_deref(), ctx, out);
         }
     }
 }
@@ -173,10 +213,10 @@ fn render_shortcode_html(
     name: &str,
     args: &ShortArgs,
     inner: Option<&str>,
-    reg: &Registry,
+    ctx: &mut Ctx,
     out: &mut String,
 ) {
-    if let Some(sc) = reg.get(name) {
+    if let Some(sc) = ctx.reg.get(name) {
         if let Some(t) = &sc.template_html {
             let r = expand_template(t, args, inner.unwrap_or(""));
             out.push_str(&r);
@@ -235,9 +275,6 @@ fn render_shortcode_html(
             let raw = inner.unwrap_or("");
             let _ = write!(out, "<span class=\"math\">{}</span>", escape_html(raw));
         }
-        "footnote" => {
-            let _ = write!(out, "<sup class=\"fn\">{}</sup>", inner.unwrap_or(""));
-        }
         "code" => {
             let lang = args
                 .keyword
@@ -265,6 +302,103 @@ fn render_shortcode_html(
             );
         }
     }
+}
+
+fn collect_footnotes(doc: &Document) -> Vec<Vec<Inline>> {
+    let mut out = Vec::new();
+    for b in &doc.blocks {
+        collect_block(b, &mut out);
+    }
+    out
+}
+
+fn collect_block(b: &Block, out: &mut Vec<Vec<Inline>>) {
+    match b {
+        Block::Heading { content, .. } | Block::Paragraph { content, .. } => {
+            for n in content {
+                collect_inline(n, out);
+            }
+        }
+        Block::List { items, .. } => {
+            for it in items {
+                for n in &it.content {
+                    collect_inline(n, out);
+                }
+                for c in &it.children {
+                    collect_block(c, out);
+                }
+            }
+        }
+        Block::Blockquote { children, .. } | Block::BlockShortcode { children, .. } => {
+            for c in children {
+                collect_block(c, out);
+            }
+        }
+        Block::Table { header, rows, .. } => {
+            for cell in &header.cells {
+                for n in cell {
+                    collect_inline(n, out);
+                }
+            }
+            for row in rows {
+                for cell in &row.cells {
+                    for n in cell {
+                        collect_inline(n, out);
+                    }
+                }
+            }
+        }
+        Block::CodeBlock { .. } | Block::HorizontalRule { .. } => {}
+    }
+}
+
+fn collect_inline(node: &Inline, out: &mut Vec<Vec<Inline>>) {
+    match node {
+        Inline::Bold { content, .. }
+        | Inline::Italic { content, .. }
+        | Inline::Underline { content, .. }
+        | Inline::Strike { content, .. } => {
+            for n in content {
+                collect_inline(n, out);
+            }
+        }
+        Inline::Shortcode { name, content, .. } => {
+            if name == "footnote" {
+                if let Some(c) = content {
+                    out.push(c.clone());
+                }
+                // Don't recurse into the body: nested footnote refs inside
+                // a footnote body render as plain text and are not numbered.
+                return;
+            }
+            if let Some(c) = content {
+                for n in c {
+                    collect_inline(n, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn emit_footnotes_section(footnotes: &[Vec<Inline>], reg: &Registry, out: &mut String) {
+    out.push_str("<hr class=\"footnotes-sep\">\n<ol class=\"footnotes\">\n");
+    for (i, body) in footnotes.iter().enumerate() {
+        let n = i + 1;
+        let _ = write!(out, "<li id=\"fn-{}\">", n);
+        let mut ctx = Ctx {
+            reg,
+            counter: 0,
+            in_footnote: true,
+        };
+        render_inline_seq(body, &mut ctx, out);
+        let _ = write!(
+            out,
+            " <a href=\"#fn-ref-{}\" class=\"fn-back\">\u{21A9}</a></li>\n",
+            n
+        );
+    }
+    out.push_str("</ol>\n");
 }
 
 fn expand_template(tpl: &str, args: &ShortArgs, content: &str) -> String {

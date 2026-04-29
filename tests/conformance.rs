@@ -229,3 +229,87 @@ fn unterminated_block_shortcode() {
     let (_, codes) = compile("@callout(kind: info)\nbody\n");
     assert!(codes.contains(&Code::UnterminatedBlock));
 }
+
+#[test]
+fn footnote_html_auto_numbers() {
+    let (html, codes) = compile("First.@footnote[note one]\n\nSecond.@footnote[note two]\n");
+    assert!(codes.is_empty(), "{:?}", codes);
+    assert!(
+        html.contains("href=\"#fn-1\">1</a>"),
+        "missing first ref: {}",
+        html
+    );
+    assert!(
+        html.contains("href=\"#fn-2\">2</a>"),
+        "missing second ref: {}",
+        html
+    );
+    assert!(
+        html.contains("<ol class=\"footnotes\">"),
+        "missing footnotes section: {}",
+        html
+    );
+    assert!(html.contains("<li id=\"fn-1\">note one"), "{}", html);
+    assert!(html.contains("<li id=\"fn-2\">note two"), "{}", html);
+    assert!(html.contains("href=\"#fn-ref-1\""), "{}", html);
+    assert!(html.contains("href=\"#fn-ref-2\""), "{}", html);
+}
+
+#[test]
+fn footnote_html_renders_inline_emphasis_in_body() {
+    // The footnote body is parsed as inline content, so emphasis markers
+    // inside it must reach the rendered <li>.
+    let (html, codes) = compile("Claim.@footnote[See _ibid._, p. 5]\n");
+    assert!(codes.is_empty(), "{:?}", codes);
+    assert!(html.contains("<em>ibid.</em>"), "{}", html);
+}
+
+#[test]
+fn footnote_llm_uses_pandoc_style() {
+    let brief_src = "First.@footnote[a]\n\nSecond.@footnote[b]\n";
+    let src = SourceMap::new("t.brf", brief_src);
+    let tokens = lex(&src).unwrap();
+    let (mut doc, diags) = parse(tokens, &src);
+    assert!(diags.is_empty(), "{:?}", diags);
+    let reg = Registry::with_builtins();
+    let r = resolve(&mut doc, &reg);
+    assert!(r.is_empty(), "{:?}", r);
+    let out = llm::render(&doc, &reg, &llm::Opts::default());
+    assert!(out.contains("First.[^1]"), "{}", out);
+    assert!(out.contains("Second.[^2]"), "{}", out);
+    assert!(out.contains("[^1]: a"), "{}", out);
+    assert!(out.contains("[^2]: b"), "{}", out);
+}
+
+#[test]
+fn footnote_no_footnotes_no_section() {
+    // A document without footnotes must not emit an empty footnotes section.
+    let (html, codes) = compile("Plain paragraph.\n");
+    assert!(codes.is_empty(), "{:?}", codes);
+    assert!(!html.contains("footnotes-sep"), "{}", html);
+    assert!(!html.contains("<ol class=\"footnotes\""), "{}", html);
+}
+
+#[test]
+fn footnote_inside_list_item_numbered_in_document_order() {
+    let (html, codes) = compile("- one@footnote[a]\n- two@footnote[b]\n");
+    assert!(codes.is_empty(), "{:?}", codes);
+    let pos1 = html.find("href=\"#fn-1\">1</a>").expect(&html);
+    let pos2 = html.find("href=\"#fn-2\">2</a>").expect(&html);
+    assert!(pos1 < pos2, "footnote order wrong: {}", html);
+}
+
+#[test]
+fn footnote_nested_in_body_not_double_numbered() {
+    // A footnote ref inside another footnote body must NOT introduce a new
+    // numbered definition; the nested ref renders as plain bracketed text so
+    // document-level numbering stays linear.
+    let (html, codes) = compile("Claim.@footnote[outer @footnote[inner ignored]]\n");
+    assert!(codes.is_empty(), "{:?}", codes);
+    // Exactly one <li> in the footnotes list.
+    let li_count = html.matches("<li id=\"fn-").count();
+    assert_eq!(li_count, 1, "{}", html);
+    // Only one auto-numbered ref in the document body.
+    let ref_count = html.matches("class=\"fn-ref\"").count();
+    assert_eq!(ref_count, 1, "{}", html);
+}

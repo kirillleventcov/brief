@@ -255,7 +255,11 @@ Keyboard input: press @kbd[Ctrl+C] to abort.
 
 Inline math: the energy is @math[E = m c^2].
 
-A footnote: this claim is contested.@footnote[See Smith, 2025.]
+A footnote: this claim is contested.@footnote[See Smith, 2025.] The
+inline form is the only form — definitions live in the `[...]` body next
+to the reference, never elsewhere in the file. The compiler auto-numbers
+them in document order and emits a list at the end (HTML `<ol
+class="footnotes">`, LLM `[^1]: ...`).
 
 A block callout — the `kind` argument is constrained to one of `info`,
 `warning`, or `danger`; anything else is B0404 BadEnumValue.
@@ -297,6 +301,8 @@ shortcodes render to compact forms:
 - `@image(src, alt)` becomes `[image: alt]` (`--keep-asset-urls` preserves the URL)
 - `@callout(kind: warning) ...` becomes `[!warning] ... [/!]`
 - `@math[x^2]` becomes `$x^2$`
+- `@footnote[body]` becomes `[^N]` inline; definitions are appended at
+  the end of the document as `[^N]: body` lines
 
 `--report-tokens` prints a stderr line with a cl100k character/token
 estimate. The estimate is best-effort and not normative.
