@@ -159,6 +159,24 @@ column (the marker plus its space):
 - next item
 ```
 
+Unordered list items can carry a task-state marker as their first
+content. The marker is exactly `[x] ` (done) or `[ ] ` (todo) — strict
+literal: lowercase `x`, single space inside the brackets, single space
+after. Anything else (uppercase `X`, `[  ]` with two spaces, `[x]`
+without a trailing space) is plain text.
+
+```brief
+- [x] ship v0.4
+- [ ] write release notes
+- plain bullet, not a task
+```
+
+HTML emit renders these as a checkbox `<input type="checkbox" disabled>`
+inside `<li class="task-list-item">`, with the parent `<ul>` carrying
+`class="contains-task-list"` if any item is a task. LLM emit preserves
+the marker verbatim. Task markers are NOT supported on ordered list
+items — `1. [x] foo` is just text.
+
 ## 7. Blockquotes
 
 A blockquote starts with `>` followed by exactly one space. Subsequent
@@ -236,11 +254,21 @@ Built-in shortcodes that ship with the reference compiler:
 | link | inline | hyperlink
 | image | inline | image
 | kbd | inline | keyboard input
+| sub | inline | subscript (replaces inline `<sub>`)
+| sup | inline | superscript (replaces inline `<sup>`)
+| details | block | collapsible block (replaces `<details>/<summary>`)
 | t | block | tables (special-cased)
 | code | block | same as triple-backtick fence
 | callout | block | boxed note
 | math | both | LaTeX math, inline or block
 | footnote | inline | footnote text
+
+Inline HTML has no general escape hatch in Brief. The four built-ins
+above (`@kbd`, `@sub`, `@sup`, `@details`) cover the inline tags that
+came up most often in real documents. `@br` is not provided — use `\`
+at end of line (§12) for hard breaks. Anything else means the document
+shouldn't be inline-HTML in the first place; if you must, register a
+custom shortcode in `brief.toml`.
 
 An inline link — note the markdown-style `[text](url)` sugar that
 supplies the URL as positional arg #1:

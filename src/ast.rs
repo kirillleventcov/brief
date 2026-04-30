@@ -13,6 +13,7 @@ pub enum Block {
     Heading {
         level: u8,
         content: Vec<Inline>,
+        anchor: Option<String>,
         span: Span,
     },
     Paragraph {
@@ -61,10 +62,20 @@ pub struct CodeAttrs {
     pub keep_comments: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskState {
+    Done,
+    Todo,
+}
+
 #[derive(Clone, Debug)]
 pub struct ListItem {
     pub content: Vec<Inline>,
     pub children: Vec<Block>,
+    /// Set when the item begins with the literal `[x] ` (Done) or `[ ] `
+    /// (Todo) marker. Marker bytes are consumed by the parser; `content`
+    /// holds the rest. Only unordered list items carry this.
+    pub task: Option<TaskState>,
     pub span: Span,
 }
 

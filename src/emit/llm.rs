@@ -142,6 +142,7 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String, indent: usize) {
             out.push('\n');
         }
         Block::List { ordered, items, .. } => {
+            use crate::ast::TaskState;
             for (i, it) in items.iter().enumerate() {
                 let marker = if *ordered {
                     format!("{}.", i + 1)
@@ -149,6 +150,12 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String, indent: usize) {
                     "-".to_string()
                 };
                 let _ = write!(out, "{}{} ", pad, marker);
+                if let Some(state) = it.task {
+                    out.push_str(match state {
+                        TaskState::Done => "[x] ",
+                        TaskState::Todo => "[ ] ",
+                    });
+                }
                 render_inline_seq(&it.content, ctx, out);
                 out.push('\n');
                 for c in &it.children {
@@ -381,6 +388,18 @@ fn render_block_shortcode_llm(
             }
             let _ = writeln!(out, "[/!]");
         }
+        "details" => {
+            let summary = args
+                .keyword
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let _ = writeln!(out, "[details: \"{}\"]", summary);
+            for c in children {
+                render_block(c, ctx, out, indent);
+            }
+            let _ = writeln!(out, "[/details]");
+        }
         "math" => {
             let mut s = String::new();
             for c in children {
@@ -489,7 +508,12 @@ fn render_inline_shortcode_llm(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let text = inner_string.as_deref().unwrap_or("");
-            let _ = write!(out, "[{}]({})", text, url);
+            let title = args.keyword.get("title").and_then(|v| v.as_str());
+            if let Some(t) = title {
+                let _ = write!(out, "[{}]({} \"{}\")", text, url, t);
+            } else {
+                let _ = write!(out, "[{}]({})", text, url);
+            }
         }
         "image" => {
             let alt = args
@@ -510,6 +534,12 @@ fn render_inline_shortcode_llm(
         }
         "kbd" => {
             let _ = write!(out, "[kbd:{}]", inner_string.as_deref().unwrap_or(""));
+        }
+        "sub" => {
+            let _ = write!(out, "[sub:{}]", inner_string.as_deref().unwrap_or(""));
+        }
+        "sup" => {
+            let _ = write!(out, "[sup:{}]", inner_string.as_deref().unwrap_or(""));
         }
         "math" => {
             let _ = write!(out, "${}$", inner_string.as_deref().unwrap_or(""));

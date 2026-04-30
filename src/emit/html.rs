@@ -27,8 +27,17 @@ struct Ctx<'a> {
 
 fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
     match block {
-        Block::Heading { level, content, .. } => {
-            let _ = write!(out, "<h{}>", level);
+        Block::Heading {
+            level,
+            content,
+            anchor,
+            ..
+        } => {
+            if let Some(a) = anchor {
+                let _ = write!(out, "<h{} id=\"{}\">", level, escape_attr(a));
+            } else {
+                let _ = write!(out, "<h{}>", level);
+            }
             render_inline_seq(content, ctx, out);
             let _ = writeln!(out, "</h{}>", level);
         }
@@ -42,7 +51,12 @@ fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
         }
         Block::List { ordered, items, .. } => {
             let tag = if *ordered { "ol" } else { "ul" };
-            let _ = writeln!(out, "<{}>", tag);
+            let has_tasks = items.iter().any(|it| it.task.is_some());
+            if has_tasks {
+                let _ = writeln!(out, "<{} class=\"contains-task-list\">", tag);
+            } else {
+                let _ = writeln!(out, "<{}>", tag);
+            }
             for it in items {
                 render_item(it, ctx, out);
             }
@@ -92,7 +106,18 @@ fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
 }
 
 fn render_item(it: &ListItem, ctx: &mut Ctx, out: &mut String) {
-    out.push_str("<li>");
+    use crate::ast::TaskState;
+    match it.task {
+        None => out.push_str("<li>"),
+        Some(state) => {
+            let checked = matches!(state, TaskState::Done);
+            let _ = write!(
+                out,
+                "<li class=\"task-list-item\"><input type=\"checkbox\" disabled{}> ",
+                if checked { " checked" } else { "" }
+            );
+        }
+    }
     render_inline_seq(&it.content, ctx, out);
     if !it.children.is_empty() {
         out.push('\n');
@@ -232,12 +257,23 @@ fn render_shortcode_html(
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("#");
-            let _ = write!(
-                out,
-                "<a href=\"{}\">{}</a>",
-                escape_attr(url),
-                inner.unwrap_or("")
-            );
+            let title = args.keyword.get("title").and_then(|v| v.as_str());
+            if let Some(t) = title {
+                let _ = write!(
+                    out,
+                    "<a href=\"{}\" title=\"{}\">{}</a>",
+                    escape_attr(url),
+                    escape_attr(t),
+                    inner.unwrap_or("")
+                );
+            } else {
+                let _ = write!(
+                    out,
+                    "<a href=\"{}\">{}</a>",
+                    escape_attr(url),
+                    inner.unwrap_or("")
+                );
+            }
         }
         "image" => {
             let src = args
@@ -259,6 +295,25 @@ fn render_shortcode_html(
         }
         "kbd" => {
             let _ = write!(out, "<kbd>{}</kbd>", inner.unwrap_or(""));
+        }
+        "sub" => {
+            let _ = write!(out, "<sub>{}</sub>", inner.unwrap_or(""));
+        }
+        "sup" => {
+            let _ = write!(out, "<sup>{}</sup>", inner.unwrap_or(""));
+        }
+        "details" => {
+            let summary = args
+                .keyword
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let _ = write!(
+                out,
+                "<details><summary>{}</summary>{}</details>\n",
+                escape_html(summary),
+                inner.unwrap_or("")
+            );
         }
         "callout" => {
             let kind = args

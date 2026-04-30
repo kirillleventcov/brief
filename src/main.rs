@@ -1,5 +1,5 @@
 use brief::config;
-use brief::diag::render_all;
+use brief::diag::{render_all, Severity};
 use brief::emit::{html, llm};
 use brief::lexer;
 use brief::parser;
@@ -178,10 +178,15 @@ fn run_compile(
     };
     let (mut doc, mut diags) = parser::parse(tokens, &src);
     diags.extend(resolve::resolve(&mut doc, &registry));
-    diags.extend(validate::validate(&doc, &opts));
-    if !diags.is_empty() {
+    diags.extend(validate::validate(&doc, &opts, &src));
+    let has_errors = diags
+        .iter()
+        .any(|d| d.severity == Severity::Error);
+    if has_errors {
         eprint!("{}", render_all(&diags, &src));
         return ExitCode::from(1);
+    } else if !diags.is_empty() {
+        eprint!("{}", render_all(&diags, &src));
     }
 
     let output = match target.as_str() {
@@ -246,7 +251,7 @@ fn run_explain(code: &str) -> ExitCode {
         ),
         (
             Code::UnknownShortcode,
-            "Shortcodes must be registered in `brief.toml` under `[shortcodes.<name>]` (or be a built-in: link, image, kbd, t, code, callout, math, footnote).",
+            "Shortcodes must be registered in `brief.toml` under `[shortcodes.<name>]` (or be a built-in: link, image, kbd, sub, sup, details, t, code, callout, math, footnote). Note: `@br` is intentionally not a shortcode — use `\\` at end of line for a hard break.",
         ),
         (
             Code::TabCharacter,

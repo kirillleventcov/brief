@@ -103,6 +103,19 @@ fn check_shortcode(
     span: Span,
     diags: &mut Vec<Diagnostic>,
 ) {
+    // `@br` is deliberately not registered: Brief already has `\` as the
+    // canonical hard-break sigil. Catch it explicitly so the user gets a
+    // useful pointer instead of the generic "register it" help.
+    if name == "br" {
+        diags.push(
+            Diagnostic::new(Code::UnknownShortcode, span)
+                .label("`@br` is not a Brief shortcode".to_string())
+                .help(
+                    "use `\\` at end of line for a hard break (see §12); `@br` will not be registered as a built-in",
+                ),
+        );
+        return;
+    }
     let Some(sc) = reg.get(name) else {
         diags.push(
             Diagnostic::new(Code::UnknownShortcode, span)
@@ -122,6 +135,30 @@ fn check_shortcode(
             if is_block { "block" } else { "inline" },
             sc.kind
         )));
+    }
+
+    // Deprecation alias rewrite for @callout(kind:).
+    // Must run before the oneof check so the canonical value passes validation.
+    if name == "callout" {
+        if let Some(v) = args.keyword.get("kind") {
+            if let Some(s) = v.as_str() {
+                let (canonical, label_msg): (Option<&str>, Option<&str>) = match s {
+                    "info" => (Some("note"), Some("`kind: info` is deprecated; use `kind: note`")),
+                    "danger" => (
+                        Some("caution"),
+                        Some("`kind: danger` is deprecated; use `kind: caution`"),
+                    ),
+                    _ => (None, None),
+                };
+                if let (Some(canonical), Some(msg)) = (canonical, label_msg) {
+                    diags.push(
+                        Diagnostic::warning(Code::DeprecatedCalloutKind, span).label(msg),
+                    );
+                    args.keyword
+                        .insert("kind".into(), ArgValue::Str(canonical.into()));
+                }
+            }
+        }
     }
 
     bind_positional(sc, args, span, diags);

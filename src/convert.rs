@@ -27,7 +27,6 @@ pub enum Hole {
     AltBullet,        // * or + bullet
     OrderedRenumber,
     NestIndentNormalize,
-    TaskListItem,
     TildeFence,
     IndentedCodeBlock,
     AltHorizontalRule,
@@ -51,7 +50,6 @@ impl Hole {
             Hole::AltBullet => "alt-bullet",
             Hole::OrderedRenumber => "ordered-renumber",
             Hole::NestIndentNormalize => "nest-indent-normalize",
-            Hole::TaskListItem => "task-list-item",
             Hole::TildeFence => "tilde-fence",
             Hole::IndentedCodeBlock => "indented-code-block",
             Hole::AltHorizontalRule => "alt-horizontal-rule",
@@ -75,7 +73,6 @@ impl Hole {
             Hole::AltBullet => "`*`/`+` bullet rewritten to `-`",
             Hole::OrderedRenumber => "ordered list renumbered to sequential 1,2,3,...",
             Hole::NestIndentNormalize => "list nesting indent normalized to 2 spaces",
-            Hole::TaskListItem => "GFM task-list marker rewritten to inline emphasis",
             Hole::TildeFence => "`~~~` fence rewritten to triple-backtick fence",
             Hole::IndentedCodeBlock => "indented code block rewritten to fenced block",
             Hole::AltHorizontalRule => "`***`/`___`/spaced rule rewritten to `---`",
@@ -548,30 +545,40 @@ impl<'a> Walker<'a> {
                 }
             }
             Event::TaskListMarker(checked) => {
-                self.push_diag(
-                    Hole::TaskListItem,
-                    range.clone(),
-                    if checked {
-                        "task `[x]` rewritten to `*(done)*`".into()
-                    } else {
-                        "task `[ ]` rewritten to `*(todo)*`".into()
-                    },
-                );
-                self.write(if checked { "*(done)* " } else { "*(todo)* " });
+                // v0.4 §4.3: Brief now natively supports `[x]` / `[ ]`
+                // as a list-item modifier. The conversion is lossless, so
+                // no diagnostic is emitted.
+                self.write(if checked { "[x] " } else { "[ ] " });
             }
             Event::Start(Tag::BlockQuote(kind)) => {
                 use pulldown_cmark::BlockQuoteKind;
                 let container = match kind {
                     None => Container::Quote,
-                    Some(BlockQuoteKind::Note) | Some(BlockQuoteKind::Tip) => {
+                    Some(BlockQuoteKind::Note) => {
                         self.push_diag(
                             Hole::GfmAlert,
                             range.clone(),
-                            "GFM alert mapped to `@callout(kind: info)`".into(),
+                            "GFM alert mapped to `@callout(kind: note)`".into(),
                         );
-                        Container::Alert(Hole::GfmAlert, "info")
+                        Container::Alert(Hole::GfmAlert, "note")
                     }
-                    Some(BlockQuoteKind::Important) | Some(BlockQuoteKind::Warning) => {
+                    Some(BlockQuoteKind::Tip) => {
+                        self.push_diag(
+                            Hole::GfmAlert,
+                            range.clone(),
+                            "GFM alert mapped to `@callout(kind: tip)`".into(),
+                        );
+                        Container::Alert(Hole::GfmAlert, "tip")
+                    }
+                    Some(BlockQuoteKind::Important) => {
+                        self.push_diag(
+                            Hole::GfmAlert,
+                            range.clone(),
+                            "GFM alert mapped to `@callout(kind: important)`".into(),
+                        );
+                        Container::Alert(Hole::GfmAlert, "important")
+                    }
+                    Some(BlockQuoteKind::Warning) => {
                         self.push_diag(
                             Hole::GfmAlert,
                             range.clone(),
@@ -583,9 +590,9 @@ impl<'a> Walker<'a> {
                         self.push_diag(
                             Hole::GfmAlert,
                             range.clone(),
-                            "GFM alert mapped to `@callout(kind: danger)`".into(),
+                            "GFM alert mapped to `@callout(kind: caution)`".into(),
                         );
-                        Container::Alert(Hole::GfmAlert, "danger")
+                        Container::Alert(Hole::GfmAlert, "caution")
                     }
                 };
                 self.out_stack.push(String::new());
@@ -646,13 +653,13 @@ impl<'a> Walker<'a> {
                 ..
             }) => {
                 use pulldown_cmark::LinkType;
+                // Capture a non-empty title to emit as `title:` kwarg.
+                let link_title = if title.is_empty() {
+                    None
+                } else {
+                    Some(title.to_string())
+                };
                 let mut diag: Option<(Hole, String)> = None;
-                if !title.is_empty() {
-                    diag = Some((
-                        Hole::LinkTitleDropped,
-                        format!("link title `{}` dropped", title),
-                    ));
-                }
                 match link_type {
                     LinkType::Autolink | LinkType::Email => {
                         diag = Some((
@@ -674,14 +681,33 @@ impl<'a> Walker<'a> {
                     LinkType::Inline => {}
                     _ => {}
                 }
-                self.link_stack.push((dest_url.to_string(), diag));
+                // Store (url, optional_title, optional_diag) via a tuple.
+                // We encode the title into the url string using a sentinel separator
+                // so we can reuse the existing link_stack without changing its type.
+                // Instead, push title into a separate parallel stack field by
+                // storing both in a combined tuple stored in out_stack label.
+                // Simplest approach: store title in a new wrapper. Use an existing
+                // field trick: push url\x00title so End can split on \x00.
+                let url_with_title = if let Some(ref t) = link_title {
+                    format!("{}\x00{}", dest_url, t)
+                } else {
+                    dest_url.to_string()
+                };
+                self.link_stack.push((url_with_title, diag));
                 self.out_stack.push(String::new());
                 self.container_stack.push(Container::LinkPending);
             }
             Event::End(TagEnd::Link) => {
                 let text = self.out_stack.pop().expect("link buffer");
                 let _ = self.container_stack.pop();
-                let (url, diag) = self.link_stack.pop().expect("link stack");
+                let (url_with_title, diag) = self.link_stack.pop().expect("link stack");
+                // Split url and optional title.
+                let (url, opt_title) = if let Some(idx) = url_with_title.find('\x00') {
+                    let (u, t) = url_with_title.split_at(idx);
+                    (u.to_string(), Some(t[1..].to_string()))
+                } else {
+                    (url_with_title, None)
+                };
                 if let Some((hole, note)) = diag {
                     self.diags.push(Diag {
                         hole,
@@ -691,11 +717,21 @@ impl<'a> Walker<'a> {
                         note,
                     });
                 }
-                self.write("@link[");
-                self.write(&text);
-                self.write("](");
-                self.write(&url);
-                self.write(")");
+                if let Some(t) = opt_title {
+                    self.write("@link(title: \"");
+                    self.write(&t);
+                    self.write("\")[");
+                    self.write(&text);
+                    self.write("](");
+                    self.write(&url);
+                    self.write(")");
+                } else {
+                    self.write("@link[");
+                    self.write(&text);
+                    self.write("](");
+                    self.write(&url);
+                    self.write(")");
+                }
             }
             Event::Start(Tag::Image {
                 dest_url, title, ..

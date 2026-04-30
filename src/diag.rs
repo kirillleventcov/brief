@@ -2,6 +2,12 @@ use crate::span::{SourceMap, Span};
 use std::fmt::Write;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Code {
     InvalidUtf8 = 101,
     TabCharacter = 102,
@@ -30,6 +36,7 @@ pub enum Code {
     FrontmatterToml = 314,
     UnknownCodeAttribute = 315,
     ConflictingCodeAttributes = 316,
+    BadHeadingAnchor = 317,
 
     CodeBlockLineCount = 702,
     LineCommentConverted = 703,
@@ -42,11 +49,13 @@ pub enum Code {
     FormMismatch = 405,
     BadArgSyntax = 406,
     DuplicateKwarg = 407,
+    DeprecatedCalloutKind = 408,
 
     OrderedListSequence = 501,
     TableColumnMismatch = 502,
     HeadingMonotonic = 503,
     AlignArrayLength = 504,
+    DuplicateHeadingAnchor = 506,
 }
 
 impl Code {
@@ -82,6 +91,7 @@ impl Code {
             FrontmatterToml => "frontmatter is not valid TOML",
             UnknownCodeAttribute => "unknown code-fence attribute",
             ConflictingCodeAttributes => "conflicting code-fence attributes",
+            BadHeadingAnchor => "invalid heading anchor",
             CodeBlockLineCount => {
                 "minified code block was originally many lines; LLM consumers cannot reference specific lines"
             }
@@ -94,10 +104,14 @@ impl Code {
             FormMismatch => "shortcode used in the wrong form (block vs. inline)",
             BadArgSyntax => "malformed shortcode argument syntax",
             DuplicateKwarg => "keyword argument given more than once",
+            DeprecatedCalloutKind => {
+                "callout kind is deprecated; use the GFM equivalent"
+            }
             OrderedListSequence => "ordered list numbering must be sequential starting from 1",
             TableColumnMismatch => "table row column count does not match header",
             HeadingMonotonic => "heading levels must increase by at most one",
             AlignArrayLength => "alignment array length must equal the column count",
+            DuplicateHeadingAnchor => "heading anchor must be unique within a document",
         }
     }
 }
@@ -108,6 +122,7 @@ pub struct Diagnostic {
     pub span: Span,
     pub label: Option<String>,
     pub help: Option<String>,
+    pub severity: Severity,
 }
 
 impl Diagnostic {
@@ -117,6 +132,16 @@ impl Diagnostic {
             span,
             label: None,
             help: None,
+            severity: Severity::Error,
+        }
+    }
+    pub fn warning(code: Code, span: Span) -> Self {
+        Diagnostic {
+            code,
+            span,
+            label: None,
+            help: None,
+            severity: Severity::Warning,
         }
     }
     pub fn label(mut self, s: impl Into<String>) -> Self {
@@ -132,9 +157,14 @@ impl Diagnostic {
 pub fn render(diag: &Diagnostic, src: &SourceMap) -> String {
     let mut out = String::new();
     let (line, col) = src.line_col(diag.span.start);
+    let prefix = match diag.severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+    };
     let _ = writeln!(
         out,
-        "error[{}]: {}",
+        "{}[{}]: {}",
+        prefix,
         diag.code.as_str(),
         diag.code.message()
     );

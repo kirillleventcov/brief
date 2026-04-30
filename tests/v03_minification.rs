@@ -21,7 +21,7 @@ fn render_llm(input: &str) -> (String, Vec<String>) {
     let cfg = Config::default();
     let registry = Registry::with_builtins();
     diags.extend(resolve(&mut doc, &registry));
-    diags.extend(validate(&doc, &ValidateOpts::default()));
+    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
     assert!(diags.is_empty(), "compile diags: {:?}", diags);
     let opts = llm::Opts {
         minify_code_blocks: cfg.compile.llm.minify_code_blocks,

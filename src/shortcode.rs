@@ -98,6 +98,15 @@ impl Registry {
                             oneof: None,
                         },
                     );
+                    a.insert(
+                        "title".into(),
+                        ArgSpec {
+                            ty: ArgType::String,
+                            required: false,
+                            position: None,
+                            oneof: None,
+                        },
+                    );
                     a
                 },
                 template_html: None,
@@ -139,6 +148,48 @@ impl Registry {
             "kbd".into(),
             Shortcode {
                 kind: ShortKindOpt::Inline,
+                ..Default::default()
+            },
+        );
+
+        // Inline subscript and superscript: replacements for the only inline
+        // HTML constructs Brief still wants to express. Both take their text
+        // via the `[content]` body — no arguments.
+        m.insert(
+            "sub".into(),
+            Shortcode {
+                kind: ShortKindOpt::Inline,
+                ..Default::default()
+            },
+        );
+
+        m.insert(
+            "sup".into(),
+            Shortcode {
+                kind: ShortKindOpt::Inline,
+                ..Default::default()
+            },
+        );
+
+        // Collapsible block: `@details(summary: "...") ... @end` ↔
+        // `<details><summary>...</summary>...</details>`.
+        m.insert(
+            "details".into(),
+            Shortcode {
+                kind: ShortKindOpt::Block,
+                arguments: {
+                    let mut a = BTreeMap::new();
+                    a.insert(
+                        "summary".into(),
+                        ArgSpec {
+                            ty: ArgType::String,
+                            required: true,
+                            position: None,
+                            oneof: None,
+                        },
+                    );
+                    a
+                },
                 ..Default::default()
             },
         );
@@ -197,7 +248,13 @@ impl Registry {
                             ty: ArgType::String,
                             required: true,
                             position: None,
-                            oneof: Some(vec!["info".into(), "warning".into(), "danger".into()]),
+                            oneof: Some(vec![
+                                "note".into(),
+                                "tip".into(),
+                                "important".into(),
+                                "warning".into(),
+                                "caution".into(),
+                            ]),
                         },
                     );
                     a

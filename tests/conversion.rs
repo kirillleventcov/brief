@@ -206,16 +206,18 @@ fn four_space_nesting_normalized() {
 
 #[test]
 fn task_list_checked() {
+    // v0.4 §4.3: Brief natively supports `[x]` / `[ ]`, so the conversion
+    // is lossless and emits no hole diagnostic.
     let (out, holes) = run("- [x] done thing\n");
-    assert_eq!(out, "- *(done)* done thing\n");
-    assert_eq!(holes, vec![Hole::TaskListItem]);
+    assert_eq!(out, "- [x] done thing\n");
+    assert!(holes.is_empty(), "{:?}", holes);
 }
 
 #[test]
 fn task_list_unchecked() {
     let (out, holes) = run("- [ ] todo thing\n");
-    assert_eq!(out, "- *(todo)* todo thing\n");
-    assert_eq!(holes, vec![Hole::TaskListItem]);
+    assert_eq!(out, "- [ ] todo thing\n");
+    assert!(holes.is_empty(), "{:?}", holes);
 }
 
 #[test]
@@ -240,7 +242,7 @@ fn nested_blockquote() {
 #[test]
 fn gfm_alert_note() {
     let (out, holes) = run("> [!NOTE]\n> body\n");
-    assert_eq!(out, "@callout(kind: info)\nbody\n@end\n");
+    assert_eq!(out, "@callout(kind: note)\nbody\n@end\n");
     assert_eq!(holes, vec![Hole::GfmAlert]);
 }
 
@@ -306,10 +308,10 @@ fn link_inline_clean() {
 }
 
 #[test]
-fn link_with_title_drops_title() {
+fn link_with_title_preserved() {
     let (out, holes) = run("[t](https://x \"some title\")\n");
-    assert_eq!(out, "@link[t](https://x)\n");
-    assert_eq!(holes, vec![Hole::LinkTitleDropped]);
+    assert_eq!(out, "@link(title: \"some title\")[t](https://x)\n");
+    assert!(holes.is_empty(), "{:?}", holes);
 }
 
 #[test]
@@ -479,11 +481,121 @@ fn roundtrip_sample_compiles_clean() {
     let (mut doc, mut diags) = parse(tokens, &src);
     let reg = Registry::with_builtins();
     diags.extend(resolve(&mut doc, &reg));
-    diags.extend(validate(&doc, &ValidateOpts::default()));
+    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
     assert!(
         diags.is_empty(),
         "converter produced invalid Brief:\n--- BRIEF ---\n{}\n--- DIAGS ---\n{:#?}",
         result.brief_source,
         diags
     );
+}
+
+// --- 4.4: convert link title: kwarg ---
+
+#[test]
+fn link_with_title_preserved_in_convert() {
+    // A Markdown link with a title must produce @link(title: "...")[text](url)
+    // and must NOT emit a LinkTitleDropped diagnostic.
+    let (out, holes) = run("[t](https://x \"the title\")\n");
+    assert_eq!(out, "@link(title: \"the title\")[t](https://x)\n");
+    assert!(
+        !holes.contains(&Hole::LinkTitleDropped),
+        "LinkTitleDropped must not be emitted: {:?}",
+        holes
+    );
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn link_without_title_no_kwarg() {
+    // A link without a title must still produce the plain form.
+    let (out, holes) = run("[text](https://example.com)\n");
+    assert_eq!(out, "see @link[text](https://example.com)\n".replace("see ", ""));
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn link_with_title_roundtrips_through_compiler() {
+    // The produced @link(title: "...")[text](url) form must parse and compile clean.
+    let md = "[doc](https://example.com \"the title\")\n";
+    let result = convert(md, "test.md");
+    assert!(
+        result.brief_source.contains("@link(title: \"the title\")"),
+        "brief: {}",
+        result.brief_source
+    );
+    let src = SourceMap::new("t.brf", &result.brief_source);
+    let tokens = lex(&src).expect("lex must succeed");
+    let (mut doc, mut diags) = parse(tokens, &src);
+    let reg = Registry::with_builtins();
+    diags.extend(resolve(&mut doc, &reg));
+    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+    assert!(
+        diags.is_empty(),
+        "converted Brief with title failed to compile:\n---\n{}\n---\n{:#?}",
+        result.brief_source,
+        diags
+    );
+}
+
+// --- 4.4: convert GFM alert kinds ---
+
+#[test]
+fn gfm_alert_tip() {
+    let (out, holes) = run("> [!TIP]\n> body\n");
+    assert_eq!(out, "@callout(kind: tip)\nbody\n@end\n");
+    assert_eq!(holes, vec![Hole::GfmAlert]);
+}
+
+#[test]
+fn gfm_alert_important() {
+    let (out, holes) = run("> [!IMPORTANT]\n> body\n");
+    assert_eq!(out, "@callout(kind: important)\nbody\n@end\n");
+    assert_eq!(holes, vec![Hole::GfmAlert]);
+}
+
+#[test]
+fn gfm_alert_caution() {
+    let (out, holes) = run("> [!CAUTION]\n> body\n");
+    assert_eq!(out, "@callout(kind: caution)\nbody\n@end\n");
+    assert_eq!(holes, vec![Hole::GfmAlert]);
+}
+
+#[test]
+fn gfm_alert_warning_maps_to_warning() {
+    let (out, holes) = run("> [!WARNING]\n> careful\n");
+    assert_eq!(out, "@callout(kind: warning)\ncareful\n@end\n");
+    assert_eq!(holes, vec![Hole::GfmAlert]);
+}
+
+#[test]
+fn gfm_alert_note_maps_to_note() {
+    let (out, holes) = run("> [!NOTE]\n> content\n");
+    assert_eq!(out, "@callout(kind: note)\ncontent\n@end\n");
+    assert_eq!(holes, vec![Hole::GfmAlert]);
+}
+
+#[test]
+fn gfm_all_five_alert_kinds_roundtrip() {
+    for (kind, _) in [
+        ("> [!NOTE]\n> body\n", "note"),
+        ("> [!TIP]\n> body\n", "tip"),
+        ("> [!IMPORTANT]\n> body\n", "important"),
+        ("> [!WARNING]\n> body\n", "warning"),
+        ("> [!CAUTION]\n> body\n", "caution"),
+    ] {
+        let result = convert(kind, "test.md");
+        let src = SourceMap::new("t.brf", &result.brief_source);
+        let tokens = lex(&src).expect("lex must succeed");
+        let (mut doc, mut diags) = parse(tokens, &src);
+        let reg = Registry::with_builtins();
+        diags.extend(resolve(&mut doc, &reg));
+        diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+        assert!(
+            diags.is_empty(),
+            "GFM alert roundtrip failed:\n---\n{}\n---\n{:#?}",
+            result.brief_source,
+            diags
+        );
+    }
 }

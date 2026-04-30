@@ -1,4 +1,4 @@
-use crate::ast::{Block, CodeAttrs, Document, Inline, ListItem, Row, ShortArgs};
+use crate::ast::{Block, CodeAttrs, Document, Inline, ListItem, Row, ShortArgs, TaskState};
 use crate::diag::{Code, Diagnostic};
 use crate::inline::{parse_args, parse_inline};
 use crate::span::{SourceMap, Span};
@@ -296,12 +296,22 @@ impl<'a> Parser<'a> {
             );
         }
         let text_offset = indent + level as usize + 1;
-        let text = &line[text_offset..];
-        let (content, idiags) = parse_inline(text, tok.span.start + text_offset as u32);
+        let raw_text = &line[text_offset..];
+
+        // Anchor detection: look for a trailing `{#name}` block.
+        // Only triggers when the line ends with `}` and contains `{#`.
+        let (heading_text, anchor) = parse_heading_anchor(
+            raw_text,
+            tok.span.start + text_offset as u32,
+            &mut self.diags,
+        );
+
+        let (content, idiags) = parse_inline(heading_text, tok.span.start + text_offset as u32);
         self.diags.extend(idiags);
         Block::Heading {
             level,
             content,
+            anchor,
             span: tok.span,
         }
     }
@@ -447,8 +457,21 @@ impl<'a> Parser<'a> {
             if !trimmed.starts_with("- ") {
                 break;
             }
-            let item_text = &trimmed[2..];
-            let (content, d) = parse_inline(item_text, tok.span.start + indent as u32 + 2);
+            let after_marker = &trimmed[2..];
+            // Task-list modifier: exactly `[x] ` (Done) or `[ ] ` (Todo) at
+            // the start of item content. Lowercase `x` only; one space; one
+            // marker length only. Anything else is plain inline content.
+            let (task, item_text, content_offset) = if let Some(rest) = after_marker.strip_prefix("[x] ") {
+                (Some(TaskState::Done), rest, 4u32)
+            } else if let Some(rest) = after_marker.strip_prefix("[ ] ") {
+                (Some(TaskState::Todo), rest, 4u32)
+            } else {
+                (None, after_marker, 0u32)
+            };
+            let (content, d) = parse_inline(
+                item_text,
+                tok.span.start + indent as u32 + 2 + content_offset,
+            );
             self.diags.extend(d);
             self.pos += 1;
             let mut children: Vec<Block> = Vec::new();
@@ -461,6 +484,7 @@ impl<'a> Parser<'a> {
             items.push(ListItem {
                 content,
                 children,
+                task,
                 span: tok.span,
             });
         }
@@ -519,6 +543,7 @@ impl<'a> Parser<'a> {
             items.push(ListItem {
                 content,
                 children,
+                task: None,
                 span: tok.span,
             });
         }
@@ -863,6 +888,125 @@ fn parse_fence_info(
         }
     }
     (lang, attrs)
+}
+
+/// Parse a trailing `{#anchor}` block from heading text.
+///
+/// Returns `(text_to_use_for_inline_parse, anchor_name)`. If the anchor
+/// block is present but malformed, a diagnostic is pushed and `anchor` is
+/// `None`, but the malformed block is still stripped from `text_to_use`
+/// where possible.
+///
+/// Anchor syntax is triggered whenever `{#` appears in the heading text.
+/// If `{#` is present but the format does not match the strict form
+/// (` {#name}` at end of line, name `[a-z0-9-]+`), it is a `BadHeadingAnchor`
+/// error.
+///
+/// Exception: `{#` in the middle of text with NO closing `}` at
+/// end-of-line is treated as plain text — it's clearly not intended as
+/// anchor syntax.
+///
+/// `base` is the byte offset of `text` in the source, used for diagnostics.
+fn parse_heading_anchor<'a>(
+    text: &'a str,
+    base: u32,
+    diags: &mut Vec<Diagnostic>,
+) -> (&'a str, Option<String>) {
+    // Quick exit: if there's no `{#` anywhere, no anchor syntax is possible.
+    if !text.contains("{#") {
+        return (text, None);
+    }
+
+    // Find the last `{#` occurrence (there can be at most one anchor block).
+    let hash_open = match text.rfind("{#") {
+        Some(i) => i,
+        None => return (text, None),
+    };
+
+    // Check if the `}` at end-of-line closes this `{#`.
+    // Case A: `{#name}` at end of line (the only valid form).
+    // Case B: `{#name}` NOT at end of line (content after `}`) → malformed.
+    // Case C: no `}` after the `{#` at all → the `{#` is inside text, leave alone.
+
+    let after_hash = &text[hash_open..];
+    let rbrace = match after_hash.find('}') {
+        Some(i) => i,
+        None => {
+            // `{#` with no closing `}` anywhere → plain text, no error.
+            return (text, None);
+        }
+    };
+
+    let candidate = &after_hash[..rbrace + 1]; // e.g. `{#abc}`
+    let after_candidate = &after_hash[rbrace + 1..]; // what comes after `}`
+
+    // If there is content after the `}`, the anchor block is NOT at end of line.
+    // This is a BadHeadingAnchor (rule: no content after `}`).
+    if !after_candidate.is_empty() {
+        let anchor_span = Span::new(base as usize + hash_open, candidate.len());
+        diags.push(
+            Diagnostic::new(Code::BadHeadingAnchor, anchor_span)
+                .label("anchor block must be `{#anchor}` with exactly one space before `{` and no content after `}`"),
+        );
+        // Leave the heading text alone (don't strip anything).
+        return (text, None);
+    }
+
+    // The candidate `{#...}` IS at end of line.
+    // Validate: exactly one space before `{`.
+    let before = &text[..hash_open];
+
+    let malformed = if before.is_empty() {
+        // No content before `{#...}` → no space before `{`.
+        true
+    } else {
+        let last_ch = before.chars().last().unwrap();
+        if last_ch != ' ' {
+            // No space before `{`
+            true
+        } else {
+            // Check for double space (before ends with "  ")
+            let before_trim = &before[..before.len() - 1];
+            before_trim.ends_with(' ')
+        }
+    };
+
+    // Extract the name (everything between `{#` and `}`).
+    let name_part = &candidate[2..candidate.len() - 1]; // strip `{#` and `}`
+
+    let anchor_span_start = base as usize + hash_open;
+    let anchor_span = Span::new(anchor_span_start, candidate.len());
+
+    if malformed {
+        diags.push(
+            Diagnostic::new(Code::BadHeadingAnchor, anchor_span)
+                .label("anchor block must be `{#anchor}` with exactly one space before `{` and no content after `}`"),
+        );
+        // Strip the malformed block from text.
+        return (&text[..hash_open], None);
+    }
+
+    // Validate the name: `[a-z0-9-]+`, non-empty.
+    let name_is_valid = !name_part.is_empty()
+        && name_part
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+
+    // Strip ` {#name}` from the text (one space + anchor block).
+    // `hash_open - 1` skips the single space before `{`.
+    let stripped = &text[..hash_open - 1];
+
+    if !name_is_valid {
+        let name_span = Span::new(anchor_span_start + 2, name_part.len().max(1));
+        diags.push(
+            Diagnostic::new(Code::BadHeadingAnchor, name_span)
+                .label("anchor must match `[a-z0-9-]+`")
+                .help("use lowercase letters, digits, and hyphens only"),
+        );
+        return (stripped, None);
+    }
+
+    (stripped, Some(name_part.to_string()))
 }
 
 fn leading_block_sigil(s: &str) -> bool {
