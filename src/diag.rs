@@ -104,9 +104,7 @@ impl Code {
             FormMismatch => "shortcode used in the wrong form (block vs. inline)",
             BadArgSyntax => "malformed shortcode argument syntax",
             DuplicateKwarg => "keyword argument given more than once",
-            DeprecatedCalloutKind => {
-                "callout kind is deprecated; use the GFM equivalent"
-            }
+            DeprecatedCalloutKind => "callout kind is deprecated; use the GFM equivalent",
             OrderedListSequence => "ordered list numbering must be sequential starting from 1",
             TableColumnMismatch => "table row column count does not match header",
             HeadingMonotonic => "heading levels must increase by at most one",

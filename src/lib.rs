@@ -12,6 +12,7 @@ pub mod shortcode;
 pub mod span;
 pub mod token;
 pub mod validate;
+pub mod watch;
 
 pub use diag::{Code, Diagnostic};
 pub use span::{SourceMap, Span};

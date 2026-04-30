@@ -461,13 +461,14 @@ impl<'a> Parser<'a> {
             // Task-list modifier: exactly `[x] ` (Done) or `[ ] ` (Todo) at
             // the start of item content. Lowercase `x` only; one space; one
             // marker length only. Anything else is plain inline content.
-            let (task, item_text, content_offset) = if let Some(rest) = after_marker.strip_prefix("[x] ") {
-                (Some(TaskState::Done), rest, 4u32)
-            } else if let Some(rest) = after_marker.strip_prefix("[ ] ") {
-                (Some(TaskState::Todo), rest, 4u32)
-            } else {
-                (None, after_marker, 0u32)
-            };
+            let (task, item_text, content_offset) =
+                if let Some(rest) = after_marker.strip_prefix("[x] ") {
+                    (Some(TaskState::Done), rest, 4u32)
+                } else if let Some(rest) = after_marker.strip_prefix("[ ] ") {
+                    (Some(TaskState::Todo), rest, 4u32)
+                } else {
+                    (None, after_marker, 0u32)
+                };
             let (content, d) = parse_inline(
                 item_text,
                 tok.span.start + indent as u32 + 2 + content_offset,

@@ -356,8 +356,7 @@ fn sup_inline_llm() {
 
 #[test]
 fn details_block_html() {
-    let (html, codes) =
-        compile("@details(summary: \"Stack trace\")\nbody line\n@end\n");
+    let (html, codes) = compile("@details(summary: \"Stack trace\")\nbody line\n@end\n");
     assert!(codes.is_empty(), "{:?}", codes);
     assert!(
         html.contains("<details><summary>Stack trace</summary>"),
@@ -430,7 +429,9 @@ fn task_list_done_html() {
         html
     );
     assert!(
-        html.contains("<li class=\"task-list-item\"><input type=\"checkbox\" disabled checked> ship it</li>"),
+        html.contains(
+            "<li class=\"task-list-item\"><input type=\"checkbox\" disabled checked> ship it</li>"
+        ),
         "{}",
         html
     );
@@ -441,7 +442,9 @@ fn task_list_todo_html() {
     let (html, codes) = compile("- [ ] write tests\n");
     assert!(codes.is_empty(), "{:?}", codes);
     assert!(
-        html.contains("<li class=\"task-list-item\"><input type=\"checkbox\" disabled> write tests</li>"),
+        html.contains(
+            "<li class=\"task-list-item\"><input type=\"checkbox\" disabled> write tests</li>"
+        ),
         "{}",
         html
     );
@@ -453,8 +456,16 @@ fn task_list_mixed_with_plain_items() {
     assert!(codes.is_empty(), "{:?}", codes);
     // `<ul>` carries the contains-task-list class because at least one
     // item is a task; the plain `- two` keeps a vanilla `<li>`.
-    assert!(html.contains("<ul class=\"contains-task-list\">"), "{}", html);
-    assert!(html.contains("<li>two</li>"), "plain li lost class: {}", html);
+    assert!(
+        html.contains("<ul class=\"contains-task-list\">"),
+        "{}",
+        html
+    );
+    assert!(
+        html.contains("<li>two</li>"),
+        "plain li lost class: {}",
+        html
+    );
     assert!(
         html.contains("class=\"task-list-item\"><input type=\"checkbox\" disabled checked>"),
         "{}",
@@ -476,7 +487,11 @@ fn task_list_marker_uppercase_x_is_plain_text() {
     assert!(codes.is_empty(), "{:?}", codes);
     assert!(!html.contains("contains-task-list"), "{}", html);
     assert!(!html.contains("task-list-item"), "{}", html);
-    assert!(html.contains("[X] not a task"), "literal preserved: {}", html);
+    assert!(
+        html.contains("[X] not a task"),
+        "literal preserved: {}",
+        html
+    );
 }
 
 #[test]
@@ -562,7 +577,10 @@ fn link_title_html() {
 
 #[test]
 fn link_title_llm() {
-    let src = SourceMap::new("t.brf", "see @link(title: \"alt text\")[here](https://x.example)\n");
+    let src = SourceMap::new(
+        "t.brf",
+        "see @link(title: \"alt text\")[here](https://x.example)\n",
+    );
     let toks = lex(&src).unwrap();
     let (mut doc, diags) = parse(toks, &src);
     assert!(diags.is_empty(), "{:?}", diags);
@@ -570,7 +588,11 @@ fn link_title_llm() {
     let r = resolve(&mut doc, &reg);
     assert!(r.is_empty(), "{:?}", r);
     let (out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
-    assert!(out.contains("[here](https://x.example \"alt text\")"), "{}", out);
+    assert!(
+        out.contains("[here](https://x.example \"alt text\")"),
+        "{}",
+        out
+    );
 }
 
 #[test]
@@ -631,14 +653,24 @@ fn callout_kind_bogus_still_errors() {
 fn callout_kind_info_deprecated_emits_warning_and_rewrites() {
     let (html, diags) = compile_with_diags("@callout(kind: info)\nbody\n@end\n");
     // Must produce a B0408 warning with Severity::Warning
-    let warn = diags
-        .iter()
-        .find(|d| d.code == Code::DeprecatedCalloutKind);
-    assert!(warn.is_some(), "expected DeprecatedCalloutKind warning: {:?}", diags);
+    let warn = diags.iter().find(|d| d.code == Code::DeprecatedCalloutKind);
+    assert!(
+        warn.is_some(),
+        "expected DeprecatedCalloutKind warning: {:?}",
+        diags
+    );
     assert_eq!(warn.unwrap().severity, Severity::Warning);
     // HTML output must show callout-note (rewritten from info → note)
-    assert!(html.contains("callout-note"), "expected callout-note: {}", html);
-    assert!(!html.contains("callout-info"), "must not contain callout-info: {}", html);
+    assert!(
+        html.contains("callout-note"),
+        "expected callout-note: {}",
+        html
+    );
+    assert!(
+        !html.contains("callout-info"),
+        "must not contain callout-info: {}",
+        html
+    );
 }
 
 #[test]
@@ -660,12 +692,18 @@ fn callout_kind_info_llm_shows_note() {
 #[test]
 fn callout_kind_danger_deprecated_emits_warning_and_rewrites_to_caution() {
     let (html, diags) = compile_with_diags("@callout(kind: danger)\nbody\n@end\n");
-    let warn = diags
-        .iter()
-        .find(|d| d.code == Code::DeprecatedCalloutKind);
-    assert!(warn.is_some(), "expected DeprecatedCalloutKind warning: {:?}", diags);
+    let warn = diags.iter().find(|d| d.code == Code::DeprecatedCalloutKind);
+    assert!(
+        warn.is_some(),
+        "expected DeprecatedCalloutKind warning: {:?}",
+        diags
+    );
     assert_eq!(warn.unwrap().severity, Severity::Warning);
-    assert!(html.contains("callout-caution"), "expected callout-caution: {}", html);
+    assert!(
+        html.contains("callout-caution"),
+        "expected callout-caution: {}",
+        html
+    );
 }
 
 #[test]
@@ -677,7 +715,11 @@ fn callout_deprecated_kind_warning_in_resolve() {
     let reg = Registry::with_builtins();
     let diags = resolve(&mut doc, &reg);
     let warn = diags.iter().find(|d| d.code == Code::DeprecatedCalloutKind);
-    assert!(warn.is_some(), "resolve must return DeprecatedCalloutKind: {:?}", diags);
+    assert!(
+        warn.is_some(),
+        "resolve must return DeprecatedCalloutKind: {:?}",
+        diags
+    );
     assert_eq!(warn.unwrap().severity, Severity::Warning);
 }
 
@@ -699,7 +741,11 @@ fn heading_anchor_valid_ast_html_llm() {
     assert!(diags.is_empty(), "{:?}", diags);
     assert_eq!(doc.blocks.len(), 1);
     if let brief::ast::Block::Heading { anchor, .. } = &doc.blocks[0] {
-        assert_eq!(anchor.as_deref(), Some("hello"), "anchor should be Some(\"hello\")");
+        assert_eq!(
+            anchor.as_deref(),
+            Some("hello"),
+            "anchor should be Some(\"hello\")"
+        );
     } else {
         panic!("expected Heading block");
     }
@@ -707,12 +753,20 @@ fn heading_anchor_valid_ast_html_llm() {
     // HTML: id="hello" on <h2>
     let (html, codes) = compile("## Heading {#hello}\n");
     assert!(codes.is_empty(), "{:?}", codes);
-    assert!(html.contains("<h2 id=\"hello\">Heading</h2>"), "html: {}", html);
+    assert!(
+        html.contains("<h2 id=\"hello\">Heading</h2>"),
+        "html: {}",
+        html
+    );
 
     // LLM: no anchor, just `## Heading\n`
     let llm_out = render_llm("## Heading {#hello}\n");
     assert!(llm_out.contains("## Heading"), "llm: {}", llm_out);
-    assert!(!llm_out.contains("{#hello}"), "anchor must be stripped in llm: {}", llm_out);
+    assert!(
+        !llm_out.contains("{#hello}"),
+        "anchor must be stripped in llm: {}",
+        llm_out
+    );
 }
 
 /// Test 2: plain heading — no anchor.

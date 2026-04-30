@@ -510,7 +510,10 @@ fn link_with_title_preserved_in_convert() {
 fn link_without_title_no_kwarg() {
     // A link without a title must still produce the plain form.
     let (out, holes) = run("[text](https://example.com)\n");
-    assert_eq!(out, "see @link[text](https://example.com)\n".replace("see ", ""));
+    assert_eq!(
+        out,
+        "see @link[text](https://example.com)\n".replace("see ", "")
+    );
     assert!(holes.is_empty(), "{:?}", holes);
 }
 

@@ -1,5 +1,5 @@
 use brief::config;
-use brief::diag::{render_all, Severity};
+use brief::diag::{Severity, render_all};
 use brief::emit::{html, llm};
 use brief::lexer;
 use brief::parser;
@@ -58,6 +58,24 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Watch files/dirs and recompile on change. 100ms debounce. Whole-file
+    /// recompile only.
+    Watch {
+        /// Files or directories to watch. Defaults to the current directory.
+        paths: Vec<PathBuf>,
+        #[arg(long, default_value = "html")]
+        target: String,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        strip_emphasis: bool,
+        #[arg(long)]
+        keep_table_rule: bool,
+        #[arg(long)]
+        keep_asset_urls: bool,
+        #[arg(long)]
+        keep_metadata: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -91,7 +109,68 @@ fn main() -> ExitCode {
             stdout,
             force,
         } => run_convert(inputs, output, stdout, force),
+        Cmd::Watch {
+            paths,
+            target,
+            config: cfg,
+            strip_emphasis,
+            keep_table_rule,
+            keep_asset_urls,
+            keep_metadata,
+        } => run_watch(
+            paths,
+            target,
+            cfg,
+            strip_emphasis,
+            keep_table_rule,
+            keep_asset_urls,
+            keep_metadata,
+        ),
     }
+}
+
+fn run_watch(
+    paths: Vec<PathBuf>,
+    target: String,
+    cfg_path: Option<PathBuf>,
+    strip_emphasis: bool,
+    keep_table_rule: bool,
+    keep_asset_urls: bool,
+    keep_metadata: bool,
+) -> ExitCode {
+    use brief::watch::{LlmOpts, Target as WatchTarget, WatchOpts};
+    let target = match WatchTarget::parse(&target) {
+        Some(t) => t,
+        None => {
+            eprintln!(
+                "brief: unknown target `{}` (expected html, llm, json)",
+                target
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let paths = if paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        paths
+    };
+    let config_path = cfg_path.unwrap_or_else(|| PathBuf::from("brief.toml"));
+    let opts = WatchOpts {
+        paths,
+        target,
+        config_path,
+        llm_opts: LlmOpts {
+            strip_emphasis,
+            keep_table_rule,
+            keep_asset_urls,
+            keep_metadata,
+        },
+    };
+    if let Err(e) = brief::watch::run(opts) {
+        eprintln!("brief: {}", e);
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_compile(
@@ -179,9 +258,7 @@ fn run_compile(
     let (mut doc, mut diags) = parser::parse(tokens, &src);
     diags.extend(resolve::resolve(&mut doc, &registry));
     diags.extend(validate::validate(&doc, &opts, &src));
-    let has_errors = diags
-        .iter()
-        .any(|d| d.severity == Severity::Error);
+    let has_errors = diags.iter().any(|d| d.severity == Severity::Error);
     if has_errors {
         eprint!("{}", render_all(&diags, &src));
         return ExitCode::from(1);

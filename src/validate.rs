@@ -58,12 +58,9 @@ fn collect_anchor(
             if let Some(name) = anchor {
                 if let Some(first_span) = seen.get(name) {
                     let (first_line, _) = src.line_col(first_span.start);
-                    diags.push(
-                        Diagnostic::new(Code::DuplicateHeadingAnchor, *span).label(format!(
-                            "anchor `{}` already used at line {}",
-                            name, first_line
-                        )),
-                    );
+                    diags.push(Diagnostic::new(Code::DuplicateHeadingAnchor, *span).label(
+                        format!("anchor `{}` already used at line {}", name, first_line),
+                    ));
                 } else {
                     seen.insert(name.clone(), *span);
                 }

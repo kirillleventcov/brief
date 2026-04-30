@@ -27,7 +27,7 @@ impl ArgValue {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ArgType {
     String,
@@ -36,7 +36,7 @@ pub enum ArgType {
     Array,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct ArgSpec {
     #[serde(rename = "type")]
     pub ty: ArgType,
@@ -48,7 +48,7 @@ pub struct ArgSpec {
     pub oneof: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ShortKindOpt {
     Inline,
@@ -62,7 +62,7 @@ impl Default for ShortKindOpt {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Default)]
+#[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
 pub struct Shortcode {
     #[serde(default)]
     pub kind: ShortKindOpt,

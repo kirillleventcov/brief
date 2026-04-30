@@ -143,7 +143,10 @@ fn check_shortcode(
         if let Some(v) = args.keyword.get("kind") {
             if let Some(s) = v.as_str() {
                 let (canonical, label_msg): (Option<&str>, Option<&str>) = match s {
-                    "info" => (Some("note"), Some("`kind: info` is deprecated; use `kind: note`")),
+                    "info" => (
+                        Some("note"),
+                        Some("`kind: info` is deprecated; use `kind: note`"),
+                    ),
                     "danger" => (
                         Some("caution"),
                         Some("`kind: danger` is deprecated; use `kind: caution`"),
@@ -151,9 +154,7 @@ fn check_shortcode(
                     _ => (None, None),
                 };
                 if let (Some(canonical), Some(msg)) = (canonical, label_msg) {
-                    diags.push(
-                        Diagnostic::warning(Code::DeprecatedCalloutKind, span).label(msg),
-                    );
+                    diags.push(Diagnostic::warning(Code::DeprecatedCalloutKind, span).label(msg));
                     args.keyword
                         .insert("kind".into(), ArgValue::Str(canonical.into()));
                 }

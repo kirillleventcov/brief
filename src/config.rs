@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct Config {
     #[serde(default)]
     pub project: Project,
@@ -15,7 +15,7 @@ pub struct Config {
     pub hooks: Hooks,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct Project {
     #[serde(default)]
     pub name: String,
@@ -23,7 +23,7 @@ pub struct Project {
     pub version: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct Compile {
     #[serde(default)]
     pub strict_heading_levels: bool,
@@ -33,7 +33,7 @@ pub struct Compile {
     pub llm: LlmCompile,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct LlmCompile {
     /// Master switch. When false, code blocks are emitted verbatim regardless
     /// of language tag or `@minify` attribute.
@@ -92,7 +92,7 @@ fn default_preserve_code_fences() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct Hooks {
     #[serde(default)]
     pub before_compile: Vec<String>,
