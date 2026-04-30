@@ -36,6 +36,7 @@ Brief documents can carry optional TOML frontmatter at the very top:
     # Document content
 
 Rules:
+
 - Frontmatter is optional. If present, it must be the very first content
   in the file (after an optional UTF-8 BOM).
 - The opening and closing delimiter is exactly `+++` on a line by itself.
@@ -59,19 +60,7 @@ brief compile doc.brf --target=llm --report-tokens
 In `--target=llm` mode, fenced code blocks are minified for languages
 where minification is meaning-preserving for an LLM consumer.
 
-**v0.2** ships JSON / JSONL minification (pretty-printed JSON is reduced
-to its compact form).
-
-**v0.3** adds hand-rolled tokenizer-based minifiers for the C-family
-plus SQL: `rust` (alias `rs`), `c` / `h`, `cpp` / `c++` / `cc` / `cxx` /
-`hpp` / `hxx`, `java`, `go`, `javascript` (alias `js`), `typescript`
-(alias `ts`), and `sql`. Comments are stripped by default; whitespace
-collapses to the minimum required to preserve token boundaries.
-
-JS / TS and Go preserve newlines (their automatic semicolon insertion
-makes whitespace-stripping ambiguous without a real parser). C / C++
-preserve newlines around `#`-preprocessor lines. All other languages
-(Rust, Java, SQL) collapse to a single line.
+Comments are stripped by default; whitespace collapses to the minimum required to preserve token boundaries. JS / TS and Go preserve newlines (their automatic semicolon insertion makes whitespace-stripping ambiguous without a real parser). C / C++ preserve newlines around `#`-preprocessor lines. All other languages (Rust, Java, SQL) collapse to a single line.
 
 ### Three states per block
 
@@ -115,7 +104,7 @@ document-level `minify_code = false` in frontmatter:
 
 ### Knobs in `brief.toml`
 
-```toml
+````toml
 [compile.llm]
 minify_code_blocks = true               # master switch
 preserve_code_fences = true             # keep ```lang around output
@@ -127,7 +116,7 @@ minify_languages = [                    # allowlist (defaults shown)
   "javascript", "js", "typescript", "ts",
   "sql",
 ]
-```
+````
 
 ### Refused languages
 
