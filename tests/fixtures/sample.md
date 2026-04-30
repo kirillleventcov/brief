@@ -28,6 +28,12 @@ fn main() {
 
 See [the docs](https://example.com) for details.
 
+The famous identity is $E = mc^2$ in inline form.
+
+$$
+\int_0^1 x \, dx = \frac{1}{2}
+$$
+
 ---
 
 End.

@@ -434,6 +434,35 @@ fn html_entities_decoded_silently_in_v02() {
     // deferred to a later version. See Task 22 in the implementation plan.
 }
 
+#[test]
+fn inline_math_passthrough() {
+    let (out, holes) = run("the energy is $E = mc^2$\n");
+    assert_eq!(out, "the energy is @math[E = mc^2]\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn display_math_block_single_line() {
+    let (out, holes) = run("$$x + y$$\n");
+    assert_eq!(out, "@math\nx + y\n@end\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn display_math_block_multiline() {
+    let (out, holes) = run("$$\n\\int_0^1 x \\, dx\n$$\n");
+    assert_eq!(out, "@math\n\\int_0^1 x \\, dx\n@end\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn dollar_without_pair_is_text() {
+    // A lone `$` (e.g. a price) must not trigger math conversion.
+    let (out, holes) = run("the price is $5 today\n");
+    assert_eq!(out, "the price is $5 today\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
 use brief::lexer::lex;
 use brief::parser::parse;
 use brief::resolve::resolve;

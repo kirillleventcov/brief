@@ -103,6 +103,7 @@ pub fn convert(input: &str, source_path: &str) -> ConvertResult {
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_GFM);
+    opts.insert(Options::ENABLE_MATH);
     opts.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
     opts.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
 
@@ -830,6 +831,18 @@ impl<'a> Walker<'a> {
             Event::HardBreak => {
                 self.write_char('\\');
                 self.write_char('\n');
+            }
+            Event::InlineMath(s) => {
+                self.write("@math[");
+                self.write(&s);
+                self.write_char(']');
+            }
+            Event::DisplayMath(s) => {
+                let body = s.trim_matches('\n');
+                self.write("@math\n");
+                self.write(body);
+                self.write_char('\n');
+                self.write("@end");
             }
             _ => {
                 // Other events handled in subsequent tasks.
