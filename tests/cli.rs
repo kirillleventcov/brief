@@ -123,6 +123,73 @@ fn force_overwrites() {
 }
 
 #[test]
+fn compile_md_without_convert_errors() {
+    let dir = temp_dir("compile_md_no_convert");
+    let input = dir.join("note.md");
+    // Use a Markdown-only construct that wouldn't survive Brief's strict lex.
+    std::fs::write(&input, "**bold here**\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("compile")
+        .arg(&input)
+        .arg("--target=llm")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--convert"),
+        "expected stderr to suggest --convert, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn compile_md_with_convert_succeeds() {
+    let dir = temp_dir("compile_md_with_convert");
+    let input = dir.join("note.md");
+    std::fs::write(&input, "# Hello\n\n**bold here**\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("compile")
+        .arg(&input)
+        .arg("--target=llm")
+        .arg("--convert")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "compile --convert failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Hello"));
+    assert!(stdout.contains("bold here"));
+    // Holes are reported on stderr but don't fail the compile.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("double-emphasis"), "stderr={}", stderr);
+}
+
+#[test]
+fn compile_brf_with_convert_flag_still_works() {
+    // Passing --convert to a non-Markdown input runs the converter on Brief
+    // source. Plain ASCII text round-trips, so the compile still succeeds.
+    let dir = temp_dir("compile_brf_with_convert");
+    let input = dir.join("doc.brf");
+    std::fs::write(&input, "# Hello\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("compile")
+        .arg(&input)
+        .arg("--target=llm")
+        .arg("--convert")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "compile --convert on .brf failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn batch_continues_past_failure() {
     let dir = temp_dir("batch_continue");
     let good = dir.join("good.md");

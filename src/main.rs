@@ -34,6 +34,11 @@ enum Cmd {
         keep_table_rule: bool,
         #[arg(long)]
         keep_asset_urls: bool,
+        /// Treat the input as Markdown and convert to Brief in memory before
+        /// compiling. Equivalent to `brief convert ... | brief compile -` but
+        /// in one step.
+        #[arg(long)]
+        convert: bool,
     },
     Explain {
         code: String,
@@ -64,6 +69,7 @@ fn main() -> ExitCode {
             strip_emphasis,
             keep_table_rule,
             keep_asset_urls,
+            convert,
         } => run_compile(
             input,
             target,
@@ -72,6 +78,7 @@ fn main() -> ExitCode {
             strip_emphasis,
             keep_table_rule,
             keep_asset_urls,
+            convert,
         ),
         Cmd::Explain { code } => run_explain(&code),
         Cmd::Convert {
@@ -91,18 +98,42 @@ fn run_compile(
     strip_emphasis: bool,
     keep_table_rule: bool,
     keep_asset_urls: bool,
+    convert: bool,
 ) -> ExitCode {
-    let source = match std::fs::read_to_string(&input) {
+    let raw = match std::fs::read_to_string(&input) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("brief: cannot read {}: {}", input.display(), e);
             return ExitCode::from(2);
         }
     };
-    let source = source
-        .strip_prefix('\u{feff}')
-        .unwrap_or(&source)
-        .to_string();
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw).to_string();
+
+    let is_markdown = input.extension().and_then(|s| s.to_str()) == Some("md");
+
+    let source = if convert {
+        let result = brief::convert::convert(&raw, &input.to_string_lossy());
+        for d in &result.diagnostics {
+            eprintln!(
+                "brief: note[{}]: {}:{}:{}: {}",
+                d.hole.slug(),
+                input.display(),
+                d.line,
+                d.col,
+                d.note
+            );
+        }
+        result.brief_source
+    } else if is_markdown {
+        eprintln!(
+            "brief: {} looks like Markdown — pass `--convert` to convert and compile in one step",
+            input.display()
+        );
+        return ExitCode::from(2);
+    } else {
+        raw
+    };
+
     let src = SourceMap::new(input.to_string_lossy(), source);
 
     let cfg = match cfg_path {
