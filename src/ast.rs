@@ -55,6 +55,10 @@ pub enum Block {
 pub struct CodeAttrs {
     pub nominify: bool,
     pub minify: bool,
+    /// `@minify-keep-comments` — State 3. Implies minification but the
+    /// minifier preserves comments (converting `//` to `/* */` where
+    /// necessary, with a B0703 warning per conversion).
+    pub keep_comments: bool,
 }
 
 #[derive(Clone, Debug)]

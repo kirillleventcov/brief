@@ -63,7 +63,30 @@ fn default_minify_code_blocks() -> bool {
     true
 }
 fn default_minify_languages() -> Vec<String> {
-    vec!["json".into(), "jsonl".into()]
+    // v0.3 ships minifiers for JSON/JSONL plus the C-family + SQL set.
+    // Aliases are listed explicitly so a user pruning the list by tag name
+    // doesn't accidentally lose a language.
+    vec![
+        "json".into(),
+        "jsonl".into(),
+        "rust".into(),
+        "rs".into(),
+        "c".into(),
+        "h".into(),
+        "cpp".into(),
+        "c++".into(),
+        "cc".into(),
+        "cxx".into(),
+        "hpp".into(),
+        "hxx".into(),
+        "java".into(),
+        "go".into(),
+        "javascript".into(),
+        "js".into(),
+        "typescript".into(),
+        "ts".into(),
+        "sql".into(),
+    ]
 }
 fn default_preserve_code_fences() -> bool {
     true

@@ -827,10 +827,10 @@ fn parse_fence_info(
         let name = &tok[1..];
         match name {
             "nominify" => {
-                if attrs.minify {
+                if attrs.minify || attrs.keep_comments {
                     diags.push(
                         Diagnostic::new(Code::ConflictingCodeAttributes, fence_span)
-                            .label("`@nominify` and `@minify` cannot both be set"),
+                            .label("`@nominify` conflicts with `@minify`/`@minify-keep-comments`"),
                     );
                 }
                 attrs.nominify = true;
@@ -844,11 +844,20 @@ fn parse_fence_info(
                 }
                 attrs.minify = true;
             }
+            "minify-keep-comments" => {
+                if attrs.nominify {
+                    diags.push(
+                        Diagnostic::new(Code::ConflictingCodeAttributes, fence_span)
+                            .label("`@nominify` and `@minify-keep-comments` cannot both be set"),
+                    );
+                }
+                attrs.keep_comments = true;
+            }
             _ => {
                 diags.push(
                     Diagnostic::new(Code::UnknownCodeAttribute, tok_span)
                         .label(format!("unknown code-fence attribute `{}`", tok))
-                        .help("v0.2 supports `@nominify` and `@minify`"),
+                        .help("v0.3 supports `@nominify`, `@minify`, `@minify-keep-comments`"),
                 );
             }
         }

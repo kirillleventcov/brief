@@ -56,36 +56,97 @@ brief compile doc.brf --target=llm --report-tokens
 
 ## Code-block minification (LLM mode)
 
-In `--target=llm` mode, fenced code blocks tagged `json` or `jsonl` are
-minified by default — pretty-printed JSON is reduced to its compact form,
-which is meaning-preserving for an LLM consumer but dramatically cheaper.
+In `--target=llm` mode, fenced code blocks are minified for languages
+where minification is meaning-preserving for an LLM consumer.
 
-Per-block opt-out:
+**v0.2** ships JSON / JSONL minification (pretty-printed JSON is reduced
+to its compact form).
 
-    ```json @nominify
-    {
-      "intentionally": "preserved"
+**v0.3** adds hand-rolled tokenizer-based minifiers for the C-family
+plus SQL: `rust` (alias `rs`), `c` / `h`, `cpp` / `c++` / `cc` / `cxx` /
+`hpp` / `hxx`, `java`, `go`, `javascript` (alias `js`), `typescript`
+(alias `ts`), and `sql`. Comments are stripped by default; whitespace
+collapses to the minimum required to preserve token boundaries.
+
+JS / TS and Go preserve newlines (their automatic semicolon insertion
+makes whitespace-stripping ambiguous without a real parser). C / C++
+preserve newlines around `#`-preprocessor lines. All other languages
+(Rust, Java, SQL) collapse to a single line.
+
+### Three states per block
+
+State 1 — full minification (default):
+
+    ```rust
+    fn add(a: i32, b: i32) -> i32 {
+        // Adds two numbers.
+        a + b
     }
     ```
 
-Per-block opt-in (overrides `compile.llm.minify_code_blocks = false` and
-the document-level `minify_code = false` in frontmatter):
+→ `fn add(a:i32,b:i32)->i32{a+b}`
+
+State 2 — verbatim:
+
+    ```rust @nominify
+    fn add(a: i32, b: i32) -> i32 { /* preserved */ }
+    ```
+
+State 3 — minified whitespace, comments preserved:
+
+    ```rust @minify-keep-comments
+    fn add(a: i32, b: i32) -> i32 {
+        // Adds two numbers.
+        a + b
+    }
+    ```
+
+→ `fn add(a:i32,b:i32)->i32{/* Adds two numbers.*/a+b}` (and emits a
+`B0703` warning per `//`-to-`/* */` conversion).
+
+### Per-block opt-in
+
+`@minify` overrides `compile.llm.minify_code_blocks = false` and the
+document-level `minify_code = false` in frontmatter:
 
     ```json @minify
     { ... }
     ```
 
-Knobs in `brief.toml`:
+### Knobs in `brief.toml`
 
 ```toml
 [compile.llm]
-minify_code_blocks = true                # master switch
-minify_languages = ["json", "jsonl"]     # allowlist
-preserve_code_fences = true              # keep ```lang around output
+minify_code_blocks = true               # master switch
+preserve_code_fences = true             # keep ```lang around output
+minify_languages = [                    # allowlist (defaults shown)
+  "json", "jsonl",
+  "rust", "rs",
+  "c", "h", "cpp", "c++", "cc", "cxx", "hpp", "hxx",
+  "java", "go",
+  "javascript", "js", "typescript", "ts",
+  "sql",
+]
 ```
 
-Invalid JSON in a `json`-tagged block emits a `B0701` warning to stderr
-and the original block is kept verbatim. Compilation does not fail.
+### Refused languages
+
+Python, YAML, and Makefile have **significant whitespace**, so they
+cannot be safely minified. If a `python` / `py` / `yaml` / `yml` /
+`makefile` / `make` / `mk` block is forced to minify (via `@minify` or
+by adding the tag to `minify_languages`), the compiler emits a `B0704`
+error to stderr and falls back to verbatim emission.
+
+### Diagnostic codes
+
+- `B0701` — content tagged for minification did not parse; emitted
+  verbatim.
+- `B0702` — minified block was originally >50 lines; LLM consumers
+  cannot reference specific lines after minification.
+- `B0703` — `//` line comment converted to `/* */` form for
+  `@minify-keep-comments`. Verify the body contains no `*/`.
+- `B0704` — language uses significant whitespace; cannot be safely
+  minified.
 
 HTML output is never minified — minification is exclusively an LLM-mode
 concern.

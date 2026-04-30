@@ -1,7 +1,11 @@
 use crate::ast::{Block, CodeAttrs, Document, Inline, Row, ShortArgs};
-use crate::minify;
+use crate::minify::{self, MinifyOptions, MinifyWarning};
 use crate::shortcode::Registry;
 use std::fmt::Write;
+
+/// A minified code block longer than this many source lines triggers a B0702
+/// warning that the LLM consumer cannot reference original line numbers.
+const LONG_BLOCK_LINE_THRESHOLD: usize = 50;
 
 #[derive(Clone, Debug)]
 pub struct Opts {
@@ -21,13 +25,39 @@ pub struct Opts {
 
 impl Default for Opts {
     fn default() -> Self {
+        // The Opts default is used in unit tests and in fall-back code paths
+        // when no `brief.toml` is on disk. Keeping it in sync with the
+        // canonical default in `config::default_minify_languages` matters
+        // because the LLM emit pass is the one that actually consults this
+        // list to decide whether to attempt minification on a tag the
+        // dispatcher knows about.
         Opts {
             strip_emphasis: false,
             keep_table_rule: false,
             keep_asset_urls: false,
             keep_metadata: false,
             minify_code_blocks: true,
-            minify_languages: vec!["json".into(), "jsonl".into()],
+            minify_languages: vec![
+                "json".into(),
+                "jsonl".into(),
+                "rust".into(),
+                "rs".into(),
+                "c".into(),
+                "h".into(),
+                "cpp".into(),
+                "c++".into(),
+                "cc".into(),
+                "cxx".into(),
+                "hpp".into(),
+                "hxx".into(),
+                "java".into(),
+                "go".into(),
+                "javascript".into(),
+                "js".into(),
+                "typescript".into(),
+                "ts".into(),
+                "sql".into(),
+            ],
             preserve_code_fences: true,
         }
     }
@@ -184,11 +214,35 @@ fn try_minify(lang: Option<&str>, body: &str, attrs: &CodeAttrs, ctx: &mut Ctx) 
         return None;
     }
     let lang = lang?;
+    let lang_lc = lang.to_ascii_lowercase();
 
-    // Three layers of opt-out, in priority order: per-block @minify forces
-    // minification (overriding all opt-outs except @nominify); then
-    // frontmatter `minify_code = false`; then config `minify_code_blocks`.
-    if !attrs.minify {
+    let force_minify = attrs.minify || attrs.keep_comments;
+
+    // Refusal gate (B0704). Only emitted when the user is trying to
+    // minify the block — either via an explicit attribute, or because the
+    // language is on the allowlist (i.e., it was deliberately enabled in
+    // brief.toml). We never error on a bare ```python``` block that was
+    // never opted in.
+    if let Some(reason) = minify::refusal_reason(&lang_lc) {
+        let in_allowlist = ctx
+            .opts
+            .minify_languages
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case(&lang_lc));
+        if force_minify || in_allowlist {
+            ctx.warnings.push(format!(
+                "error[B0704]: language `{}` cannot be minified — {}",
+                lang, reason
+            ));
+        }
+        return None;
+    }
+
+    // Three layers of opt-out, in priority order: per-block @minify (or
+    // @minify-keep-comments) forces minification, overriding all opt-outs
+    // except @nominify; then frontmatter `minify_code = false`; then
+    // config `minify_code_blocks`.
+    if !force_minify {
         if let Some(false) = ctx.frontmatter_minify_code {
             return None;
         }
@@ -199,21 +253,42 @@ fn try_minify(lang: Option<&str>, body: &str, attrs: &CodeAttrs, ctx: &mut Ctx) 
 
     // Allowlist gate. Even with @minify, only languages with registered
     // minifiers are processed; everything else falls back to verbatim.
-    let lang_lc = lang.to_ascii_lowercase();
     let in_allowlist = ctx
         .opts
         .minify_languages
         .iter()
         .any(|x| x.eq_ignore_ascii_case(&lang_lc));
-    if !in_allowlist && !attrs.minify {
+    if !in_allowlist && !force_minify {
         return None;
     }
     if !minify::is_supported(&lang_lc) {
         return None;
     }
 
-    match minify::minify(&lang_lc, body) {
-        Ok(s) => Some(s),
+    let mopts = MinifyOptions {
+        keep_comments: attrs.keep_comments,
+    };
+    match minify::minify(&lang_lc, body, &mopts) {
+        Ok(out) => {
+            for w in &out.warnings {
+                match w {
+                    MinifyWarning::LineCommentConverted => {
+                        ctx.warnings.push(format!(
+                            "warning[B0703]: line comment converted to block form for minification in `{}` block; verify no `*/` content",
+                            lang
+                        ));
+                    }
+                }
+            }
+            let n_lines = body.lines().count();
+            if n_lines > LONG_BLOCK_LINE_THRESHOLD {
+                ctx.warnings.push(format!(
+                    "warning[B0702]: minified code block was originally {} lines. LLM consumers cannot reference specific lines after minification. Consider @nominify if line references matter.",
+                    n_lines
+                ));
+            }
+            Some(out.body)
+        }
         Err(e) => {
             ctx.warnings.push(format!(
                 "warning[B0701]: code block tagged `{}` did not parse; emitted verbatim ({})",
@@ -683,13 +758,154 @@ mod tests {
     }
 
     #[test]
-    fn rust_block_not_minified_in_v0_2() {
-        // Rust isn't in the v0.2 allowlist or minifier set; even with @minify
-        // the block falls back to verbatim emission (no warning).
-        let src = "```rust @minify\nfn x() {\n    1\n}\n```\n";
+    fn rust_block_minified_in_v0_3() {
+        let src = "```rust\nfn x() {\n    // hi\n    1\n}\n```\n";
         let (out, w) = render_with(src, Opts::default());
-        assert!(w.is_empty());
-        assert!(out.contains("fn x() {"), "verbatim rust: {}", out);
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(out.contains("fn x(){1}"), "minified rust: {}", out);
+        assert!(!out.contains("// hi"), "comment dropped: {}", out);
+    }
+
+    #[test]
+    fn js_block_preserves_newlines() {
+        let src = "```javascript\nfunction add(a, b) {\n    return a + b;\n}\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(
+            out.contains("function add(a,b){\nreturn a+b;\n}"),
+            "got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn ts_alias_minifies() {
+        let src = "```ts\nfunction f(x: number): string { return String(x); }\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(
+            out.contains("function f(x:number):string{return String(x);}"),
+            "got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn sql_block_minified() {
+        let src = "```sql\nSELECT *\nFROM users\nWHERE id = 1;\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(
+            out.contains("SELECT*FROM users WHERE id=1;"),
+            "got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn c_preprocessor_kept_on_own_line() {
+        let src = "```c\n#include <stdio.h>\nint main() { return 0; }\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(
+            out.contains("#include <stdio.h>\nint main(){return 0;}"),
+            "got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn cpp_alias_minifies_with_raw_string() {
+        let src = "```cpp\nconst char* s = R\"x(hi)x\";\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(out.contains("R\"x(hi)x\""), "got: {}", out);
+    }
+
+    #[test]
+    fn java_block_minified() {
+        let src = "```java\npublic class Foo {\n    @Override public void f() {}\n}\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(
+            out.contains("public class Foo{@Override public void f(){}}"),
+            "got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn go_block_preserves_newlines() {
+        let src = "```go\nfunc add(a, b int) int {\n    return a + b\n}\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(
+            out.contains("func add(a,b int)int{\nreturn a+b\n}"),
+            "got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn keep_comments_emits_b0703() {
+        let src = "```rust @minify-keep-comments\nfn x() {\n    // hi\n    1\n}\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(out.contains("/* hi*/"), "comment preserved: {}", out);
+        assert!(
+            w.iter().any(|s| s.contains("B0703")),
+            "B0703 warning emitted: {:?}",
+            w
+        );
+    }
+
+    #[test]
+    fn refused_language_emits_b0704() {
+        // `python` is permanently refused (significant whitespace). With
+        // `@minify` forcing the attempt, the LLM emit pass surfaces a
+        // B0704 error and falls back to verbatim output.
+        let src = "```python @minify\ndef f(x):\n    return x\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(out.contains("def f(x):\n    return x"), "verbatim: {}", out);
+        assert!(
+            w.iter().any(|s| s.contains("B0704")),
+            "B0704 emitted: {:?}",
+            w
+        );
+    }
+
+    #[test]
+    fn refused_language_silent_without_optin() {
+        // No `@minify`, default allowlist excludes python — no warning.
+        let opts = Opts {
+            // Make sure python is NOT in the allowlist (default already
+            // excludes it but be explicit for the test's intent).
+            minify_languages: vec!["json".into()],
+            ..Opts::default()
+        };
+        let src = "```python\nx = 1\n```\n";
+        let (_out, w) = render_with(src, opts);
+        assert!(w.is_empty(), "no warning expected: {:?}", w);
+    }
+
+    #[test]
+    fn long_block_emits_b0702() {
+        // Build a 60-line JSON block (each line is its own array element).
+        let mut body = String::from("[\n");
+        for i in 0..60 {
+            body.push_str(&format!("  {}", i));
+            if i < 59 {
+                body.push(',');
+            }
+            body.push('\n');
+        }
+        body.push(']');
+        let src = format!("```json\n{}\n```\n", body);
+        let (_out, w) = render_with(&src, Opts::default());
+        assert!(
+            w.iter().any(|s| s.contains("B0702")),
+            "B0702 emitted for long block: {:?}",
+            w
+        );
     }
 
     #[test]

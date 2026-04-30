@@ -262,11 +262,23 @@ fn run_explain(code: &str) -> ExitCode {
         ),
         (
             Code::UnknownCodeAttribute,
-            "Code-fence attributes are `@`-prefixed identifiers after the language tag (e.g. ```json @nominify). v0.2 recognizes `@nominify` and `@minify`. Anything else is a compile error so typos are caught early.",
+            "Code-fence attributes are `@`-prefixed identifiers after the language tag (e.g. ```json @nominify). v0.3 recognizes `@nominify`, `@minify`, and `@minify-keep-comments`. Anything else is a compile error so typos are caught early.",
         ),
         (
             Code::ConflictingCodeAttributes,
-            "`@nominify` and `@minify` are mutually exclusive: one says \"never minify this block\" and the other says \"always minify this block.\" Drop one.",
+            "`@nominify` and `@minify` (or `@minify-keep-comments`) are mutually exclusive: one says \"never minify this block\" and the other says \"always minify this block.\" Drop one.",
+        ),
+        (
+            Code::CodeBlockLineCount,
+            "A code block is being minified to a single (or near-single) line, but the original spanned more than 50 lines. After minification the LLM consumer cannot reference the original line numbers. Either accept this (silence with `@nominify`) or split the block into smaller pieces.",
+        ),
+        (
+            Code::LineCommentConverted,
+            "`@minify-keep-comments` converts `//` line comments into `/* */` block form so they can survive on a single minified line. If the comment body contains `*/` the conversion will break the comment; audit those blocks. Or use `@nominify` to keep the source verbatim.",
+        ),
+        (
+            Code::RefusedLanguage,
+            "Python, YAML, and Makefile use significant whitespace; minification cannot be performed safely without parsing the language. Such blocks are emitted verbatim and the LLM consumer pays full cost. Drop the `@minify` attribute or remove the language from `compile.llm.minify_languages`.",
         ),
     ];
     for (c, text) in table {

@@ -31,6 +31,10 @@ pub enum Code {
     UnknownCodeAttribute = 315,
     ConflictingCodeAttributes = 316,
 
+    CodeBlockLineCount = 702,
+    LineCommentConverted = 703,
+    RefusedLanguage = 704,
+
     UnknownShortcode = 401,
     ArgTypeMismatch = 402,
     MissingArg = 403,
@@ -78,6 +82,11 @@ impl Code {
             FrontmatterToml => "frontmatter is not valid TOML",
             UnknownCodeAttribute => "unknown code-fence attribute",
             ConflictingCodeAttributes => "conflicting code-fence attributes",
+            CodeBlockLineCount => {
+                "minified code block was originally many lines; LLM consumers cannot reference specific lines"
+            }
+            LineCommentConverted => "line comment converted to block-comment form for minification",
+            RefusedLanguage => "language uses significant whitespace and cannot be safely minified",
             UnknownShortcode => "shortcode is not registered",
             ArgTypeMismatch => "shortcode argument has wrong type",
             MissingArg => "missing required shortcode argument",
