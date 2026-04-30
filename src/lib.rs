@@ -5,6 +5,7 @@ pub mod diag;
 pub mod emit;
 pub mod inline;
 pub mod lexer;
+pub mod minify;
 pub mod parser;
 pub mod resolve;
 pub mod shortcode;

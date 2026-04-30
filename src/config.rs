@@ -29,6 +29,44 @@ pub struct Compile {
     pub strict_heading_levels: bool,
     #[serde(default)]
     pub default_target: Option<String>,
+    #[serde(default)]
+    pub llm: LlmCompile,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct LlmCompile {
+    /// Master switch. When false, code blocks are emitted verbatim regardless
+    /// of language tag or `@minify` attribute.
+    #[serde(default = "default_minify_code_blocks")]
+    pub minify_code_blocks: bool,
+    /// Allowlist of language tags eligible for minification. Tags are
+    /// matched case-insensitively. Defaults to the v0.2 set.
+    #[serde(default = "default_minify_languages")]
+    pub minify_languages: Vec<String>,
+    /// Whether to keep the surrounding ```lang fence around minified code.
+    /// True (default) preserves the structural cue for the consumer LLM.
+    #[serde(default = "default_preserve_code_fences")]
+    pub preserve_code_fences: bool,
+}
+
+impl Default for LlmCompile {
+    fn default() -> Self {
+        LlmCompile {
+            minify_code_blocks: default_minify_code_blocks(),
+            minify_languages: default_minify_languages(),
+            preserve_code_fences: default_preserve_code_fences(),
+        }
+    }
+}
+
+fn default_minify_code_blocks() -> bool {
+    true
+}
+fn default_minify_languages() -> Vec<String> {
+    vec!["json".into(), "jsonl".into()]
+}
+fn default_preserve_code_fences() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

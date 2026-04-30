@@ -190,6 +190,75 @@ fn compile_brf_with_convert_flag_still_works() {
 }
 
 #[test]
+fn compile_llm_minifies_json_block() {
+    let dir = temp_dir("minify_json");
+    let input = dir.join("doc.brf");
+    std::fs::write(
+        &input,
+        "# Doc\n\n```json\n{\n  \"a\": 1,\n  \"b\": [1, 2, 3]\n}\n```\n",
+    )
+    .unwrap();
+    let out = Command::new(brief_bin())
+        .arg("compile")
+        .arg(&input)
+        .arg("--target=llm")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("{\"a\":1,\"b\":[1,2,3]}"),
+        "stdout={}",
+        stdout
+    );
+}
+
+#[test]
+fn compile_llm_invalid_json_warns_but_succeeds() {
+    let dir = temp_dir("invalid_json");
+    let input = dir.join("doc.brf");
+    std::fs::write(&input, "```json\n{ not valid }\n```\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("compile")
+        .arg(&input)
+        .arg("--target=llm")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "compile must not fail on invalid JSON"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("B0701"), "stderr={}", stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("{ not valid }"),
+        "verbatim body kept: {}",
+        stdout
+    );
+}
+
+#[test]
+fn compile_llm_unknown_attr_is_error() {
+    let dir = temp_dir("unknown_attr");
+    let input = dir.join("doc.brf");
+    std::fs::write(&input, "```json @bogus\n{}\n```\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("compile")
+        .arg(&input)
+        .arg("--target=llm")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "compile must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("B0315"), "stderr={}", stderr);
+}
+
+#[test]
 fn batch_continues_past_failure() {
     let dir = temp_dir("batch_continue");
     let good = dir.join("good.md");

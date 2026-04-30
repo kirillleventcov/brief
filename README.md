@@ -54,6 +54,42 @@ brief compile doc.brf --target=html
 brief compile doc.brf --target=llm --report-tokens
 ```
 
+## Code-block minification (LLM mode)
+
+In `--target=llm` mode, fenced code blocks tagged `json` or `jsonl` are
+minified by default — pretty-printed JSON is reduced to its compact form,
+which is meaning-preserving for an LLM consumer but dramatically cheaper.
+
+Per-block opt-out:
+
+    ```json @nominify
+    {
+      "intentionally": "preserved"
+    }
+    ```
+
+Per-block opt-in (overrides `compile.llm.minify_code_blocks = false` and
+the document-level `minify_code = false` in frontmatter):
+
+    ```json @minify
+    { ... }
+    ```
+
+Knobs in `brief.toml`:
+
+```toml
+[compile.llm]
+minify_code_blocks = true                # master switch
+minify_languages = ["json", "jsonl"]     # allowlist
+preserve_code_fences = true              # keep ```lang around output
+```
+
+Invalid JSON in a `json`-tagged block emits a `B0701` warning to stderr
+and the original block is kept verbatim. Compilation does not fail.
+
+HTML output is never minified — minification is exclusively an LLM-mode
+concern.
+
 ## Convert from Markdown
 
 ```

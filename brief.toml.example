@@ -6,6 +6,15 @@ version = "0.1.0"
 strict_heading_levels = true
 default_target = "html"
 
+[compile.llm]
+# Master switch for code-block minification in --target=llm output.
+minify_code_blocks = true
+# Languages eligible for minification (v0.2 ships json + jsonl).
+minify_languages = ["json", "jsonl"]
+# Keep the surrounding ```lang fence around minified output. Setting this
+# to false drops the fence to save ~3 tokens per block.
+preserve_code_fences = true
+
 [shortcodes.note]
 kind = "block"
 template_html = "<aside>{{content}}</aside>"

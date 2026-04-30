@@ -1,4 +1,4 @@
-use crate::ast::{Block, Document, Inline, ListItem, Row, ShortArgs};
+use crate::ast::{Block, CodeAttrs, Document, Inline, ListItem, Row, ShortArgs};
 use crate::diag::{Code, Diagnostic};
 use crate::inline::{parse_args, parse_inline};
 use crate::span::{SourceMap, Span};
@@ -385,11 +385,8 @@ impl<'a> Parser<'a> {
                     .label("opening fence must be exactly three backticks"),
             );
         }
-        let lang = if after.is_empty() {
-            None
-        } else {
-            Some(after.trim().to_string())
-        };
+        let info_offset = open.span.start as usize + indent + 3;
+        let (lang, attrs) = parse_fence_info(after, info_offset as u32, open.span, &mut self.diags);
         let mut body = String::new();
         let mut span = open.span;
         loop {
@@ -422,7 +419,12 @@ impl<'a> Parser<'a> {
         if body.ends_with('\n') {
             body.pop();
         }
-        Block::CodeBlock { lang, body, span }
+        Block::CodeBlock {
+            lang,
+            body,
+            attrs,
+            span,
+        }
     }
 
     fn parse_unordered_list(&mut self, indent: u16) -> Block {
@@ -765,6 +767,95 @@ fn build_blockquote(items: &[(u8, String, Span)], depth: u8) -> (Vec<Block>, Spa
     (paras, full_span)
 }
 
+fn parse_fence_info(
+    after: &str,
+    base: u32,
+    fence_span: Span,
+    diags: &mut Vec<Diagnostic>,
+) -> (Option<String>, CodeAttrs) {
+    // The info string follows the opening ```; the language tag is the first
+    // whitespace-separated token, and any subsequent `@<ident>` tokens are
+    // fence attributes (v0.2: `@nominify`, `@minify`).
+    let mut attrs = CodeAttrs::default();
+    let bytes = after.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    if i == bytes.len() {
+        return (None, attrs);
+    }
+    let lang_start = i;
+    while i < bytes.len() && bytes[i] != b' ' {
+        i += 1;
+    }
+    let lang_tok = &after[lang_start..i];
+    let lang = if lang_tok.is_empty() {
+        None
+    } else if lang_tok.starts_with('@') {
+        // The first non-whitespace token is an attribute, not a language.
+        i = lang_start;
+        None
+    } else {
+        Some(lang_tok.to_string())
+    };
+
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let tok_start = i;
+        while i < bytes.len() && bytes[i] != b' ' {
+            i += 1;
+        }
+        let tok = &after[tok_start..i];
+        if tok.is_empty() {
+            continue;
+        }
+        let tok_span = Span::new(base as usize + tok_start, tok.len());
+        if !tok.starts_with('@') {
+            diags.push(
+                Diagnostic::new(Code::UnknownCodeAttribute, tok_span)
+                    .label(format!("`{}` is not a valid code-fence attribute", tok))
+                    .help("attributes must be `@`-prefixed identifiers (e.g. `@nominify`)"),
+            );
+            continue;
+        }
+        let name = &tok[1..];
+        match name {
+            "nominify" => {
+                if attrs.minify {
+                    diags.push(
+                        Diagnostic::new(Code::ConflictingCodeAttributes, fence_span)
+                            .label("`@nominify` and `@minify` cannot both be set"),
+                    );
+                }
+                attrs.nominify = true;
+            }
+            "minify" => {
+                if attrs.nominify {
+                    diags.push(
+                        Diagnostic::new(Code::ConflictingCodeAttributes, fence_span)
+                            .label("`@nominify` and `@minify` cannot both be set"),
+                    );
+                }
+                attrs.minify = true;
+            }
+            _ => {
+                diags.push(
+                    Diagnostic::new(Code::UnknownCodeAttribute, tok_span)
+                        .label(format!("unknown code-fence attribute `{}`", tok))
+                        .help("v0.2 supports `@nominify` and `@minify`"),
+                );
+            }
+        }
+    }
+    (lang, attrs)
+}
+
 fn leading_block_sigil(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -894,9 +985,82 @@ mod tests {
     fn code_block() {
         let (doc, d) = p("```rust\nfn x() {}\n```\n");
         assert!(d.is_empty(), "{:?}", d);
-        if let Block::CodeBlock { lang, body, .. } = &doc.blocks[0] {
+        if let Block::CodeBlock {
+            lang, body, attrs, ..
+        } = &doc.blocks[0]
+        {
             assert_eq!(lang.as_deref(), Some("rust"));
             assert_eq!(body, "fn x() {}");
+            assert_eq!(*attrs, CodeAttrs::default());
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn code_fence_nominify_attr() {
+        let (doc, d) = p("```json @nominify\n{\"a\":1}\n```\n");
+        assert!(d.is_empty(), "{:?}", d);
+        if let Block::CodeBlock { lang, attrs, .. } = &doc.blocks[0] {
+            assert_eq!(lang.as_deref(), Some("json"));
+            assert!(attrs.nominify);
+            assert!(!attrs.minify);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn code_fence_minify_attr() {
+        let (doc, d) = p("```rust @minify\nfn x() {}\n```\n");
+        assert!(d.is_empty(), "{:?}", d);
+        if let Block::CodeBlock { lang, attrs, .. } = &doc.blocks[0] {
+            assert_eq!(lang.as_deref(), Some("rust"));
+            assert!(attrs.minify);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn code_fence_unknown_attr_errors() {
+        let (_, d) = p("```json @bogus\n{}\n```\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::UnknownCodeAttribute),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn code_fence_attr_without_at_sigil_errors() {
+        let (_, d) = p("```json bogus\n{}\n```\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::UnknownCodeAttribute),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn code_fence_conflicting_attrs() {
+        let (_, d) = p("```json @nominify @minify\n{}\n```\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::ConflictingCodeAttributes),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn code_fence_attr_only_no_lang() {
+        // An attribute on the first non-whitespace position means the block
+        // has no language; the attribute still parses.
+        let (doc, d) = p("``` @nominify\nbody\n```\n");
+        assert!(d.is_empty(), "{:?}", d);
+        if let Block::CodeBlock { lang, attrs, .. } = &doc.blocks[0] {
+            assert!(lang.is_none());
+            assert!(attrs.nominify);
         } else {
             panic!();
         }

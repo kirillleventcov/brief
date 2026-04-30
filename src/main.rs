@@ -192,8 +192,15 @@ fn run_compile(
                 keep_table_rule,
                 keep_asset_urls,
                 keep_metadata,
+                minify_code_blocks: cfg.compile.llm.minify_code_blocks,
+                minify_languages: cfg.compile.llm.minify_languages.clone(),
+                preserve_code_fences: cfg.compile.llm.preserve_code_fences,
             };
-            llm::render(&doc, &registry, &lopts)
+            let (out, warnings) = llm::render(&doc, &registry, &lopts);
+            for w in &warnings {
+                eprintln!("brief: {}", w);
+            }
+            out
         }
         "json" => format!("{:#?}\n", doc),
         other => {
@@ -252,6 +259,14 @@ fn run_explain(code: &str) -> ExitCode {
         (
             Code::FrontmatterToml,
             "Frontmatter content must be valid TOML. Brief deliberately uses TOML (not YAML) to match `brief.toml`. Fix the TOML syntax in the `+++ ... +++` block.",
+        ),
+        (
+            Code::UnknownCodeAttribute,
+            "Code-fence attributes are `@`-prefixed identifiers after the language tag (e.g. ```json @nominify). v0.2 recognizes `@nominify` and `@minify`. Anything else is a compile error so typos are caught early.",
+        ),
+        (
+            Code::ConflictingCodeAttributes,
+            "`@nominify` and `@minify` are mutually exclusive: one says \"never minify this block\" and the other says \"always minify this block.\" Drop one.",
         ),
     ];
     for (c, text) in table {

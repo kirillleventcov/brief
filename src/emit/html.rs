@@ -56,6 +56,8 @@ fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
             out.push_str("</blockquote>\n");
         }
         Block::CodeBlock { lang, body, .. } => {
+            // HTML emit ignores `attrs` — minification is exclusively an
+            // LLM-mode concern (per design §3 and §7.4).
             match lang {
                 Some(l) => {
                     let _ = write!(out, "<pre><code class=\"language-{}\">", escape_attr(l));

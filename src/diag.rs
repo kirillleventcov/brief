@@ -28,6 +28,8 @@ pub enum Code {
     StrayContent = 312,
     UnterminatedFrontmatter = 313,
     FrontmatterToml = 314,
+    UnknownCodeAttribute = 315,
+    ConflictingCodeAttributes = 316,
 
     UnknownShortcode = 401,
     ArgTypeMismatch = 402,
@@ -74,6 +76,8 @@ impl Code {
             StrayContent => "unexpected content after directive",
             UnterminatedFrontmatter => "frontmatter `+++` block is never closed",
             FrontmatterToml => "frontmatter is not valid TOML",
+            UnknownCodeAttribute => "unknown code-fence attribute",
+            ConflictingCodeAttributes => "conflicting code-fence attributes",
             UnknownShortcode => "shortcode is not registered",
             ArgTypeMismatch => "shortcode argument has wrong type",
             MissingArg => "missing required shortcode argument",

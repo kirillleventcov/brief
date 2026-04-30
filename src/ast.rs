@@ -31,6 +31,7 @@ pub enum Block {
     CodeBlock {
         lang: Option<String>,
         body: String,
+        attrs: CodeAttrs,
         span: Span,
     },
     Table {
@@ -48,6 +49,12 @@ pub enum Block {
     HorizontalRule {
         span: Span,
     },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodeAttrs {
+    pub nominify: bool,
+    pub minify: bool,
 }
 
 #[derive(Clone, Debug)]

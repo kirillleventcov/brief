@@ -1,18 +1,46 @@
-use crate::ast::{Block, Document, Inline, Row, ShortArgs};
+use crate::ast::{Block, CodeAttrs, Document, Inline, Row, ShortArgs};
+use crate::minify;
 use crate::shortcode::Registry;
 use std::fmt::Write;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Opts {
     pub strip_emphasis: bool,
     pub keep_table_rule: bool,
     pub keep_asset_urls: bool,
     pub keep_metadata: bool,
+    /// Master toggle for code-block minification. When false, every code
+    /// block is emitted verbatim regardless of tag or `@minify`.
+    pub minify_code_blocks: bool,
+    /// Lowercased language tags eligible for the configured minifiers.
+    pub minify_languages: Vec<String>,
+    /// Keep the surrounding ```lang fence around minified output. When
+    /// false, only the minified body is emitted (no fence).
+    pub preserve_code_fences: bool,
 }
 
-pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> String {
+impl Default for Opts {
+    fn default() -> Self {
+        Opts {
+            strip_emphasis: false,
+            keep_table_rule: false,
+            keep_asset_urls: false,
+            keep_metadata: false,
+            minify_code_blocks: true,
+            minify_languages: vec!["json".into(), "jsonl".into()],
+            preserve_code_fences: true,
+        }
+    }
+}
+
+pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> (String, Vec<String>) {
     let footnotes = collect_footnotes(doc);
     let mut out = String::new();
+    let frontmatter_minify_code = doc
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("minify_code"))
+        .and_then(|v| v.as_bool());
     if opts.keep_metadata {
         if let Some(meta) = &doc.metadata {
             // Re-serialize the metadata table to preserve it as Brief
@@ -31,6 +59,8 @@ pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> String {
         opts,
         counter: 0,
         in_footnote: false,
+        warnings: Vec::new(),
+        frontmatter_minify_code,
     };
     for b in &doc.blocks {
         render_block(b, &mut ctx, &mut out, 0);
@@ -38,6 +68,7 @@ pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> String {
     if !footnotes.is_empty() {
         emit_footnotes_section(&footnotes, reg, opts, &mut out);
     }
+    let warnings = ctx.warnings;
     let mut collapsed = String::with_capacity(out.len());
     let mut nl_run = 0;
     for c in out.chars() {
@@ -51,7 +82,7 @@ pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> String {
             collapsed.push(c);
         }
     }
-    collapsed
+    (collapsed, warnings)
 }
 
 struct Ctx<'a> {
@@ -59,6 +90,8 @@ struct Ctx<'a> {
     opts: &'a Opts,
     counter: u32,
     in_footnote: bool,
+    warnings: Vec<String>,
+    frontmatter_minify_code: Option<bool>,
 }
 
 fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String, indent: usize) {
@@ -104,15 +137,10 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String, indent: usize) {
                 }
             }
         }
-        Block::CodeBlock { lang, body, .. } => {
-            out.push_str("```");
-            if let Some(l) = lang {
-                out.push_str(l);
-            }
-            out.push('\n');
-            out.push_str(body);
-            out.push('\n');
-            out.push_str("```\n");
+        Block::CodeBlock {
+            lang, body, attrs, ..
+        } => {
+            emit_code_block(lang.as_deref(), body, attrs, ctx, out);
         }
         Block::Table { header, rows, .. } => render_table(header, rows, ctx, out),
         Block::HorizontalRule { .. } => out.push_str("---\n"),
@@ -123,6 +151,75 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String, indent: usize) {
             ..
         } => {
             render_block_shortcode_llm(name, args, children, ctx, out, indent);
+        }
+    }
+}
+
+fn emit_code_block(
+    lang: Option<&str>,
+    body: &str,
+    attrs: &CodeAttrs,
+    ctx: &mut Ctx,
+    out: &mut String,
+) {
+    let minified = try_minify(lang, body, attrs, ctx);
+    let body_to_emit = minified.as_deref().unwrap_or(body);
+    if ctx.opts.preserve_code_fences {
+        out.push_str("```");
+        if let Some(l) = lang {
+            out.push_str(l);
+        }
+        out.push('\n');
+        out.push_str(body_to_emit);
+        out.push('\n');
+        out.push_str("```\n");
+    } else {
+        out.push_str(body_to_emit);
+        out.push('\n');
+    }
+}
+
+fn try_minify(lang: Option<&str>, body: &str, attrs: &CodeAttrs, ctx: &mut Ctx) -> Option<String> {
+    if attrs.nominify {
+        return None;
+    }
+    let lang = lang?;
+
+    // Three layers of opt-out, in priority order: per-block @minify forces
+    // minification (overriding all opt-outs except @nominify); then
+    // frontmatter `minify_code = false`; then config `minify_code_blocks`.
+    if !attrs.minify {
+        if let Some(false) = ctx.frontmatter_minify_code {
+            return None;
+        }
+        if !ctx.opts.minify_code_blocks {
+            return None;
+        }
+    }
+
+    // Allowlist gate. Even with @minify, only languages with registered
+    // minifiers are processed; everything else falls back to verbatim.
+    let lang_lc = lang.to_ascii_lowercase();
+    let in_allowlist = ctx
+        .opts
+        .minify_languages
+        .iter()
+        .any(|x| x.eq_ignore_ascii_case(&lang_lc));
+    if !in_allowlist && !attrs.minify {
+        return None;
+    }
+    if !minify::is_supported(&lang_lc) {
+        return None;
+    }
+
+    match minify::minify(&lang_lc, body) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            ctx.warnings.push(format!(
+                "warning[B0701]: code block tagged `{}` did not parse; emitted verbatim ({})",
+                lang, e.message
+            ));
+            None
         }
     }
 }
@@ -444,6 +541,8 @@ fn emit_footnotes_section(
             opts,
             counter: 0,
             in_footnote: true,
+            warnings: Vec::new(),
+            frontmatter_minify_code: None,
         };
         render_inline_seq(body, &mut ctx, out);
         out.push('\n');
@@ -482,7 +581,7 @@ mod tests {
     use crate::parser::parse;
     use crate::span::SourceMap;
 
-    fn render_with(input: &str, opts: Opts) -> String {
+    fn render_with(input: &str, opts: Opts) -> (String, Vec<String>) {
         let src = SourceMap::new("d.brf", input);
         let toks = lex(&src).unwrap();
         let (doc, diags) = parse(toks, &src);
@@ -491,9 +590,20 @@ mod tests {
         render(&doc, &reg, &opts)
     }
 
+    fn render_default(input: &str) -> String {
+        render_with(input, Opts::default()).0
+    }
+
+    fn opts_with_keep_metadata() -> Opts {
+        Opts {
+            keep_metadata: true,
+            ..Opts::default()
+        }
+    }
+
     #[test]
     fn llm_strips_frontmatter_by_default() {
-        let out = render_with("+++\ntitle = \"hi\"\n+++\n# Doc\n", Opts::default());
+        let out = render_default("+++\ntitle = \"hi\"\n+++\n# Doc\n");
         assert!(!out.contains("+++"), "{}", out);
         assert!(!out.contains("title"), "{}", out);
         assert!(out.contains("# Doc"));
@@ -501,14 +611,9 @@ mod tests {
 
     #[test]
     fn llm_keeps_frontmatter_with_flag() {
-        let out = render_with(
+        let (out, _) = render_with(
             "+++\ntitle = \"hi\"\n+++\n# Doc\n",
-            Opts {
-                strip_emphasis: false,
-                keep_table_rule: false,
-                keep_asset_urls: false,
-                keep_metadata: true,
-            },
+            opts_with_keep_metadata(),
         );
         assert!(
             out.starts_with("+++\n"),
@@ -528,16 +633,102 @@ mod tests {
 
     #[test]
     fn llm_keep_metadata_no_op_when_no_metadata() {
-        let out = render_with(
-            "# Doc\n",
-            Opts {
-                strip_emphasis: false,
-                keep_table_rule: false,
-                keep_asset_urls: false,
-                keep_metadata: true,
-            },
-        );
+        let (out, _) = render_with("# Doc\n", opts_with_keep_metadata());
         assert!(!out.contains("+++"), "{}", out);
         assert!(out.contains("# Doc"));
+    }
+
+    #[test]
+    fn json_block_minified_by_default() {
+        let (out, w) = render_with(
+            "```json\n{\n  \"a\": 1,\n  \"b\": [1, 2, 3]\n}\n```\n",
+            Opts::default(),
+        );
+        assert!(w.is_empty(), "unexpected warnings: {:?}", w);
+        assert!(out.contains("{\"a\":1,\"b\":[1,2,3]}"), "{}", out);
+        assert!(
+            out.contains("```json"),
+            "fence preserved by default: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn json_block_with_nominify_kept_verbatim() {
+        let src = "```json @nominify\n{\n  \"a\": 1\n}\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(w.is_empty());
+        assert!(
+            out.contains("\"a\": 1"),
+            "must preserve whitespace: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn invalid_json_falls_back_with_warning() {
+        let src = "```json\n{ not valid }\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(out.contains("{ not valid }"), "verbatim body: {}", out);
+        assert_eq!(w.len(), 1, "expected one B0701 warning");
+        assert!(w[0].contains("B0701"));
+    }
+
+    #[test]
+    fn jsonl_block_minified() {
+        let src = "```jsonl\n{\"a\": 1}\n{\"b\": 2}\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(out.contains("{\"a\":1}\n{\"b\":2}"), "{}", out);
+    }
+
+    #[test]
+    fn rust_block_not_minified_in_v0_2() {
+        // Rust isn't in the v0.2 allowlist or minifier set; even with @minify
+        // the block falls back to verbatim emission (no warning).
+        let src = "```rust @minify\nfn x() {\n    1\n}\n```\n";
+        let (out, w) = render_with(src, Opts::default());
+        assert!(w.is_empty());
+        assert!(out.contains("fn x() {"), "verbatim rust: {}", out);
+    }
+
+    #[test]
+    fn frontmatter_minify_code_false_disables() {
+        let src = "+++\nminify_code = false\n+++\n```json\n{\"a\": 1}\n```\n";
+        let (out, _) = render_with(src, Opts::default());
+        // Whitespace between key and value is preserved; the minifier did
+        // not run.
+        assert!(out.contains("\"a\": 1"), "verbatim under override: {}", out);
+    }
+
+    #[test]
+    fn frontmatter_override_can_be_force_minified() {
+        // `@minify` on a block overrides the document-level disable.
+        let src = "+++\nminify_code = false\n+++\n```json @minify\n{\"a\": 1}\n```\n";
+        let (out, _) = render_with(src, Opts::default());
+        assert!(out.contains("{\"a\":1}"), "minified anyway: {}", out);
+    }
+
+    #[test]
+    fn config_disable_minification_globally() {
+        let src = "```json\n{\"a\": 1}\n```\n";
+        let opts = Opts {
+            minify_code_blocks: false,
+            ..Opts::default()
+        };
+        let (out, _) = render_with(src, opts);
+        assert!(out.contains("\"a\": 1"), "disabled globally: {}", out);
+    }
+
+    #[test]
+    fn drop_fence_with_preserve_false() {
+        let src = "```json\n{\"a\": 1}\n```\n";
+        let opts = Opts {
+            preserve_code_fences: false,
+            ..Opts::default()
+        };
+        let (out, _) = render_with(src, opts);
+        assert!(!out.contains("```"), "fence dropped: {}", out);
+        assert!(out.contains("{\"a\":1}"));
     }
 }

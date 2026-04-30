@@ -76,7 +76,7 @@ fn t_12_7_llm_token_reduction() {
     let reg = Registry::with_builtins();
     let r = resolve(&mut doc, &reg);
     assert!(r.is_empty(), "{:?}", r);
-    let llm_out = llm::render(&doc, &reg, &llm::Opts::default());
+    let (llm_out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
     assert!(
         llm_out.chars().count() < md_equivalent.chars().count(),
         "brief llm ({}) should be shorter than markdown ({}):\n--- brief ---\n{}\n--- md ---\n{}",
@@ -274,7 +274,7 @@ fn footnote_llm_uses_pandoc_style() {
     let reg = Registry::with_builtins();
     let r = resolve(&mut doc, &reg);
     assert!(r.is_empty(), "{:?}", r);
-    let out = llm::render(&doc, &reg, &llm::Opts::default());
+    let (out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
     assert!(out.contains("First.[^1]"), "{}", out);
     assert!(out.contains("Second.[^2]"), "{}", out);
     assert!(out.contains("[^1]: a"), "{}", out);
