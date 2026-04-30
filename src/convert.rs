@@ -202,6 +202,7 @@ struct Walker<'a> {
     pending_html_comments: Vec<String>,
     in_metadata: bool,
     metadata_buf: String,
+    metadata_kind: Option<pulldown_cmark::MetadataBlockKind>,
 }
 
 struct TableState {
@@ -288,6 +289,7 @@ impl<'a> Walker<'a> {
             pending_html_comments: Vec::new(),
             in_metadata: false,
             metadata_buf: String::new(),
+            metadata_kind: None,
         }
     }
 
@@ -767,27 +769,40 @@ impl<'a> Walker<'a> {
                     t.in_cell = false;
                 }
             }
-            Event::Start(Tag::MetadataBlock(_)) => {
+            Event::Start(Tag::MetadataBlock(kind)) => {
                 self.in_metadata = true;
                 self.metadata_buf.clear();
-                self.push_diag(
-                    Hole::Frontmatter,
-                    range.clone(),
-                    "frontmatter dropped, replaced with TODO comment".into(),
-                );
+                self.metadata_kind = Some(kind);
             }
             Event::End(TagEnd::MetadataBlock(_)) => {
+                use pulldown_cmark::MetadataBlockKind;
                 self.in_metadata = false;
-                let summary: String = self
-                    .metadata_buf
-                    .chars()
-                    .take(60)
-                    .collect::<String>()
-                    .replace('\n', " ");
-                self.write("// TODO[B-hole:frontmatter]: ");
-                self.write(&summary);
-                self.write_char('\n');
-                self.metadata_buf.clear();
+                let kind = self.metadata_kind.take();
+                let body = std::mem::take(&mut self.metadata_buf);
+                match kind {
+                    Some(MetadataBlockKind::PlusesStyle) => {
+                        // TOML markdown frontmatter has a clean Brief equivalent;
+                        // emit it directly with no hole diagnostic.
+                        self.write("+++\n");
+                        self.write(&body);
+                        if !body.ends_with('\n') {
+                            self.write_char('\n');
+                        }
+                        self.write("+++\n\n");
+                    }
+                    _ => {
+                        self.push_diag(
+                            Hole::Frontmatter,
+                            range.clone(),
+                            "frontmatter dropped, replaced with TODO comment".into(),
+                        );
+                        let summary: String =
+                            body.chars().take(60).collect::<String>().replace('\n', " ");
+                        self.write("// TODO[B-hole:frontmatter]: ");
+                        self.write(&summary);
+                        self.write_char('\n');
+                    }
+                }
             }
             Event::Start(Tag::HtmlBlock) => {
                 self.push_diag(
@@ -936,4 +951,56 @@ fn compute_line_offsets(s: &str) -> Vec<usize> {
         }
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_toml_frontmatter_cleanly() {
+        let md = "+++\ntitle = \"hi\"\nn = 3\n+++\n\n# Doc\nbody\n";
+        let res = convert(md, "in.md");
+        assert!(
+            !res.diagnostics.iter().any(|d| d.hole == Hole::Frontmatter),
+            "{:?}",
+            res.diagnostics
+        );
+        assert!(
+            res.brief_source.starts_with("+++\n"),
+            "got: {}",
+            res.brief_source
+        );
+        assert!(res.brief_source.contains("title = \"hi\""));
+        assert!(res.brief_source.contains("n = 3"));
+        assert!(res.brief_source.contains("\n+++\n"));
+        assert!(res.brief_source.contains("# Doc"));
+    }
+
+    #[test]
+    fn converts_yaml_frontmatter_as_hole() {
+        let md = "---\ntitle: hi\n---\n\n# Doc\n";
+        let res = convert(md, "in.md");
+        assert!(
+            res.diagnostics.iter().any(|d| d.hole == Hole::Frontmatter),
+            "{:?}",
+            res.diagnostics
+        );
+        assert!(
+            res.brief_source.contains("// TODO[B-hole:frontmatter]"),
+            "{}",
+            res.brief_source
+        );
+    }
+
+    #[test]
+    fn converted_toml_frontmatter_round_trips_through_compiler() {
+        let md = "+++\ntitle = \"hi\"\n+++\n\n# Doc\n";
+        let res = convert(md, "in.md");
+        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = crate::lexer::lex(&src).expect("lex ok");
+        let (doc, diags) = crate::parser::parse(toks, &src);
+        assert!(diags.is_empty(), "{:?}\n---\n{}", diags, res.brief_source);
+        assert!(doc.metadata.is_some());
+    }
 }

@@ -5,11 +5,12 @@ use crate::span::{SourceMap, Span};
 use crate::token::{Token, TokenKind};
 
 pub fn parse(tokens: Vec<Token>, src: &SourceMap) -> (Document, Vec<Diagnostic>) {
+    let (metadata, fm_consumed, fm_diags) = parse_frontmatter(&tokens, src);
     let mut p = Parser {
         _src: src,
         toks: tokens,
-        pos: 0,
-        diags: Vec::new(),
+        pos: fm_consumed,
+        diags: fm_diags,
     };
     let mut blocks = p.parse_blocks(0, None);
     // Anything left after a top-level parse must be a stray `@end`.
@@ -29,7 +30,82 @@ pub fn parse(tokens: Vec<Token>, src: &SourceMap) -> (Document, Vec<Diagnostic>)
             }
         }
     }
-    (Document { blocks }, p.diags)
+    (Document { blocks, metadata }, p.diags)
+}
+
+fn parse_frontmatter(
+    toks: &[Token],
+    src: &SourceMap,
+) -> (Option<toml::Table>, usize, Vec<Diagnostic>) {
+    // Returns (metadata, tokens_consumed, diagnostics).
+    //
+    // Frontmatter must be the very first content. We detect it by checking
+    // that the first token is `Line("+++")` at byte offset 0 with indent 0.
+    // If anything else comes first (a Blank, a comment, an indented `+++`,
+    // or a non-`+++` line), there is no frontmatter and we return
+    // (None, 0, empty).
+    if toks.is_empty() {
+        return (None, 0, Vec::new());
+    }
+    let first = &toks[0];
+    let opens = match &first.kind {
+        TokenKind::Line(s) => s == "+++" && first.indent == 0 && first.span.start == 0,
+        _ => false,
+    };
+    if !opens {
+        return (None, 0, Vec::new());
+    }
+
+    // Body starts at the first byte after `+++\n` (or `+++\r\n`).
+    // The lexer's next token's `span.start` is exactly that byte.
+    let mut idx = 1usize;
+    let body_start = toks
+        .get(idx)
+        .map(|t| t.span.start as usize)
+        .unwrap_or(src.source.len());
+
+    let mut diags = Vec::new();
+    while idx < toks.len() {
+        match &toks[idx].kind {
+            TokenKind::Eof => {
+                diags.push(
+                    Diagnostic::new(Code::UnterminatedFrontmatter, first.span)
+                        .label("frontmatter opened with `+++` is never closed"),
+                );
+                return (None, idx, diags);
+            }
+            TokenKind::Line(s) if s == "+++" && toks[idx].indent == 0 => {
+                let close = &toks[idx];
+                let body_end = close.span.start as usize;
+                let body = &src.source[body_start..body_end];
+                idx += 1; // consume the closing `+++`
+                match toml::from_str::<toml::Table>(body) {
+                    Ok(t) => return (Some(t), idx, diags),
+                    Err(e) => {
+                        let (off, len) = match e.span() {
+                            Some(r) => (body_start + r.start, r.end - r.start),
+                            None => (body_start, body.len()),
+                        };
+                        // `.max(1)` keeps the diagnostic caret renderable; a
+                        // zero-length span produces no caret in the error UI.
+                        let span = Span::new(off, len.max(1));
+                        diags.push(
+                            Diagnostic::new(Code::FrontmatterToml, span).label(e.to_string()),
+                        );
+                        return (None, idx, diags);
+                    }
+                }
+            }
+            _ => {
+                idx += 1;
+            }
+        }
+    }
+    diags.push(
+        Diagnostic::new(Code::UnterminatedFrontmatter, first.span)
+            .label("frontmatter opened with `+++` is never closed"),
+    );
+    (None, idx, diags)
 }
 
 struct Parser<'a> {
@@ -854,5 +930,72 @@ mod tests {
     fn hr() {
         let (doc, _) = p("---\n");
         assert!(matches!(doc.blocks[0], Block::HorizontalRule { .. }));
+    }
+
+    #[test]
+    fn frontmatter_basic() {
+        let input = "+++\ntitle = \"hi\"\nn = 3\n+++\n# Doc\n";
+        let (doc, d) = p(input);
+        assert!(d.is_empty(), "{:?}", d);
+        let meta = doc.metadata.as_ref().expect("metadata present");
+        assert_eq!(meta.get("title").and_then(|v| v.as_str()), Some("hi"));
+        assert_eq!(meta.get("n").and_then(|v| v.as_integer()), Some(3));
+        assert_eq!(doc.blocks.len(), 1);
+        assert!(matches!(doc.blocks[0], Block::Heading { level: 1, .. }));
+    }
+
+    #[test]
+    fn frontmatter_empty_table() {
+        let (doc, d) = p("+++\n+++\n");
+        assert!(d.is_empty(), "{:?}", d);
+        let meta = doc.metadata.as_ref().expect("metadata present");
+        assert!(meta.is_empty());
+        assert!(doc.blocks.is_empty());
+    }
+
+    #[test]
+    fn frontmatter_unterminated() {
+        let (_, d) = p("+++\nfoo = 1\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::UnterminatedFrontmatter),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn frontmatter_bad_toml() {
+        let (_, d) = p("+++\nfoo === 1\n+++\n");
+        assert!(d.iter().any(|x| x.code == Code::FrontmatterToml), "{:?}", d);
+    }
+
+    #[test]
+    fn frontmatter_only_first_line() {
+        // Leading blank line means the document does not start with `+++`,
+        // so this is a stray paragraph, not frontmatter.
+        let (doc, _d) = p("\n+++\nfoo = 1\n+++\n");
+        assert!(doc.metadata.is_none());
+    }
+
+    #[test]
+    fn frontmatter_indented_is_not_frontmatter() {
+        // Leading spaces on the opening line mean it's not a delimiter.
+        let (doc, _d) = p("  +++\nfoo = 1\n+++\n");
+        assert!(doc.metadata.is_none());
+    }
+
+    #[test]
+    fn frontmatter_no_open_means_none() {
+        let (doc, _d) = p("# Heading\n");
+        assert!(doc.metadata.is_none());
+    }
+
+    #[test]
+    fn frontmatter_crlf() {
+        let input = "+++\r\ntitle = \"hi\"\r\n+++\r\n# Doc\r\n";
+        let (doc, d) = p(input);
+        assert!(d.is_empty(), "{:?}", d);
+        let meta = doc.metadata.as_ref().expect("metadata present");
+        assert_eq!(meta.get("title").and_then(|v| v.as_str()), Some("hi"));
     }
 }

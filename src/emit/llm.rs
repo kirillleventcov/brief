@@ -7,11 +7,25 @@ pub struct Opts {
     pub strip_emphasis: bool,
     pub keep_table_rule: bool,
     pub keep_asset_urls: bool,
+    pub keep_metadata: bool,
 }
 
 pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> String {
     let footnotes = collect_footnotes(doc);
     let mut out = String::new();
+    if opts.keep_metadata {
+        if let Some(meta) = &doc.metadata {
+            // Re-serialize the metadata table to preserve it as Brief
+            // frontmatter at the top of the LLM output.
+            let body = toml::to_string(meta).unwrap_or_default();
+            out.push_str("+++\n");
+            out.push_str(&body);
+            if !body.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("+++\n\n");
+        }
+    }
     let mut ctx = Ctx {
         reg,
         opts,
@@ -459,4 +473,71 @@ fn expand_template_llm(tpl: &str, args: &ShortArgs, content: &str) -> String {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::lex;
+    use crate::parser::parse;
+    use crate::span::SourceMap;
+
+    fn render_with(input: &str, opts: Opts) -> String {
+        let src = SourceMap::new("d.brf", input);
+        let toks = lex(&src).unwrap();
+        let (doc, diags) = parse(toks, &src);
+        assert!(diags.is_empty(), "{:?}", diags);
+        let reg = Registry::with_builtins();
+        render(&doc, &reg, &opts)
+    }
+
+    #[test]
+    fn llm_strips_frontmatter_by_default() {
+        let out = render_with("+++\ntitle = \"hi\"\n+++\n# Doc\n", Opts::default());
+        assert!(!out.contains("+++"), "{}", out);
+        assert!(!out.contains("title"), "{}", out);
+        assert!(out.contains("# Doc"));
+    }
+
+    #[test]
+    fn llm_keeps_frontmatter_with_flag() {
+        let out = render_with(
+            "+++\ntitle = \"hi\"\n+++\n# Doc\n",
+            Opts {
+                strip_emphasis: false,
+                keep_table_rule: false,
+                keep_asset_urls: false,
+                keep_metadata: true,
+            },
+        );
+        assert!(
+            out.starts_with("+++\n"),
+            "starts with: {:?}",
+            &out[..20.min(out.len())]
+        );
+        assert!(out.contains("title"));
+        assert!(out.contains("# Doc"));
+        let close_pos = out.find("\n+++\n").expect("closing +++ missing");
+        let doc_pos = out.find("# Doc").expect("body missing");
+        assert!(close_pos < doc_pos, "closing +++ must precede body");
+        assert!(
+            out.contains("+++\n\n"),
+            "blank line after closing +++ missing"
+        );
+    }
+
+    #[test]
+    fn llm_keep_metadata_no_op_when_no_metadata() {
+        let out = render_with(
+            "# Doc\n",
+            Opts {
+                strip_emphasis: false,
+                keep_table_rule: false,
+                keep_asset_urls: false,
+                keep_metadata: true,
+            },
+        );
+        assert!(!out.contains("+++"), "{}", out);
+        assert!(out.contains("# Doc"));
+    }
 }

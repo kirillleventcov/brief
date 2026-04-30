@@ -34,6 +34,8 @@ enum Cmd {
         keep_table_rule: bool,
         #[arg(long)]
         keep_asset_urls: bool,
+        #[arg(long)]
+        keep_metadata: bool,
         /// Treat the input as Markdown and convert to Brief in memory before
         /// compiling. Equivalent to `brief convert ... | brief compile -` but
         /// in one step.
@@ -69,6 +71,7 @@ fn main() -> ExitCode {
             strip_emphasis,
             keep_table_rule,
             keep_asset_urls,
+            keep_metadata,
             convert,
         } => run_compile(
             input,
@@ -78,6 +81,7 @@ fn main() -> ExitCode {
             strip_emphasis,
             keep_table_rule,
             keep_asset_urls,
+            keep_metadata,
             convert,
         ),
         Cmd::Explain { code } => run_explain(&code),
@@ -98,6 +102,7 @@ fn run_compile(
     strip_emphasis: bool,
     keep_table_rule: bool,
     keep_asset_urls: bool,
+    keep_metadata: bool,
     convert: bool,
 ) -> ExitCode {
     let raw = match std::fs::read_to_string(&input) {
@@ -186,6 +191,7 @@ fn run_compile(
                 strip_emphasis,
                 keep_table_rule,
                 keep_asset_urls,
+                keep_metadata,
             };
             llm::render(&doc, &registry, &lopts)
         }
@@ -238,6 +244,14 @@ fn run_explain(code: &str) -> ExitCode {
         (
             Code::TabCharacter,
             "Tabs are forbidden in Brief sources. Configure your editor to insert two spaces.",
+        ),
+        (
+            Code::UnterminatedFrontmatter,
+            "A frontmatter block opened with `+++` was never closed. Add a closing `+++` line, or remove the opening if the document has no metadata.",
+        ),
+        (
+            Code::FrontmatterToml,
+            "Frontmatter content must be valid TOML. Brief deliberately uses TOML (not YAML) to match `brief.toml`. Fix the TOML syntax in the `+++ ... +++` block.",
         ),
     ];
     for (c, text) in table {

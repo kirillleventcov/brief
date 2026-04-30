@@ -26,6 +26,8 @@ pub enum Code {
     BadBlockquote = 310,
     StrayEnd = 311,
     StrayContent = 312,
+    UnterminatedFrontmatter = 313,
+    FrontmatterToml = 314,
 
     UnknownShortcode = 401,
     ArgTypeMismatch = 402,
@@ -70,6 +72,8 @@ impl Code {
             BadBlockquote => "blockquote marker must be followed by a space",
             StrayEnd => "`@end` without a matching block shortcode",
             StrayContent => "unexpected content after directive",
+            UnterminatedFrontmatter => "frontmatter `+++` block is never closed",
+            FrontmatterToml => "frontmatter is not valid TOML",
             UnknownShortcode => "shortcode is not registered",
             ArgTypeMismatch => "shortcode argument has wrong type",
             MissingArg => "missing required shortcode argument",

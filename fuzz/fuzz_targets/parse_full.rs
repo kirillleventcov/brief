@@ -39,6 +39,7 @@ fuzz_target!(|data: &[u8]| {
             strip_emphasis: false,
             keep_table_rule: false,
             keep_asset_urls: false,
+            keep_metadata: false,
         },
     );
 });

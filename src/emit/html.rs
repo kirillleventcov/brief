@@ -443,3 +443,28 @@ fn escape_html(s: &str) -> String {
 fn escape_attr(s: &str) -> String {
     escape_html(s)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::lex;
+    use crate::parser::parse;
+    use crate::span::SourceMap;
+
+    fn render_html(input: &str) -> String {
+        let src = SourceMap::new("d.brf", input);
+        let toks = lex(&src).unwrap();
+        let (doc, diags) = parse(toks, &src);
+        assert!(diags.is_empty(), "{:?}", diags);
+        let reg = Registry::with_builtins();
+        render(&doc, &reg)
+    }
+
+    #[test]
+    fn html_does_not_emit_frontmatter() {
+        let out = render_html("+++\ntitle = \"hi\"\n+++\n# Doc\n");
+        assert!(!out.contains("+++"), "{}", out);
+        assert!(!out.contains("title"), "{}", out);
+        assert!(out.contains("<h1>Doc</h1>"));
+    }
+}

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug)]
 pub struct Document {
     pub blocks: Vec<Block>,
+    pub metadata: Option<toml::Table>,
 }
 
 #[derive(Clone, Debug)]

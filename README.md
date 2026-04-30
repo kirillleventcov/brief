@@ -23,6 +23,29 @@ Read [`LearnXinYminutes.brf`](./LearnXinYminutes.brf) — it's the whole languag
 
 Compile it for your AI Agent: `brief compile LearnXinYminutes.brf --target=llm`
 
+## Frontmatter
+
+Brief documents can carry optional TOML frontmatter at the very top:
+
+    +++
+    title = "My document"
+    date = 2026-04-29
+    tags = ["foo", "bar"]
+    +++
+
+    # Document content
+
+Rules:
+- Frontmatter is optional. If present, it must be the very first content
+  in the file (after an optional UTF-8 BOM).
+- The opening and closing delimiter is exactly `+++` on a line by itself.
+- The block between the delimiters is parsed as TOML; TOML errors are
+  compile errors with a span (`B0314`).
+- An unterminated `+++` block is `B0313`.
+- LLM mode strips frontmatter by default. Pass `--keep-metadata` to
+  preserve it as a `+++` block at the top of the LLM output.
+- HTML mode never emits frontmatter.
+
 ## Build
 
 ```
