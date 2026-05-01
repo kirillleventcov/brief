@@ -58,6 +58,25 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Reformat Brief source(s) according to the canonical style.
+    /// gofmt-doctrine: no config beyond an explicit opt-in for the
+    /// controversial frontmatter sort.
+    Fmt {
+        /// One or more `.brf` inputs. With no inputs, reads from stdin and
+        /// writes formatted output to stdout.
+        inputs: Vec<PathBuf>,
+        /// Exit non-zero (and list affected paths to stderr) if any input
+        /// would be changed by formatting. Mutually exclusive with `--write`.
+        #[arg(long, conflicts_with = "write")]
+        check: bool,
+        /// Rewrite each input in place. Mutually exclusive with `--check`.
+        #[arg(long)]
+        write: bool,
+        /// Sort top-level frontmatter keys alphabetically. Off by default
+        /// — re-emitting the TOML loses comment positions.
+        #[arg(long)]
+        sort_frontmatter: bool,
+    },
     /// Watch files/dirs and recompile on change. 100ms debounce. Whole-file
     /// recompile only.
     Watch {
@@ -109,6 +128,12 @@ fn main() -> ExitCode {
             stdout,
             force,
         } => run_convert(inputs, output, stdout, force),
+        Cmd::Fmt {
+            inputs,
+            check,
+            write,
+            sort_frontmatter,
+        } => run_fmt(inputs, check, write, sort_frontmatter),
         Cmd::Watch {
             paths,
             target,
@@ -490,6 +515,84 @@ fn run_convert(
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn run_fmt(inputs: Vec<PathBuf>, check: bool, write: bool, sort_frontmatter: bool) -> ExitCode {
+    use brief::fmt;
+    use std::io::Read;
+
+    let opts = fmt::Opts { sort_frontmatter };
+
+    if inputs.is_empty() {
+        // Stdin → stdout. `--write` is meaningless here; `--check` is honored.
+        if write {
+            eprintln!("brief: --write requires at least one input file");
+            return ExitCode::from(2);
+        }
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("brief: cannot read stdin: {}", e);
+            return ExitCode::from(2);
+        }
+        let formatted = fmt::format(&buf, &opts);
+        if check {
+            if formatted != buf {
+                eprintln!("brief: <stdin> would be reformatted");
+                return ExitCode::from(1);
+            }
+            return ExitCode::SUCCESS;
+        }
+        print!("{}", formatted);
+        return ExitCode::SUCCESS;
+    }
+
+    let multi = inputs.len() > 1;
+    let mut errors: usize = 0;
+    let mut would_change: usize = 0;
+
+    for input in &inputs {
+        let raw = match std::fs::read_to_string(input) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("brief: cannot read {}: {}", input.display(), e);
+                errors += 1;
+                continue;
+            }
+        };
+        let formatted = fmt::format(&raw, &opts);
+        if check {
+            if formatted != raw {
+                eprintln!("{}", input.display());
+                would_change += 1;
+            }
+        } else if write {
+            if formatted == raw {
+                continue;
+            }
+            if let Err(e) = std::fs::write(input, &formatted) {
+                eprintln!("brief: cannot write {}: {}", input.display(), e);
+                errors += 1;
+            }
+        } else {
+            // Default mode: print to stdout. With multiple inputs that
+            // would interleave; refuse it the way gofmt does.
+            if multi {
+                eprintln!(
+                    "brief: refusing to print multiple files to stdout; pass --write or --check"
+                );
+                return ExitCode::from(2);
+            }
+            print!("{}", formatted);
+        }
+    }
+
+    if errors > 0 {
+        return ExitCode::from(2);
+    }
+    if check && would_change > 0 {
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
 }
 
 fn default_output_path(input: &std::path::Path) -> PathBuf {

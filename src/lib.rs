@@ -3,6 +3,7 @@ pub mod config;
 pub mod convert;
 pub mod diag;
 pub mod emit;
+pub mod fmt;
 pub mod inline;
 pub mod lexer;
 pub mod minify;
