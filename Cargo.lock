@@ -92,6 +92,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "brief-web"
+version = "0.2.0"
+dependencies = [
+ "brief-core",
+ "clap",
+ "notify",
+ "notify-debouncer-mini",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -55,6 +55,32 @@ brief compile doc.brf --target=html
 brief compile doc.brf --target=llm --report-tokens
 ```
 
+The repo is a Cargo workspace. The crates are:
+
+- [`crates/brief-core`](./crates/brief-core) — the parser, AST, validators, HTML / LLM emitters, formatter, and Markdown→Brief converter, exposed as a library.
+- [`crates/brief-cli`](./crates/brief-cli) — the `brief` command-line binary used in the examples above.
+- [`crates/brief-web`](./crates/brief-web) — `brief-web`, a static-site generator and dev server for `.brf` documents. See below.
+
+## Web rendering (`brief-web`)
+
+`brief-web` turns a directory of `.brf` files into an HTML site with a
+sidebar, themes, and live-reload during development. It is to Brief what
+`mdBook` is to Markdown: a separate binary that depends on the Brief
+compiler as a library.
+
+```
+cargo build -p brief-web --release
+./target/release/brief-web serve examples/learn-x-in-y-minutes
+# open http://127.0.0.1:3000
+```
+
+That example hosts `LearnXinYminutes.brf` as a rendered, browseable single
+page. Editing the source rebuilds and reloads the browser automatically.
+
+Operational docs (project layout, `book.toml`, `SUMMARY.brf`, the `@page`
+cross-link shortcode, themes) are in
+[`crates/brief-web/README.md`](./crates/brief-web/README.md).
+
 ## Code-block minification (LLM mode)
 
 In `--target=llm` mode, fenced code blocks are minified for languages

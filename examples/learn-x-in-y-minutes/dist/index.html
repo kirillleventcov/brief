@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Learn Brief in Y Minutes — Brief</title>
+  <meta name="description" content="Brief is a strict markup language designed to replace Markdown for documents written by humans and consumed by humans and LLMs. It has three goals:">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="site-title" href="/">Brief</a>
+    <button id="theme-toggle" type="button" aria-label="Toggle theme">◐</button>
+  </header>
+  <div class="layout">
+    <aside class="sidebar"><nav aria-label="site navigation">
+<ul>
+<li><a href="/index.html">Learn Brief in Y Minutes</a></li>
+</ul>
+</nav>
+</aside>
+    <main class="content">
+      <article class="prose">
+        <h1>Learn Brief in Y Minutes</h1>
+<p>Brief is a strict markup language designed to replace Markdown for documents written by humans and consumed by humans <strong>and</strong> LLMs. It has three goals:</p>
+<ol>
+<li><strong>One way to do it.</strong> Every construct has a single canonical spelling.
+<p>Ambiguous input is a compile error, not a guess.</p>
+</li>
+<li><strong>Token economy.</strong> The source and the rendered LLM output are designed
+<p>to be cheaper than equivalent Markdown.</p>
+</li>
+<li><strong>Real compiler.</strong> Errors come with source spans, error codes, and help
+<p>text, like <code>rustc</code>. There are no warnings — just success or failure.</p>
+</li>
+</ol>
+<p>There is no inline HTML. The single extension point is <strong>shortcodes</strong>.</p>
+<p>The whole language fits in one file. Read it top to bottom.</p>
+<h2>1. Comments</h2>
+<p>Line comments start with <code>//</code> and must occupy the whole line. They are stripped before any output.</p>
+<p>Block comments use C-style <code>/* */</code> delimiters. They cannot nest, and the opening <code>/*</code> and closing <code>*/</code> must each appear at the start or end of a line — never in the middle of text.</p>
+<h2>2. Headings</h2>
+<p>Brief supports six levels of headings, written with <code>#</code> through <code>######</code>, followed by exactly one space and the heading text.</p>
+<pre><code class="language-brief"># Heading level 1
+## Heading level 2
+### Heading level 3
+#### Heading level 4
+##### Heading level 5
+###### Heading level 6</code></pre>
+<p>Seven or more <code>#</code> is an error: B0301 &quot;heading level exceeds maximum of 6&quot;. Setext headings (<code>===</code> / <code>---</code> underlines) do NOT exist. Two spaces, zero spaces, or no text after the <code>#</code> run are all errors.</p>
+<h2>3. Paragraphs and line breaks</h2>
+<p>Multiple consecutive non-blank lines that don't begin with a block sigil get joined with a single space when rendered. A blank line separates paragraphs. A trailing backslash at the end of a line is the hard-break marker — it forces a line break inside a single paragraph.</p>
+<pre><code class="language-brief">This is one paragraph
+that spans two lines.
+
+This is the next paragraph.\
+And this line breaks within it.</code></pre>
+<h2>4. Inline emphasis</h2>
+<p>Each kind of emphasis uses a SINGLE-character marker on each side:</p>
+<ul>
+<li><code>*bold*</code> renders as strong</li>
+<li><code>_italic_</code> renders as em</li>
+<li><code>+underline+</code> renders as underline</li>
+<li><code>~strike~</code> renders as strikethrough</li>
+</ul>
+<p>Doubled markers (<code>**bold**</code>, <code>__italic__</code>) are NOT valid. Brief refuses them rather than treating them as a different style — this is the entire point.</p>
+<pre><code class="language-brief">A line with *bold*, _italic_, +underline+, and ~strikethrough~ words.
+
+*bold with _italic inside_ and back to bold*</code></pre>
+<p>Emphasis kinds nest freely with each other, but the SAME kind cannot nest (that would be B0204). Multi-line emphasis is also an error (B0205).</p>
+<p>A marker flanked by alphanumerics on both sides is treated as a literal character, not as emphasis:</p>
+<pre><code class="language-brief">snake_case_name              // literal — no italic
+file_with_underscores.txt    // literal
+3*4 = 12                     // literal asterisks</code></pre>
+<p>To force a marker to be literal in a position where it would otherwise be emphasis, escape it with <code>\</code>:</p>
+<pre><code class="language-brief">This costs \*5\* dollars.</code></pre>
+<h2>5. Inline code</h2>
+<p>Use the <code>printf</code> function. To include a literal backtick inside inline code, switch to the double-backtick form. This is the ONLY exception in the whole language to the &quot;one canonical form&quot; rule, and it exists because you cannot escape inside a verbatim region.</p>
+<pre><code class="language-brief">Run ``echo `whoami` `` to print the user.</code></pre>
+<h2>6. Lists</h2>
+<p>Two kinds — unordered and ordered — and they do NOT mix at the same level. Switching between them ends the previous list.</p>
+<p>The unordered marker is <code>-</code> followed by exactly one space. <code>*</code> and <code>+</code> are NOT valid unordered markers.</p>
+<pre><code class="language-brief">- first item
+- second item
+- third item</code></pre>
+<p>The ordered marker is digits, then <code>.</code>, then exactly one space. Numbering MUST be sequential starting from 1. Out-of-order is an error (B0501) — the renderer does not silently renumber for you.</p>
+<pre><code class="language-brief">1. step one
+2. step two
+3. step three</code></pre>
+<p>Nested lists use exactly TWO spaces of indentation per level. One space, three spaces, or tabs are all errors.</p>
+<pre><code class="language-brief">- top level
+  - nested
+    - deeper still
+  - back to nested
+- another top</code></pre>
+<p>You can mix list types between levels:</p>
+<pre><code class="language-brief">1. ordered top
+  - bullet inside
+  - another bullet
+2. ordered top again</code></pre>
+<p>A list item can have continuation lines, indented to match the content column (the marker plus its space):</p>
+<pre><code class="language-brief">- this item has
+  a continuation line
+- next item</code></pre>
+<p>Unordered list items can carry a task-state marker as their first content. The marker is exactly <code>[x] </code> (done) or <code>[ ] </code> (todo) — strict literal: lowercase <code>x</code>, single space inside the brackets, single space after. Anything else (uppercase <code>X</code>, <code>[  ]</code> with two spaces, <code>[x]</code> without a trailing space) is plain text.</p>
+<pre><code class="language-brief">- [x] ship v0.4
+- [ ] write release notes
+- plain bullet, not a task</code></pre>
+<p>HTML emit renders these as a checkbox <code>&lt;input type=&quot;checkbox&quot; disabled&gt;</code> inside <code>&lt;li class=&quot;task-list-item&quot;&gt;</code>, with the parent <code>&lt;ul&gt;</code> carrying</p>
+<p><code>class=&quot;contains-task-list&quot;</code> if any item is a task. LLM emit preserves the marker verbatim. Task markers are NOT supported on ordered list items — <code>1. [x] foo</code> is just text.</p>
+<h2>7. Blockquotes</h2>
+<p>A blockquote starts with <code>&gt;</code> followed by exactly one space. Subsequent lines beginning the same way continue it. Nested blockquotes use additional <code>&gt;</code> markers. A blank line ends the blockquote.</p>
+<pre><code class="language-brief">&gt; An outer quote.
+&gt;&gt; A nested quote.
+&gt; Back to the outer.</code></pre>
+<h2>8. Code blocks</h2>
+<p>Triple-backtick fences only. Tilde fences (<code>~~~</code>) and four-space-indent code blocks are NOT supported. The opening fence may include a language tag. Content between the fences is verbatim — no escaping, no inline parsing. Unterminated fences are an error (B0305) at end of file.</p>
+<p>For example, here is a real fenced Rust block:</p>
+<pre><code class="language-rust">fn main() {
+    println!(&quot;hi&quot;);
+}</code></pre>
+<h2>9. Horizontal rule</h2>
+<p>Exactly three dashes, on a line by themselves. Two or four dashes are errors.</p>
+<hr>
+<h2>10. Tables</h2>
+<p>Tables are introduced by the <code>@t</code> directive. The first <code>|</code>-row is the header. There is NO separator row.</p>
+<table>
+<thead><tr><th style="text-align:left">Name</th><th style="text-align:left">Age</th><th style="text-align:left">City</th></tr></thead>
+<tbody>
+<tr><td style="text-align:left">John</td><td style="text-align:left">30</td><td style="text-align:left">NYC</td></tr>
+<tr><td style="text-align:left">Jane</td><td style="text-align:left">25</td><td style="text-align:left">LA</td></tr>
+</tbody>
+</table>
+<p>The trailing <code>|</code> is optional. Cells are trimmed of leading and trailing whitespace. Every row must have the same number of cells as the header — mismatches are an error (B0502).</p>
+<p>Column alignment is set on the directive:</p>
+<table>
+<thead><tr><th style="text-align:left">Name</th><th style="text-align:right">Score</th><th style="text-align:center">Status</th></tr></thead>
+<tbody>
+<tr><td style="text-align:left">Ada</td><td style="text-align:right">1024</td><td style="text-align:center">active</td></tr>
+<tr><td style="text-align:left">Bob</td><td style="text-align:right">42</td><td style="text-align:center">idle</td></tr>
+</tbody>
+</table>
+<p>Alignment array length must match the column count (B0504).</p>
+<h2>11. Shortcodes — the single extension point</h2>
+<p>Shortcodes are how Brief replaces inline HTML. Two forms exist: an inline form <code>@name(args)[content]</code> and a block form that opens with</p>
+<p><code>@name(args)</code>, has a body, and closes with <code>@end</code>.</p>
+<p>Arguments inside <code>(...)</code> are positional or keyword (mixed allowed, positionals first). Argument values are bare idents, integers, double-quoted strings, or arrays. The <code>[content]</code> of an inline shortcode is parsed as inline. Block bodies are parsed as full blocks (recursively). All shortcodes must be REGISTERED — using an unknown one is an error (B0401).</p>
+<p>Built-in shortcodes that ship with the reference compiler:</p>
+<table>
+<thead><tr><th style="text-align:left">Name</th><th style="text-align:left">Form</th><th style="text-align:left">Purpose</th></tr></thead>
+<tbody>
+<tr><td style="text-align:left">link</td><td style="text-align:left">inline</td><td style="text-align:left">hyperlink</td></tr>
+<tr><td style="text-align:left">image</td><td style="text-align:left">inline</td><td style="text-align:left">image</td></tr>
+<tr><td style="text-align:left">kbd</td><td style="text-align:left">inline</td><td style="text-align:left">keyboard input</td></tr>
+<tr><td style="text-align:left">sub</td><td style="text-align:left">inline</td><td style="text-align:left">subscript (replaces inline <code>&lt;sub&gt;</code>)</td></tr>
+<tr><td style="text-align:left">sup</td><td style="text-align:left">inline</td><td style="text-align:left">superscript (replaces inline <code>&lt;sup&gt;</code>)</td></tr>
+<tr><td style="text-align:left">details</td><td style="text-align:left">block</td><td style="text-align:left">collapsible block (replaces <code>&lt;details&gt;/&lt;summary&gt;</code>)</td></tr>
+<tr><td style="text-align:left">t</td><td style="text-align:left">block</td><td style="text-align:left">tables (special-cased)</td></tr>
+<tr><td style="text-align:left">code</td><td style="text-align:left">block</td><td style="text-align:left">same as triple-backtick fence</td></tr>
+<tr><td style="text-align:left">callout</td><td style="text-align:left">block</td><td style="text-align:left">boxed note</td></tr>
+<tr><td style="text-align:left">math</td><td style="text-align:left">both</td><td style="text-align:left">LaTeX math, inline or block</td></tr>
+<tr><td style="text-align:left">footnote</td><td style="text-align:left">inline</td><td style="text-align:left">footnote text</td></tr>
+</tbody>
+</table>
+<p>Inline HTML has no general escape hatch in Brief. The four built-ins above (<code>@kbd</code>, <code>@sub</code>, <code>@sup</code>, <code>@details</code>) cover the inline tags that came up most often in real documents. <code>@br</code> is not provided — use <code>\</code> at end of line (§12) for hard breaks. Anything else means the document shouldn't be inline-HTML in the first place; if you must, register a custom shortcode in <code>brief.toml</code>.</p>
+<p>An inline link — note the markdown-style <code>[text](url)</code> sugar that supplies the URL as positional arg #1:</p>
+<p>See <a href="https://example.com/brief">the spec</a> for details.</p>
+<p>An image with required keyword args (inline, embedded in a paragraph):</p>
+<p>The architecture is shown here: <img src="diagram.png" alt="architecture diagram">.</p>
+<p>Keyboard input: press <kbd>Ctrl+C</kbd> to abort.</p>
+<p>Inline math: the energy is <span class="math">E = m c^2</span>.</p>
+<p>A footnote: this claim is contested.<sup class="fn-ref"><a id="fn-ref-1" href="#fn-1">1</a></sup> The inline form is the only form — definitions live in the <code>[...]</code> body next to the reference, never elsewhere in the file. The compiler auto-numbers them in document order and emits a list at the end (HTML <code>&lt;ol class=&quot;footnotes&quot;&gt;</code>, LLM <code>[^1]: ...</code>).</p>
+<p>A block callout — the <code>kind</code> argument is constrained to one of <code>info</code>,</p>
+<p><code>warning</code>, or <code>danger</code>; anything else is B0404 BadEnumValue.</p>
+<aside class="callout callout-warning"><p>Watch out for the <kbd>Shift+Delete</kbd> shortcut on Linux. It can wipe data without going through the trash.</p>
+</aside>
+<p>Custom shortcodes are registered in <code>brief.toml</code> (see §13). User-defined shortcodes can NEVER be self-terminating — only <code>@t</code> and the triple-backtick fence are allowed that special form.</p>
+<h2>12. Escapes</h2>
+<p><code>\</code> escapes the next character, treating it as a literal. <code>\\</code> produces a literal backslash. Escapes are honored everywhere EXCEPT inside code spans and code blocks, which are verbatim by definition.</p>
+<pre><code class="language-brief">\*not bold\* \[not a bracket\] \\\\backslash</code></pre>
+<h2>13. Compiling</h2>
+<pre><code>brief compile doc.brf --target=html
+brief compile doc.brf --target=llm --report-tokens
+brief compile doc.brf --target=json</code></pre>
+<p>The <code>--target=llm</code> mode produces a deterministic, token-minimized rendering for inclusion in LLM prompts. Comments are stripped, blank lines are collapsed, indentation drops to one space per level, emphasis markers are preserved (use <code>--strip-emphasis</code> to drop them), and shortcodes render to compact forms:</p>
+<ul>
+<li><code>@link[text](url)</code> becomes <code>[text](url)</code></li>
+<li><code>@image(src, alt)</code> becomes <code>[image: alt]</code> (<code>--keep-asset-urls</code> preserves the URL)</li>
+<li><code>@callout(kind: warning) ...</code> becomes <code>[!warning] ... [/!]</code></li>
+<li><code>@math[x^2]</code> becomes <code>$x^2$</code></li>
+<li><code>@footnote[body]</code> becomes <code>[^N]</code> inline; definitions are appended at
+<p>the end of the document as <code>[^N]: body</code> lines</p>
+</li>
+</ul>
+<p><code>--report-tokens</code> prints a stderr line with a cl100k character/token estimate. The estimate is best-effort and not normative.</p>
+<h2>14. Configuration: brief.toml</h2>
+<p>At the project root, place a <code>brief.toml</code>. It declares custom shortcodes, enables strictness flags, and points to templates.</p>
+<pre><code class="language-toml">[project]
+name = &quot;my-docs&quot;
+version = &quot;0.1.0&quot;
+
+[compile]
+strict_heading_levels = true
+default_target = &quot;html&quot;
+
+[shortcodes.note]
+kind = &quot;block&quot;
+template_html = &quot;&lt;aside class=\&quot;note\&quot;&gt;{{content}}&lt;/aside&gt;&quot;
+template_llm = &quot;[note] {{content}} [/note]&quot;
+
+[shortcodes.callout]
+kind = &quot;block&quot;
+arguments = { kind = { type = &quot;string&quot;, required = true,
+  oneof = [&quot;info&quot;, &quot;warning&quot;, &quot;danger&quot;] } }
+template_html = &quot;templates/callout.html&quot;</code></pre>
+<p>Templates are minimal mustache: only <code>{{content}}</code> (rendered children) and <code>{{args.name}}</code> (argument values). No conditionals, no loops, no embedded code. Logic belongs in build hooks, not templates.</p>
+<h2>15. Diagnostics and error codes</h2>
+<p>Errors come out in <code>rustc</code> form:</p>
+<pre><code>error[B0204]: emphasis cannot nest with the same marker
+  --&gt; doc.brf:14:23
+   |
+14 | This is *outer *inner* outer*.
+   |        ^^^^^^^ inner emphasis re-uses the `*` marker
+   |
+   = help: use a different emphasis marker for the inner span,
+           e.g. _outer *inner* outer_</code></pre>
+<p>Code ranges:</p>
+<ul>
+<li>B01xx — lexical (tabs, BOM, encoding)</li>
+<li>B02xx — inline parsing (emphasis, code spans)</li>
+<li>B03xx — block parsing (headings, fences, comments)</li>
+<li>B04xx — shortcode resolution (unknown, type, enum, form)</li>
+<li>B05xx — semantic / cross-cutting (list sequence, table columns)</li>
+</ul>
+<p><code>brief explain B0204</code> prints the long-form explanation. There is no</p>
+<p><code>--allow-warnings</code>. There never will be.</p>
+<h2>16. The whole list of things that are intentionally NOT here</h2>
+<ul>
+<li>Inline HTML — use a shortcode.</li>
+<li><code>**bold**</code> / <code>__italic__</code> — one marker on each side; period.</li>
+<li><code>*</code> or <code>+</code> for bullets — only <code>-</code> is valid.</li>
+<li>Setext headings — only <code>#</code>-prefixed.</li>
+<li>Indented code blocks — use triple-backtick fences.</li>
+<li>Reference-style links — use <code>@link[text](url)</code>.</li>
+<li>Table separator row — <code>@t</code> header is implicit.</li>
+<li>Renumbering ordered lists — 1, 2, 3 or it's an error.</li>
+<li>Tab characters anywhere — two-space indent only.</li>
+<li>Inline trailing comments — comments are whole lines.</li>
+</ul>
+<p>If a thing isn't on this page, it isn't in the language.</p>
+<h2>Further reading</h2>
+<ul>
+<li>The full language specification (the source of truth).</li>
+<li><code>brief explain &lt;CODE&gt;</code> for any error code.</li>
+<li>The reference compiler's conformance suite under <code>tests/conformance.rs</code>.</li>
+</ul>
+<hr class="footnotes-sep">
+<ol class="footnotes">
+<li id="fn-1">See Smith, 2025. <a href="#fn-ref-1" class="fn-back">↩</a></li>
+</ol>
+
+      </article>
+      <footer class="page-footer">
+        <p>Rendered by <code>brief-web</code>.</p>
+      </footer>
+    </main>
+  </div>
+  <script>
+(function () {
+  if (!window.EventSource) return;
+  var es = new EventSource("/__brief_web_events");
+  es.addEventListener("reload", function () { window.location.reload(); });
+  es.onerror = function () { /* keep retrying silently */ };
+}());
+</script>
+
+  <script>
+    (function () {
+      var key = "brief-web-theme";
+      var btn = document.getElementById("theme-toggle");
+      var saved = localStorage.getItem(key);
+      if (saved) document.documentElement.dataset.theme = saved;
+      if (btn) btn.addEventListener("click", function () {
+        var cur = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = cur;
+        localStorage.setItem(key, cur);
+      });
+    }());
+  </script>
+</body>
+</html>

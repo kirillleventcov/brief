@@ -1,0 +1,270 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #5b5b5b;
+  --border: #e3e3e3;
+  --accent: #2c5d83;
+  --code-bg: #f4f4f4;
+  --quote-bg: #f6f8fa;
+  --warn-bg: #fff7e0;
+  --note-bg: #eaf3fb;
+  --tip-bg: #e8f7ee;
+  --caution-bg: #fdecec;
+  --important-bg: #f1ecfb;
+  --sidebar-bg: #fafafa;
+  --link: #2c5d83;
+  --kbd-bg: #ececec;
+}
+
+:root[data-theme="dark"] {
+  --bg: #14151a;
+  --fg: #e8e8e8;
+  --muted: #9da3ad;
+  --border: #2a2c33;
+  --accent: #88b8e0;
+  --code-bg: #1d1f25;
+  --quote-bg: #1a1d23;
+  --warn-bg: #3a311a;
+  --note-bg: #1a2a38;
+  --tip-bg: #1a302a;
+  --caution-bg: #3a1f1f;
+  --important-bg: #2a1f3a;
+  --sidebar-bg: #181a1f;
+  --link: #88b8e0;
+  --kbd-bg: #2a2c33;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #14151a;
+    --fg: #e8e8e8;
+    --muted: #9da3ad;
+    --border: #2a2c33;
+    --accent: #88b8e0;
+    --code-bg: #1d1f25;
+    --quote-bg: #1a1d23;
+    --warn-bg: #3a311a;
+    --note-bg: #1a2a38;
+    --tip-bg: #1a302a;
+    --caution-bg: #3a1f1f;
+    --important-bg: #2a1f3a;
+    --sidebar-bg: #181a1f;
+    --link: #88b8e0;
+    --kbd-bg: #2a2c33;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.65;
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 5;
+}
+.site-title {
+  font-weight: 600;
+  font-size: 0.95rem;
+  letter-spacing: 0.01em;
+  text-decoration: none;
+  color: var(--fg);
+}
+#theme-toggle {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  border-radius: 999px;
+  width: 2rem;
+  height: 2rem;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 0;
+  min-height: calc(100vh - 3.25rem);
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.sidebar {
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--border);
+  padding: 1.5rem 1rem 3rem;
+  font-size: 0.92rem;
+  position: sticky;
+  top: 3.25rem;
+  align-self: start;
+  max-height: calc(100vh - 3.25rem);
+  overflow-y: auto;
+}
+.sidebar ul { list-style: none; padding-left: 0.75rem; margin: 0.4rem 0; }
+.sidebar > ul { padding-left: 0; }
+.sidebar li { margin: 0.2rem 0; }
+.sidebar a {
+  color: var(--fg);
+  text-decoration: none;
+  padding: 0.15rem 0.4rem;
+  display: inline-block;
+  border-radius: 4px;
+}
+.sidebar a:hover { background: rgba(127, 127, 127, 0.12); }
+.sidebar a[aria-current="page"],
+.sidebar a.active {
+  color: var(--accent);
+  font-weight: 600;
+}
+.sidebar h1, .sidebar h2, .sidebar h3 {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 1.2rem 0 0.4rem;
+}
+
+.content {
+  padding: 2rem 2.5rem 4rem;
+  min-width: 0;
+}
+
+.prose {
+  max-width: 70ch;
+  margin: 0 auto;
+}
+
+.prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 {
+  line-height: 1.25;
+  margin: 2rem 0 0.8rem;
+  font-weight: 600;
+}
+.prose h1 { font-size: 2rem; margin-top: 0; }
+.prose h2 { font-size: 1.5rem; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+.prose h3 { font-size: 1.2rem; }
+.prose h4 { font-size: 1.05rem; color: var(--muted); }
+
+.prose p { margin: 0.9rem 0; }
+.prose a { color: var(--link); }
+.prose a:hover { text-decoration-thickness: 2px; }
+
+.prose ul, .prose ol { padding-left: 1.4rem; margin: 0.8rem 0; }
+.prose li { margin: 0.25rem 0; }
+
+.prose blockquote {
+  margin: 1rem 0;
+  padding: 0.6rem 1rem;
+  background: var(--quote-bg);
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+
+.prose code {
+  background: var(--code-bg);
+  padding: 0.05em 0.35em;
+  border-radius: 3px;
+  font-size: 0.92em;
+  font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+}
+.prose pre {
+  background: var(--code-bg);
+  padding: 0.85rem 1rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 0.88rem;
+  line-height: 1.55;
+  border: 1px solid var(--border);
+}
+.prose pre code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+}
+
+.prose table {
+  border-collapse: collapse;
+  margin: 1rem 0;
+  width: 100%;
+  font-size: 0.94rem;
+}
+.prose th, .prose td {
+  border: 1px solid var(--border);
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+}
+.prose th { background: var(--quote-bg); font-weight: 600; }
+
+.prose hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2rem 0;
+}
+
+.prose kbd {
+  background: var(--kbd-bg);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0.05em 0.4em;
+  font-size: 0.86em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.prose .callout, .prose div[role="note"] {
+  margin: 1rem 0;
+  padding: 0.6rem 1rem;
+  border-radius: 6px;
+  border-left: 3px solid var(--accent);
+}
+.prose .callout-note { background: var(--note-bg); }
+.prose .callout-tip { background: var(--tip-bg); }
+.prose .callout-warning { background: var(--warn-bg); }
+.prose .callout-caution { background: var(--caution-bg); }
+.prose .callout-important { background: var(--important-bg); }
+
+.prose .footnotes {
+  margin-top: 3rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.92rem;
+  color: var(--muted);
+}
+
+.prose .contains-task-list { padding-left: 1.1rem; }
+.prose .contains-task-list li input[type="checkbox"] { margin-right: 0.4rem; }
+
+.page-footer {
+  margin-top: 3rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+@media (max-width: 800px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar {
+    position: static;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    max-height: none;
+  }
+  .content { padding: 1.25rem 1.25rem 3rem; }
+}

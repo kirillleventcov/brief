@@ -1,0 +1,15 @@
+[book]
+title       = "Brief"
+description = "A strict markup language for documents written by humans and consumed by humans and LLMs."
+authors     = ["Kirill Leventcov"]
+
+[build]
+src = "src"
+out = "dist"
+
+[site]
+base_url = "/"
+
+[server]
+host = "127.0.0.1"
+port = 3000

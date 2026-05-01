@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members  = ["crates/brief-core", "crates/brief-cli"]
+members  = ["crates/brief-core", "crates/brief-cli", "crates/brief-web"]
 # Fuzz crate excluded from default members so `cargo build --workspace`
 # and `cargo test --workspace` ignore it. Run via cargo-fuzz from inside
 # crates/brief-core/fuzz instead.
