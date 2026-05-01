@@ -83,16 +83,77 @@ fn check_mode_exit_one_when_dirty_and_lists_path() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
-    let stderr = String::from_utf8(out.stderr).unwrap();
+    // The diff (including the file path) is printed to stdout, not stderr.
+    let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stderr.contains(input.to_str().unwrap()),
-        "expected stderr to list {:?}, got {:?}",
+        stdout.contains(input.to_str().unwrap()),
+        "expected stdout to contain file path {:?}, got {:?}",
         input,
-        stderr
+        stdout
     );
     // File is left untouched in check mode.
     let on_disk = std::fs::read_to_string(&input).unwrap();
     assert_eq!(on_disk, "hello   \n");
+}
+
+#[test]
+fn check_mode_dirty_file_prints_unified_diff() {
+    let dir = temp_dir("check_diff_content");
+    let input = dir.join("doc.brf");
+    std::fs::write(&input, "hello   \n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("fmt")
+        .arg("--check")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    // A unified diff must include a hunk header, a removal line, and an addition line.
+    assert!(
+        stdout.contains("@@"),
+        "expected hunk header '@@' in diff output, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with('-') && !l.starts_with("---")),
+        "expected a '-' diff line in output, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with('+') && !l.starts_with("+++")),
+        "expected a '+' diff line in output, got:\n{}",
+        stdout
+    );
+    // The --- / +++ header lines must contain the file path.
+    assert!(
+        stdout.contains(input.to_str().unwrap()),
+        "expected file path in diff header, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn check_mode_clean_file_no_diff_output() {
+    let dir = temp_dir("check_clean_nodiff");
+    let input = dir.join("doc.brf");
+    std::fs::write(&input, "hello\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("fmt")
+        .arg("--check")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "exit code should be 0 for clean file");
+    assert!(
+        out.stdout.is_empty(),
+        "expected no stdout output for clean file, got: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 #[test]
@@ -164,9 +225,10 @@ fn check_mode_aggregates_across_files() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
-    let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(stderr.contains(dirty.to_str().unwrap()));
-    assert!(!stderr.contains(clean.to_str().unwrap()));
+    // Diffs are printed to stdout; dirty files appear in diff headers.
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains(dirty.to_str().unwrap()));
+    assert!(!stdout.contains(clean.to_str().unwrap()));
 }
 
 #[test]

@@ -74,6 +74,8 @@ pub struct WatchOpts {
     pub target: Target,
     pub config_path: PathBuf,
     pub llm_opts: LlmOpts,
+    /// When true, suppress the clear-screen sequence between recompile runs.
+    pub no_clear: bool,
 }
 
 #[derive(Debug)]
@@ -114,6 +116,8 @@ pub struct Engine {
     pub target: Target,
     pub llm_opts: LlmOpts,
     pub files: BTreeSet<PathBuf>,
+    /// When true, suppress the clear-screen sequence between recompile runs.
+    pub no_clear: bool,
     /// Per-file: set of shortcode names referenced in source. Built/refreshed
     /// each time a file is compiled.
     shortcode_use: HashMap<PathBuf, HashSet<String>>,
@@ -135,6 +139,7 @@ impl Engine {
             target: opts.target,
             llm_opts: opts.llm_opts.clone(),
             files,
+            no_clear: opts.no_clear,
             shortcode_use: HashMap::new(),
         })
     }
@@ -512,6 +517,11 @@ fn handle_events<W: Write>(events: Vec<DebouncedEvent>, engine: &mut Engine, log
 /// Dispatch a list of changed paths through the engine. Public for tests
 /// (so we don't have to drive the FS watcher to exercise the logic).
 pub fn handle_change_paths<W: Write>(paths: &[PathBuf], engine: &mut Engine, log: &mut W) {
+    // Clear screen between runs per spec §4.7, unless suppressed.
+    if !engine.no_clear {
+        let _ = write!(log, "\x1b[2J\x1b[H");
+    }
+
     let cfg_canon = canonicalize_or_clone(&engine.config_path);
     let mut config_changed = false;
     let mut brf_changes: BTreeSet<PathBuf> = BTreeSet::new();
@@ -765,6 +775,7 @@ mod tests {
             target: Target::Html,
             config_path: dir.join("brief.toml"),
             llm_opts: LlmOpts::default(),
+            no_clear: true,
         };
         let mut engine = Engine::load(&opts).unwrap();
         let mut sink: Vec<u8> = Vec::new();
@@ -807,6 +818,7 @@ template_html = "<aside>{{content}}</aside>"
             target: Target::Html,
             config_path: cfg_path,
             llm_opts: LlmOpts::default(),
+            no_clear: false,
         };
         let mut engine = Engine::load(&opts).unwrap();
         let mut sink: Vec<u8> = Vec::new();
@@ -817,5 +829,103 @@ template_html = "<aside>{{content}}</aside>"
         let users = engine.files_using(&names);
         assert_eq!(users.len(), 1);
         assert!(users[0].ends_with("uses_note.brf"), "users={:?}", users);
+    }
+
+    #[test]
+    fn clear_screen_emitted_before_subsequent_compile() {
+        let dir = std::env::temp_dir().join("brief-watch-clear-emitted");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("doc.brf");
+        std::fs::write(&f, "# Hello\n").unwrap();
+
+        let opts = WatchOpts {
+            paths: vec![dir.clone()],
+            target: Target::Html,
+            config_path: dir.join("brief.toml"),
+            llm_opts: LlmOpts::default(),
+            no_clear: false,
+        };
+        let mut engine = Engine::load(&opts).unwrap();
+
+        // Simulate initial compile (no clear expected here).
+        let mut initial_log: Vec<u8> = Vec::new();
+        let _ = engine.compile_all(&mut initial_log);
+        assert!(
+            !String::from_utf8_lossy(&initial_log).contains("\x1b[2J"),
+            "clear should NOT appear on initial compile"
+        );
+
+        // Simulate a subsequent file-change event.
+        let mut log: Vec<u8> = Vec::new();
+        handle_change_paths(&[f.clone()], &mut engine, &mut log);
+        let out = String::from_utf8_lossy(&log);
+        assert!(
+            out.contains("\x1b[2J\x1b[H"),
+            "clear sequence should appear in subsequent compile log; got: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn clear_screen_suppressed_by_no_clear() {
+        let dir = std::env::temp_dir().join("brief-watch-clear-suppressed");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("doc.brf");
+        std::fs::write(&f, "# Hello\n").unwrap();
+
+        let opts = WatchOpts {
+            paths: vec![dir.clone()],
+            target: Target::Html,
+            config_path: dir.join("brief.toml"),
+            llm_opts: LlmOpts::default(),
+            no_clear: true,
+        };
+        let mut engine = Engine::load(&opts).unwrap();
+        let mut initial_log: Vec<u8> = Vec::new();
+        let _ = engine.compile_all(&mut initial_log);
+
+        let mut log: Vec<u8> = Vec::new();
+        handle_change_paths(&[f.clone()], &mut engine, &mut log);
+        let out = String::from_utf8_lossy(&log);
+        assert!(
+            !out.contains("\x1b[2J"),
+            "clear sequence should be suppressed when no_clear=true; got: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn clear_screen_not_emitted_on_initial_compile() {
+        let dir = std::env::temp_dir().join("brief-watch-clear-initial");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("doc.brf");
+        std::fs::write(&f, "# Hello\n").unwrap();
+
+        let opts = WatchOpts {
+            paths: vec![dir.clone()],
+            target: Target::Html,
+            config_path: dir.join("brief.toml"),
+            llm_opts: LlmOpts::default(),
+            no_clear: false,
+        };
+        let mut engine = Engine::load(&opts).unwrap();
+        let mut log: Vec<u8> = Vec::new();
+        // This is the initial compile path — no clear-screen should appear.
+        let _ = engine.compile_all(&mut log);
+        let out = String::from_utf8_lossy(&log);
+        assert!(
+            !out.contains("\x1b[2J"),
+            "clear sequence should NOT appear on initial compile; got: {:?}",
+            out
+        );
+        // Also verify it did compile something.
+        let html_path = f.with_extension("html");
+        assert!(
+            html_path.exists(),
+            "html output should exist after initial compile"
+        );
     }
 }

@@ -7,6 +7,7 @@ edition = "2024"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+similar = "2"
 toml = "0.8.23"
 pulldown-cmark = { version = "0.13", default-features = false }
 notify = "8"

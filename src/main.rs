@@ -94,6 +94,9 @@ enum Cmd {
         keep_asset_urls: bool,
         #[arg(long)]
         keep_metadata: bool,
+        /// Do not print a clear-screen sequence between recompile runs.
+        #[arg(long)]
+        no_clear: bool,
     },
 }
 
@@ -142,6 +145,7 @@ fn main() -> ExitCode {
             keep_table_rule,
             keep_asset_urls,
             keep_metadata,
+            no_clear,
         } => run_watch(
             paths,
             target,
@@ -150,6 +154,7 @@ fn main() -> ExitCode {
             keep_table_rule,
             keep_asset_urls,
             keep_metadata,
+            no_clear,
         ),
     }
 }
@@ -162,6 +167,7 @@ fn run_watch(
     keep_table_rule: bool,
     keep_asset_urls: bool,
     keep_metadata: bool,
+    no_clear: bool,
 ) -> ExitCode {
     use brief::watch::{LlmOpts, Target as WatchTarget, WatchOpts};
     let target = match WatchTarget::parse(&target) {
@@ -190,6 +196,7 @@ fn run_watch(
             keep_asset_urls,
             keep_metadata,
         },
+        no_clear,
     };
     if let Err(e) = brief::watch::run(opts) {
         eprintln!("brief: {}", e);
@@ -562,7 +569,14 @@ fn run_fmt(inputs: Vec<PathBuf>, check: bool, write: bool, sort_frontmatter: boo
         let formatted = fmt::format(&raw, &opts);
         if check {
             if formatted != raw {
-                eprintln!("{}", input.display());
+                // Print a unified diff to stdout (matching gofmt's convention).
+                let diff = similar::TextDiff::from_lines(&raw, &formatted);
+                let mut udiff = diff.unified_diff();
+                udiff.header(
+                    &format!("{} (original)", input.display()),
+                    &format!("{} (formatted)", input.display()),
+                );
+                print!("{}", udiff);
                 would_change += 1;
             }
         } else if write {

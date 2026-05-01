@@ -25,6 +25,7 @@ fn opts_for(dir: &Path, target: Target) -> WatchOpts {
         target,
         config_path: dir.join("brief.toml"),
         llm_opts: LlmOpts::default(),
+        no_clear: true,
     }
 }
 

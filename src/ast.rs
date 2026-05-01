@@ -74,7 +74,7 @@ pub struct ListItem {
     pub children: Vec<Block>,
     /// Set when the item begins with the literal `[x] ` (Done) or `[ ] `
     /// (Todo) marker. Marker bytes are consumed by the parser; `content`
-    /// holds the rest. Only unordered list items carry this.
+    /// holds the rest. Both unordered and ordered list items can carry this.
     pub task: Option<TaskState>,
     pub span: Span,
 }

@@ -535,12 +535,78 @@ fn task_list_inline_emphasis_in_content() {
 }
 
 #[test]
-fn task_list_ordered_brackets_are_plain_text() {
-    // Ordered lists never carry task markers; `1. [x] foo` is plain text.
-    let (html, codes) = compile("1. [x] still text\n");
+fn task_list_ordered_done_html() {
+    let (html, codes) = compile("1. [x] ship it\n");
+    assert!(codes.is_empty(), "{:?}", codes);
+    assert!(
+        html.contains("<ol class=\"contains-task-list\">"),
+        "parent class missing: {}",
+        html
+    );
+    assert!(
+        html.contains(
+            "<li class=\"task-list-item\"><input type=\"checkbox\" disabled checked> ship it</li>"
+        ),
+        "{}",
+        html
+    );
+}
+
+#[test]
+fn task_list_ordered_todo_html() {
+    let (html, codes) = compile("1. [ ] write tests\n");
+    assert!(codes.is_empty(), "{:?}", codes);
+    assert!(
+        html.contains("<ol class=\"contains-task-list\">"),
+        "parent class missing: {}",
+        html
+    );
+    assert!(
+        html.contains(
+            "<li class=\"task-list-item\"><input type=\"checkbox\" disabled> write tests</li>"
+        ),
+        "{}",
+        html
+    );
+}
+
+#[test]
+fn task_list_ordered_llm_round_trips() {
+    let out = render_llm("1. [x] one\n2. [ ] two\n");
+    assert!(out.contains("1. [x] one"), "{}", out);
+    assert!(out.contains("2. [ ] two"), "{}", out);
+}
+
+#[test]
+fn task_list_ordered_marker_uppercase_x_is_plain_text() {
+    // The spec is strict: lowercase `x` only.
+    let (html, codes) = compile("1. [X] not a task\n");
+    assert!(codes.is_empty(), "{:?}", codes);
+    assert!(!html.contains("contains-task-list"), "{}", html);
+    assert!(!html.contains("task-list-item"), "{}", html);
+    assert!(
+        html.contains("[X] not a task"),
+        "literal preserved: {}",
+        html
+    );
+}
+
+#[test]
+fn task_list_ordered_no_space_after_marker_is_plain_text() {
+    // The trailing space after `]` is required to consume the marker.
+    let (html, codes) = compile("1. [x]nope\n");
     assert!(codes.is_empty(), "{:?}", codes);
     assert!(!html.contains("task-list-item"), "{}", html);
-    assert!(html.contains("[x] still text"), "{}", html);
+    assert!(html.contains("[x]nope"), "{}", html);
+}
+
+#[test]
+fn task_list_ordered_double_space_is_plain_text() {
+    // `[  ]` (two spaces) is not a task marker.
+    let (html, codes) = compile("1. [  ] still text\n");
+    assert!(codes.is_empty(), "{:?}", codes);
+    assert!(!html.contains("contains-task-list"), "{}", html);
+    assert!(html.contains("[  ] still text"), "{}", html);
 }
 
 // --- 4.4 @link title: kwarg and @callout GFM kinds ----------------------
