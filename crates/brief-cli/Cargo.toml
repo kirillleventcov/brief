@@ -1,0 +1,13 @@
+[package]
+name    = "brief-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap       = { version = "4", features = ["derive"] }
+brief-core = { path = "../brief-core" }
+similar    = "2"
+
+[[bin]]
+name = "brief"
+path = "src/main.rs"

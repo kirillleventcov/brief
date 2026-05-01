@@ -1,26 +1,15 @@
-[package]
-name = "brief"
+[workspace]
+resolver = "3"
+members  = ["crates/brief-core", "crates/brief-cli"]
+# Fuzz crate excluded from default members so `cargo build --workspace`
+# and `cargo test --workspace` ignore it. Run via cargo-fuzz from inside
+# crates/brief-core/fuzz instead.
+exclude  = ["crates/brief-core/fuzz"]
+
+[workspace.package]
 version = "0.2.0"
 edition = "2024"
 
-[dependencies]
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
-similar = "2"
-toml = "0.8.23"
-pulldown-cmark = { version = "0.13", default-features = false }
-notify = "8"
-notify-debouncer-mini = { version = "0.7", default-features = false }
-
-[lib]
-name = "brief"
-path = "src/lib.rs"
-
-[[bin]]
-name = "brief"
-path = "src/main.rs"
-
 [profile.release]
-lto = true
+lto           = true
 codegen-units = 1

@@ -71,16 +71,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
-name = "brief"
+name = "brief-cli"
 version = "0.2.0"
 dependencies = [
+ "brief-core",
  "clap",
+ "similar",
+]
+
+[[package]]
+name = "brief-core"
+version = "0.2.0"
+dependencies = [
  "notify",
  "notify-debouncer-mini",
  "pulldown-cmark",
  "serde",
  "serde_json",
- "similar",
  "toml",
 ]
 

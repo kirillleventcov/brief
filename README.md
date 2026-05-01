@@ -159,7 +159,7 @@ remain greppable in the converted corpus.
 
 The parser is fuzzed with [cargo-fuzz][]. Four targets cover the lex/parse
 pipeline, the inline parser, the shortcode argument grammar, and the
-markdown→brief converter (round-trip). See [`fuzz/README.md`](./fuzz/README.md)
+markdown→brief converter (round-trip). See [`crates/brief-core/fuzz/README.md`](./crates/brief-core/fuzz/README.md)
 for setup and run instructions.
 
 [cargo-fuzz]: https://rust-fuzz.github.io/book/cargo-fuzz.html

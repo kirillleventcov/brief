@@ -1,0 +1,16 @@
+[package]
+name    = "brief-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml       = "0.8.23"
+pulldown-cmark = { version = "0.13", default-features = false }
+notify = "8"
+notify-debouncer-mini = { version = "0.7", default-features = false }
+
+[lib]
+name = "brief"
+path = "src/lib.rs"
