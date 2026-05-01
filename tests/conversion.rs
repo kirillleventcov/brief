@@ -389,18 +389,48 @@ fn footnote_body_emphasis_diagnostics_propagate() {
 }
 
 #[test]
-fn inline_html_emits_todo_above_paragraph() {
+fn inline_sub_rewritten_to_shortcode() {
     let md = "before <sub>2</sub> after\n";
     let (out, holes) = run(md);
-    assert!(
-        out.contains("// TODO[B-hole:inline-html]: <sub>"),
-        "out={:?}",
-        out
+    assert_eq!(out, "before @sub[2] after\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn inline_sup_rewritten_to_shortcode() {
+    let md = "x<sup>2</sup>\n";
+    let (out, holes) = run(md);
+    assert_eq!(out, "x@sup[2]\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn inline_kbd_rewritten_to_shortcode() {
+    let md = "press <kbd>Ctrl+C</kbd>\n";
+    let (out, holes) = run(md);
+    assert_eq!(out, "press @kbd[Ctrl+C]\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn inline_br_becomes_brief_hard_break() {
+    let md = "line one<br>line two\n";
+    let (out, holes) = run(md);
+    assert_eq!(out, "line one\\\nline two\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn unknown_inline_html_still_emits_todo() {
+    let md = "see <abbr title=\"x\">A</abbr> here\n";
+    let (out, holes) = run(md);
+    assert!(out.contains("// TODO[B-hole:inline-html]"), "out={:?}", out);
+    assert_eq!(
+        holes,
+        vec![Hole::InlineHtml, Hole::InlineHtml],
+        "{:?}",
+        holes
     );
-    assert!(out.contains("before"));
-    assert!(out.contains("2"));
-    assert!(out.contains("after"));
-    assert_eq!(holes, vec![Hole::InlineHtml, Hole::InlineHtml]);
 }
 
 #[test]
@@ -412,6 +442,118 @@ fn html_block_in_block_comment() {
     assert!(out.contains("</div>"));
     assert!(out.contains("*/"));
     assert_eq!(holes, vec![Hole::HtmlBlock]);
+}
+
+#[test]
+fn details_block_self_contained_rewritten() {
+    let md = "<details><summary>Why</summary>Because</details>\n";
+    let (out, holes) = run(md);
+    assert!(out.contains("@details(summary: \"Why\")"), "out={:?}", out);
+    assert!(out.contains("Because"));
+    assert!(out.contains("@end"));
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn details_block_with_markdown_body() {
+    let md = "<details>\n<summary>Click</summary>\n\n*Important* note.\n\n</details>\n";
+    let (out, holes) = run(md);
+    assert!(
+        out.contains("@details(summary: \"Click\")"),
+        "out={:?}",
+        out
+    );
+    // Markdown body is reparsed normally — `*x*` (italic) becomes `_x_`,
+    // raising the standard AsteriskEmphasis hole.
+    assert!(out.contains("_Important_ note."), "out={:?}", out);
+    assert!(out.contains("@end"));
+    assert_eq!(holes, vec![Hole::AsteriskEmphasis], "{:?}", holes);
+}
+
+#[test]
+fn heading_anchor_passthrough() {
+    let md = "## Hello world {#hello-world}\n";
+    let (out, holes) = run(md);
+    assert_eq!(out, "## Hello world {#hello-world}\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn converted_heading_anchor_round_trips_through_compiler() {
+    use brief::lexer::lex;
+    use brief::parser::parse;
+    use brief::span::SourceMap;
+    let md = "# Top {#top}\n\n## Sub {#some-sub}\n\nbody\n";
+    let r = convert(md, "in.md");
+    let src = SourceMap::new("in.brf", r.brief_source.clone());
+    let toks = lex(&src).expect("lex");
+    let (doc, diags) = parse(toks, &src);
+    assert!(diags.is_empty(), "{:?}\n---\n{}", diags, r.brief_source);
+    let mut anchors: Vec<String> = Vec::new();
+    for b in &doc.blocks {
+        if let brief::ast::Block::Heading { anchor, .. } = b {
+            if let Some(a) = anchor {
+                anchors.push(a.clone());
+            }
+        }
+    }
+    assert_eq!(anchors, vec!["top".to_string(), "some-sub".to_string()]);
+}
+
+#[test]
+fn converted_inline_shortcodes_round_trip_through_compiler() {
+    use brief::lexer::lex;
+    use brief::parser::parse;
+    use brief::resolve::resolve;
+    use brief::shortcode::Registry;
+    use brief::span::SourceMap;
+    use brief::validate::{ValidateOpts, validate};
+    let md = "press <kbd>Ctrl+C</kbd> to abort. x<sup>2</sup> + y<sub>0</sub>\n";
+    let r = convert(md, "in.md");
+    let src = SourceMap::new("in.brf", &r.brief_source);
+    let toks = lex(&src).expect("lex");
+    let (mut doc, mut diags) = parse(toks, &src);
+    let reg = Registry::with_builtins();
+    diags.extend(resolve(&mut doc, &reg));
+    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+    assert!(
+        diags.is_empty(),
+        "diags:\n{:#?}\n---\n{}",
+        diags,
+        r.brief_source
+    );
+}
+
+#[test]
+fn converted_details_round_trips_through_compiler() {
+    use brief::lexer::lex;
+    use brief::parser::parse;
+    use brief::resolve::resolve;
+    use brief::shortcode::Registry;
+    use brief::span::SourceMap;
+    use brief::validate::{ValidateOpts, validate};
+    let md = "<details><summary>Why</summary>Because reasons.</details>\n";
+    let r = convert(md, "in.md");
+    let src = SourceMap::new("in.brf", &r.brief_source);
+    let toks = lex(&src).expect("lex");
+    let (mut doc, mut diags) = parse(toks, &src);
+    let reg = Registry::with_builtins();
+    diags.extend(resolve(&mut doc, &reg));
+    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+    assert!(
+        diags.is_empty(),
+        "diags:\n{:#?}\n---\n{}",
+        diags,
+        r.brief_source
+    );
+}
+
+#[test]
+fn heading_anchor_slugified_when_invalid() {
+    let md = "## Title {#Some_ID}\n";
+    let (out, holes) = run(md);
+    assert_eq!(out, "## Title {#some-id}\n");
+    assert_eq!(holes, vec![Hole::HeadingAnchorSlugged]);
 }
 
 #[test]

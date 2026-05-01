@@ -38,6 +38,7 @@ pub enum Hole {
     HtmlBlock,
     Frontmatter,
     HtmlEntity,
+    HeadingAnchorSlugged,
 }
 
 impl Hole {
@@ -61,6 +62,7 @@ impl Hole {
             Hole::HtmlBlock => "html-block",
             Hole::Frontmatter => "frontmatter",
             Hole::HtmlEntity => "html-entity",
+            Hole::HeadingAnchorSlugged => "heading-anchor-slugged",
         }
     }
 
@@ -84,6 +86,7 @@ impl Hole {
             Hole::HtmlBlock => "HTML block preserved inside Brief block comment",
             Hole::Frontmatter => "frontmatter dropped, replaced with TODO comment",
             Hole::HtmlEntity => "HTML entity decoded to literal character",
+            Hole::HeadingAnchorSlugged => "heading anchor id rewritten to `[a-z0-9-]+` slug",
         }
     }
 }
@@ -103,6 +106,7 @@ pub fn convert(input: &str, source_path: &str) -> ConvertResult {
     opts.insert(Options::ENABLE_MATH);
     opts.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
     opts.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
+    opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
 
     let line_offsets = compute_line_offsets(input);
     let events: Vec<(Event<'_>, std::ops::Range<usize>)> =
@@ -200,6 +204,12 @@ struct Walker<'a> {
     in_metadata: bool,
     metadata_buf: String,
     metadata_kind: Option<pulldown_cmark::MetadataBlockKind>,
+    /// Stack of currently-open inline HTML rewrites (`<sub>`, `<sup>`, `<kbd>`).
+    /// On a matching close tag we pop and emit `]`.
+    html_replace_stack: Vec<HtmlInlineKind>,
+    /// `Some(anchor)` between Start(Heading) and End(Heading) when the
+    /// markdown source carried a `{#anchor}` attribute.
+    pending_heading_anchor: Option<String>,
 }
 
 struct TableState {
@@ -226,6 +236,35 @@ enum Container {
     ImagePending,
     /// Paragraph buffer; on pop we flush pending HTML comments then this content.
     Paragraph,
+    /// Buffer for an HtmlBlock; on End we inspect the buffered content and
+    /// either rewrite `<details>` to `@details(...)/@end`, hand off to a
+    /// `Details` container if the block is an opening fragment, or fall
+    /// back to the existing TODO + `/* */` form.
+    HtmlBlock,
+    /// Active `<details>` block whose body spans multiple events (because
+    /// blank lines split markdown content out of the surrounding HtmlBlock).
+    /// The `summary` is captured when we open; on the closing `</details>`
+    /// HtmlBlock we pop and emit `@details(summary: "..")\n[body]\n@end`.
+    Details {
+        summary: String,
+    },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum HtmlInlineKind {
+    Sub,
+    Sup,
+    Kbd,
+}
+
+impl HtmlInlineKind {
+    fn shortcode(self) -> &'static str {
+        match self {
+            HtmlInlineKind::Sub => "sub",
+            HtmlInlineKind::Sup => "sup",
+            HtmlInlineKind::Kbd => "kbd",
+        }
+    }
 }
 
 impl<'a> Walker<'a> {
@@ -287,6 +326,8 @@ impl<'a> Walker<'a> {
             in_metadata: false,
             metadata_buf: String::new(),
             metadata_kind: None,
+            html_replace_stack: Vec::new(),
+            pending_heading_anchor: None,
         }
     }
 
@@ -419,7 +460,7 @@ impl<'a> Walker<'a> {
                     self.write_char('\n');
                 }
             }
-            Event::Start(Tag::Heading { level, .. }) => {
+            Event::Start(Tag::Heading { level, id, .. }) => {
                 let n = match level {
                     pulldown_cmark::HeadingLevel::H1 => 1,
                     pulldown_cmark::HeadingLevel::H2 => 2,
@@ -438,12 +479,41 @@ impl<'a> Walker<'a> {
                         format!("rewritten to `{} ...`", "#".repeat(n)),
                     );
                 }
+                if let Some(raw) = id {
+                    let raw = raw.to_string();
+                    let safe = sluggify_anchor(&raw);
+                    if safe != raw {
+                        self.push_diag(
+                            Hole::HeadingAnchorSlugged,
+                            range.clone(),
+                            format!("anchor `{}` rewritten to `{}`", raw, safe),
+                        );
+                    }
+                    self.pending_heading_anchor = Some(safe);
+                }
                 for _ in 0..n {
                     self.write_char('#');
                 }
                 self.write_char(' ');
             }
             Event::End(TagEnd::Heading(_)) => {
+                if let Some(anchor) = self.pending_heading_anchor.take() {
+                    // Heading body may have ended with a trailing space from a
+                    // soft break; trim before joining the anchor block.
+                    while self.current_ends_with(' ') {
+                        match self.out_stack.last_mut() {
+                            Some(buf) => {
+                                buf.pop();
+                            }
+                            None => {
+                                self.out.pop();
+                            }
+                        }
+                    }
+                    self.write(" {#");
+                    self.write(&anchor);
+                    self.write_char('}');
+                }
                 self.write_char('\n');
             }
             Event::Start(Tag::Emphasis) => {
@@ -627,9 +697,13 @@ impl<'a> Walker<'a> {
                         }
                         self.write("@end\n");
                     }
-                    Container::LinkPending | Container::ImagePending | Container::Paragraph => {
-                        // Should not arrive here — Link/Image/Paragraph End arms
-                        // pop their own buffers and containers. Defensive no-op.
+                    Container::LinkPending
+                    | Container::ImagePending
+                    | Container::Paragraph
+                    | Container::HtmlBlock
+                    | Container::Details { .. } => {
+                        // Should not arrive here — those containers are
+                        // popped by their own End arms. Defensive no-op.
                         self.write(&inner);
                     }
                 }
@@ -841,22 +915,92 @@ impl<'a> Walker<'a> {
                 }
             }
             Event::Start(Tag::HtmlBlock) => {
-                self.push_diag(
-                    Hole::HtmlBlock,
-                    range.clone(),
-                    "HTML block preserved inside Brief block comment".into(),
-                );
-                self.write("// TODO[B-hole:html-block]\n");
-                self.write("/*\n");
+                // Buffer the block's content; on End we either rewrite a
+                // recognized `<details>` shape or fall back to the
+                // existing TODO + `/* */` comment form.
+                self.out_stack.push(String::new());
+                self.container_stack.push(Container::HtmlBlock);
             }
             Event::End(TagEnd::HtmlBlock) => {
-                self.write("\n*/\n");
+                let buf = self.out_stack.pop().expect("html block buffer");
+                let _ = self.container_stack.pop();
+                match classify_details_block(&buf) {
+                    DetailsShape::Closed { summary, body } => {
+                        self.write("@details(summary: \"");
+                        self.write(&escape_brief_string(&summary));
+                        self.write("\")\n");
+                        let body = body.trim_matches('\n');
+                        if !body.is_empty() {
+                            self.write(body);
+                            self.write_char('\n');
+                        }
+                        self.write("@end\n\n");
+                    }
+                    DetailsShape::Open { summary } => {
+                        // The `</details>` will arrive in a later HtmlBlock.
+                        // Stage a Details container that captures any
+                        // blocks rendered in between.
+                        self.out_stack.push(String::new());
+                        self.container_stack.push(Container::Details { summary });
+                    }
+                    DetailsShape::Close => {
+                        // Pop the matching Details container, if any.
+                        let mut closed = false;
+                        if matches!(self.container_stack.last(), Some(Container::Details { .. })) {
+                            let body = self.out_stack.pop().expect("details body buffer");
+                            let container = self.container_stack.pop().expect("details container");
+                            if let Container::Details { summary } = container {
+                                self.write("@details(summary: \"");
+                                self.write(&escape_brief_string(&summary));
+                                self.write("\")\n");
+                                let body = body.trim_matches('\n');
+                                if !body.is_empty() {
+                                    self.write(body);
+                                    self.write_char('\n');
+                                }
+                                self.write("@end\n\n");
+                                closed = true;
+                            }
+                        }
+                        if !closed {
+                            // Stray `</details>` with no opener on the
+                            // stack — fall back to the comment form.
+                            self.fallback_html_block(range.clone(), &buf);
+                        }
+                    }
+                    DetailsShape::Unknown => {
+                        self.fallback_html_block(range.clone(), &buf);
+                    }
+                }
             }
             Event::Html(s) => {
                 // Block-level HTML content (between Start/End of HtmlBlock).
                 self.write(&s);
             }
             Event::InlineHtml(s) => {
+                let trimmed = s.trim();
+                if let Some(kind) = classify_inline_html_open(trimmed) {
+                    self.html_replace_stack.push(kind);
+                    self.write_char('@');
+                    self.write(kind.shortcode());
+                    self.write_char('[');
+                    return;
+                }
+                if let Some(kind) = classify_inline_html_close(trimmed) {
+                    if self.html_replace_stack.last().copied() == Some(kind) {
+                        self.html_replace_stack.pop();
+                        self.write_char(']');
+                        return;
+                    }
+                    // Mismatched close — fall through to TODO so we don't
+                    // emit a stray `]` that would corrupt the output.
+                }
+                if is_inline_br(trimmed) {
+                    // Brief hard break: backslash at end of line.
+                    self.write_char('\\');
+                    self.write_char('\n');
+                    return;
+                }
                 let snippet = s.to_string();
                 self.push_diag(
                     Hole::InlineHtml,
@@ -946,6 +1090,26 @@ impl<'a> Walker<'a> {
         });
     }
 
+    /// Emit a buffered HTML block as the existing TODO + `/* */` comment
+    /// fallback. Used when the block isn't a recognizable `<details>`.
+    fn fallback_html_block(&mut self, range: std::ops::Range<usize>, buf: &str) {
+        self.push_diag(
+            Hole::HtmlBlock,
+            range,
+            "HTML block preserved inside Brief block comment".into(),
+        );
+        self.write("// TODO[B-hole:html-block]\n");
+        self.write("/*\n");
+        // Brief block comments don't nest; sanitize any embedded `*/` so
+        // the comment terminates only where we want it to.
+        let sanitized = buf.replace("*/", "* /");
+        self.write(&sanitized);
+        if !sanitized.ends_with('\n') {
+            self.write_char('\n');
+        }
+        self.write("*/\n");
+    }
+
     fn emit_table(&mut self, state: TableState) {
         use pulldown_cmark::Alignment;
         let needs_align = state.aligns.iter().any(|a| !matches!(a, Alignment::None));
@@ -977,6 +1141,176 @@ impl<'a> Walker<'a> {
             self.write("\n");
         }
     }
+}
+
+/// Coerce an arbitrary heading id string into Brief's `[a-z0-9-]+` form.
+/// Lowercases ASCII, replaces every other char with `-`, collapses runs,
+/// strips leading/trailing `-`. Falls back to `"section"` when the input
+/// has no usable characters.
+fn sluggify_anchor(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = true;
+    for ch in raw.chars() {
+        let lo = ch.to_ascii_lowercase();
+        if lo.is_ascii_lowercase() || lo.is_ascii_digit() {
+            out.push(lo);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        return "section".to_string();
+    }
+    out
+}
+
+/// Classify an `Event::InlineHtml` payload as an opening tag we know how
+/// to rewrite. Returns `None` for everything else (closing tags,
+/// self-closing tags, unrecognized fragments) — the caller handles those.
+fn classify_inline_html_open(s: &str) -> Option<HtmlInlineKind> {
+    let t = s.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "<sub>" => Some(HtmlInlineKind::Sub),
+        "<sup>" => Some(HtmlInlineKind::Sup),
+        "<kbd>" => Some(HtmlInlineKind::Kbd),
+        _ => None,
+    }
+}
+
+fn classify_inline_html_close(s: &str) -> Option<HtmlInlineKind> {
+    let t = s.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "</sub>" => Some(HtmlInlineKind::Sub),
+        "</sup>" => Some(HtmlInlineKind::Sup),
+        "</kbd>" => Some(HtmlInlineKind::Kbd),
+        _ => None,
+    }
+}
+
+fn is_inline_br(s: &str) -> bool {
+    let t = s.trim().to_ascii_lowercase();
+    matches!(t.as_str(), "<br>" | "<br/>" | "<br />")
+}
+
+/// Escape a summary string for use inside `@details(summary: "...")`.
+fn escape_brief_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Try to recognize a `<details>` HTML fragment.
+///
+/// Returns `DetailsShape::Closed` when the buffer fully wraps a
+/// `<details>...</details>` block; `DetailsShape::Open` when the buffer
+/// is the *opening* fragment of a multi-event `<details>` block (the
+/// closing `</details>` will arrive in a later HtmlBlock); `Unknown`
+/// otherwise.
+fn classify_details_block(buf: &str) -> DetailsShape {
+    let trimmed = buf.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let starts_open = lower.starts_with("<details>")
+        || lower.starts_with("<details ")
+        || lower.starts_with("<details\n");
+    let only_close = lower == "</details>" || lower.starts_with("</details>");
+    if only_close && !starts_open {
+        // Bare close fragment; caller will pop a Details container.
+        return DetailsShape::Close;
+    }
+    if !starts_open {
+        return DetailsShape::Unknown;
+    }
+    let after_open = match find_after_open_tag(trimmed, "details") {
+        Some(idx) => idx,
+        None => return DetailsShape::Unknown,
+    };
+    let inner = &trimmed[after_open..];
+    // Strip a single optional leading newline.
+    let inner = inner.strip_prefix('\n').unwrap_or(inner);
+    let summary = extract_summary(inner);
+    let body_start = match summary.as_ref() {
+        Some((_, end)) => *end,
+        None => 0,
+    };
+    let after_summary = &inner[body_start..];
+    // Look for matching `</details>` at the end of the buffer (case-insensitive).
+    let lower_after = after_summary.to_ascii_lowercase();
+    if let Some(close_idx) = lower_after.rfind("</details>") {
+        let body = after_summary[..close_idx].trim_matches('\n').to_string();
+        let summary_text = summary.map(|((s, _), _)| s).unwrap_or_default();
+        DetailsShape::Closed {
+            summary: summary_text,
+            body,
+        }
+    } else {
+        // Opener without close — defer body to a Details container.
+        let summary_text = summary.map(|((s, _), _)| s).unwrap_or_default();
+        DetailsShape::Open {
+            summary: summary_text,
+        }
+    }
+}
+
+enum DetailsShape {
+    Closed { summary: String, body: String },
+    Open { summary: String },
+    Close,
+    Unknown,
+}
+
+/// Return the byte index immediately after the opening tag for `name`
+/// (case-insensitive), e.g. the index after `<details>` or `<details ...>`.
+fn find_after_open_tag(s: &str, name: &str) -> Option<usize> {
+    let lower = s.to_ascii_lowercase();
+    let needle = format!("<{}", name);
+    let start = lower.find(&needle)?;
+    let rest = &s[start + needle.len()..];
+    let close = rest.find('>')?;
+    Some(start + needle.len() + close + 1)
+}
+
+/// Pull a `<summary>...</summary>` out of `s`. Returns `((text, byte_len),
+/// end_byte_offset_of_close_tag)` when found.
+#[allow(clippy::type_complexity)]
+fn extract_summary(s: &str) -> Option<((String, usize), usize)> {
+    let lower = s.to_ascii_lowercase();
+    let open_idx = lower.find("<summary")?;
+    let after_open_attrs = &s[open_idx..];
+    let gt = after_open_attrs.find('>')?;
+    let body_start = open_idx + gt + 1;
+    let after_body = &s[body_start..];
+    let lower_after = after_body.to_ascii_lowercase();
+    let close_rel = lower_after.find("</summary>")?;
+    let summary_text = strip_tags(&after_body[..close_rel]).trim().to_string();
+    let close_end = body_start + close_rel + "</summary>".len();
+    Some(((summary_text, close_end - open_idx), close_end))
+}
+
+/// Rough HTML-to-text: drops anything that looks like a tag.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn compute_line_offsets(s: &str) -> Vec<usize> {
