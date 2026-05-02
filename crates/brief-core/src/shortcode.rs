@@ -279,6 +279,28 @@ impl Registry {
             },
         );
 
+        m.insert(
+            "ref".into(),
+            Shortcode {
+                kind: ShortKindOpt::Inline,
+                arguments: {
+                    let mut a = BTreeMap::new();
+                    a.insert(
+                        "title".into(),
+                        ArgSpec {
+                            ty: ArgType::String,
+                            required: true,
+                            position: Some(1),
+                            oneof: None,
+                        },
+                    );
+                    a
+                },
+                template_html: None,
+                template_llm: None,
+            },
+        );
+
         Registry { map: m }
     }
 
@@ -290,5 +312,21 @@ impl Registry {
         for (k, v) in other {
             self.map.insert(k, v);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ref_is_a_builtin_inline_shortcode() {
+        let reg = Registry::with_builtins();
+        let sc = reg.get("ref").expect("@ref must be a built-in");
+        assert!(matches!(sc.kind, ShortKindOpt::Inline));
+        let title = sc.arguments.get("title").expect("title arg");
+        assert!(title.required);
+        assert_eq!(title.position, Some(1));
+        assert!(matches!(title.ty, ArgType::String));
     }
 }

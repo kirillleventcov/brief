@@ -2,8 +2,8 @@
 //!
 //! Modeled on mdBook's `SUMMARY.md`. The file *is* the navigation: list items
 //! become pages, nested lists become sub-pages, headings become section
-//! dividers in the sidebar. Each page is described by an inline `@page`
-//! shortcode of the form `@page[path](title)`.
+//! dividers in the sidebar. Each page is described by an inline `@ref`
+//! shortcode of the form `@ref[path](title)`.
 
 use brief::ast::{Block, Document, Inline, ListItem};
 use brief::shortcode::ArgValue;
@@ -98,7 +98,7 @@ fn find_page_shortcode(inlines: &[Inline]) -> Option<ParsedPage> {
             ..
         } = n
         {
-            if name != "page" {
+            if name != "ref" {
                 continue;
             }
             let path_str = content.as_ref().map(|c| inline_text(c)).unwrap_or_default();
@@ -163,5 +163,40 @@ fn push_inline_text(n: &Inline, out: &mut String) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brief::{lexer, parser, span::SourceMap};
+
+    fn parse(src: &str) -> brief::ast::Document {
+        let s = SourceMap::new("SUMMARY.brf", src);
+        let tokens = lexer::lex(&s).expect("lex");
+        let (d, _) = parser::parse(tokens, &s);
+        d
+    }
+
+    #[test]
+    fn extract_finds_pages_via_ref_shortcode() {
+        let doc =
+            parse("# Summary\n\n- @ref[intro.brf](Introduction)\n- @ref[advanced.brf](Advanced)\n");
+        let entries = extract(&doc).unwrap();
+        let pages: Vec<&PageEntry> = entries
+            .iter()
+            .filter_map(|e| {
+                if let Entry::Page(p) = e {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].path, std::path::PathBuf::from("intro.brf"));
+        assert_eq!(pages[0].title, "Introduction");
+        assert_eq!(pages[1].path, std::path::PathBuf::from("advanced.brf"));
+        assert_eq!(pages[1].title, "Advanced");
     }
 }

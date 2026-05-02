@@ -56,6 +56,11 @@ pub enum Code {
     HeadingMonotonic = 503,
     AlignArrayLength = 504,
     DuplicateHeadingAnchor = 506,
+
+    RefMissingFile = 601,
+    RefMissingAnchor = 602,
+    RefBadTarget = 603,
+    RefNoProject = 604,
 }
 
 impl Code {
@@ -110,6 +115,12 @@ impl Code {
             HeadingMonotonic => "heading levels must increase by at most one",
             AlignArrayLength => "alignment array length must equal the column count",
             DuplicateHeadingAnchor => "heading anchor must be unique within a document",
+            RefMissingFile => "cross-document reference target file does not exist in project",
+            RefMissingAnchor => {
+                "cross-document reference target anchor does not exist in target file"
+            }
+            RefBadTarget => "malformed cross-document reference target",
+            RefNoProject => "`@ref` requires a `brief.toml`-rooted project; none found",
         }
     }
 }
@@ -208,5 +219,18 @@ mod tests {
         assert!(out.contains("doc.brf:2:1"));
         assert!(out.contains("hello world"));
         assert!(out.contains("^^^^^"));
+    }
+
+    #[test]
+    fn ref_codes_render_with_correct_prefix() {
+        use Code::*;
+        assert_eq!(RefMissingFile.as_str(), "B0601");
+        assert_eq!(RefMissingAnchor.as_str(), "B0602");
+        assert_eq!(RefBadTarget.as_str(), "B0603");
+        assert_eq!(RefNoProject.as_str(), "B0604");
+        assert!(RefMissingFile.message().contains("file"));
+        assert!(RefMissingAnchor.message().contains("anchor"));
+        assert!(RefBadTarget.message().contains("target"));
+        assert!(RefNoProject.message().contains("brief.toml"));
     }
 }

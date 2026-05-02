@@ -11,3 +11,6 @@ similar    = "2"
 [[bin]]
 name = "brief"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"

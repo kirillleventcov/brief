@@ -91,12 +91,13 @@ pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> (String, Vec<Strin
         in_footnote: false,
         warnings: Vec::new(),
         frontmatter_minify_code,
+        resolved_refs: &doc.resolved_refs,
     };
     for b in &doc.blocks {
         render_block(b, &mut ctx, &mut out, 0);
     }
     if !footnotes.is_empty() {
-        emit_footnotes_section(&footnotes, reg, opts, &mut out);
+        emit_footnotes_section(&footnotes, reg, opts, &doc.resolved_refs, &mut out);
     }
     let warnings = ctx.warnings;
     let mut collapsed = String::with_capacity(out.len());
@@ -122,6 +123,7 @@ struct Ctx<'a> {
     in_footnote: bool,
     warnings: Vec<String>,
     frontmatter_minify_code: Option<bool>,
+    resolved_refs: &'a std::collections::BTreeMap<crate::span::Span, crate::ast::ResolvedRef>,
 }
 
 fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String, indent: usize) {
@@ -444,6 +446,26 @@ fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
             name,
             args,
             content,
+            span,
+        } if name == "ref" => {
+            let resolved = ctx.resolved_refs.get(span);
+            let display = if let Some(r) = resolved {
+                r.display.clone()
+            } else if let Some(s) = args.keyword.get("title").and_then(|v| v.as_str()) {
+                s.to_string()
+            } else if let Some(s) = args.positional.first().and_then(|v| v.as_str()) {
+                s.to_string()
+            } else if let Some([Inline::Text { value, .. }]) = content.as_deref() {
+                value.clone()
+            } else {
+                String::new()
+            };
+            out.push_str(&display);
+        }
+        Inline::Shortcode {
+            name,
+            args,
+            content,
             ..
         } => {
             // Footnote refs are auto-numbered; the body is emitted in a
@@ -632,6 +654,7 @@ fn emit_footnotes_section(
     footnotes: &[Vec<Inline>],
     reg: &Registry,
     opts: &Opts,
+    resolved_refs: &std::collections::BTreeMap<crate::span::Span, crate::ast::ResolvedRef>,
     out: &mut String,
 ) {
     if !out.ends_with('\n') {
@@ -648,6 +671,7 @@ fn emit_footnotes_section(
             in_footnote: true,
             warnings: Vec::new(),
             frontmatter_minify_code: None,
+            resolved_refs,
         };
         render_inline_seq(body, &mut ctx, out);
         out.push('\n');
@@ -976,5 +1000,62 @@ mod tests {
         let (out, _) = render_with(src, opts);
         assert!(!out.contains("```"), "fence dropped: {}", out);
         assert!(out.contains("{\"a\":1}"));
+    }
+
+    #[test]
+    fn ref_renders_display_text_only_in_llm_mode() {
+        use crate::project::ProjectIndex;
+        use crate::resolve::{ResolveProject, resolve_with_project};
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        // Parse + resolve with project so resolved_refs is populated.
+        let src = "See @ref[other.brf#x](the spec).\n";
+        let mut doc = {
+            use crate::{lexer, parser, span::SourceMap};
+            let s = SourceMap::new("t.brf", src);
+            let tokens = lexer::lex(&s).expect("lex");
+            let (d, _) = parser::parse(tokens, &s);
+            d
+        };
+        let mut idx = ProjectIndex::default();
+        idx.anchors
+            .insert("other.brf".to_string(), BTreeSet::from(["x".into()]));
+        let p = ResolveProject {
+            index: &idx,
+            current: &PathBuf::from("here.brf"),
+        };
+        let reg = crate::shortcode::Registry::with_builtins();
+        let _ = resolve_with_project(&mut doc, &reg, Some(&p));
+
+        let opts = Opts::default();
+        let (out, _warnings) = render(&doc, &reg, &opts);
+        assert!(out.contains("the spec"), "got: {}", out);
+        assert!(
+            !out.contains("other.brf"),
+            "url must be dropped in LLM mode: {}",
+            out
+        );
+        assert!(
+            !out.contains("#x"),
+            "anchor must be dropped in LLM mode: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn unresolved_ref_in_llm_falls_back_to_display_text() {
+        let doc = {
+            use crate::{lexer, parser, span::SourceMap};
+            let s = SourceMap::new("t.brf", "See @ref[a.brf](just text).\n");
+            let tokens = lexer::lex(&s).expect("lex");
+            let (d, _) = parser::parse(tokens, &s);
+            d
+        };
+        let reg = crate::shortcode::Registry::with_builtins();
+        let opts = Opts::default();
+        let (out, _) = render(&doc, &reg, &opts);
+        assert!(out.contains("just text"), "got: {}", out);
+        assert!(!out.contains("a.brf"));
     }
 }

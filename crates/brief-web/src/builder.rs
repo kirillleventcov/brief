@@ -1,13 +1,14 @@
 //! Build pipeline: walk source tree, compile each `.brf` to HTML, wrap in the
 //! theme template, write to `dist/`.
 
-use brief::ast::{Block, Document, Inline};
+use brief::ast::{Block, Document};
 use brief::config::registry_from;
 use brief::diag::{Severity, render_all};
 use brief::emit::html;
 use brief::lexer;
 use brief::parser;
-use brief::resolve;
+use brief::project::{self, ProjectIndex};
+use brief::resolve::{ResolveProject, resolve_with_project};
 use brief::shortcode::Registry;
 use brief::span::SourceMap;
 use brief::validate;
@@ -17,7 +18,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::BookConfig;
-use crate::page::{self, SiteIndex};
 use crate::summary::{self, Entry, PageEntry};
 use crate::theme::{self, PageContext, Theme};
 
@@ -25,7 +25,7 @@ use crate::theme::{self, PageContext, Theme};
 pub struct BuildOutcome {
     pub pages_built: usize,
     pub warnings: Vec<String>,
-    pub site_index: SiteIndex,
+    pub project_index: ProjectIndex,
 }
 
 #[derive(Clone)]
@@ -93,16 +93,15 @@ impl Builder {
         let theme = Theme::load(self.theme_dir().as_deref())?;
         let mut warnings = Vec::new();
 
-        // 1. Build the registry (built-ins + user shortcodes + @page).
+        // 1. Build the registry (built-ins + user shortcodes).
         let mut brief_cfg = brief::config::Config::default();
         brief_cfg.shortcodes = self.config.shortcodes.clone();
-        let mut registry: Registry = registry_from(&brief_cfg);
-        page::register(&mut registry);
+        let registry: Registry = registry_from(&brief_cfg);
 
         // 2. Decide between single-page and multi-page mode.
         let summary_path = src.join("SUMMARY.brf");
         let entries: Vec<Entry> = if summary_path.exists() {
-            let summary_doc = compile_to_doc(&summary_path, &registry)?;
+            let summary_doc = compile_to_doc(&summary_path)?;
             summary::extract(&summary_doc)?
         } else {
             // Single-page mode: synthesize an entry for index.brf.
@@ -128,13 +127,29 @@ impl Builder {
             }
         }
         if flat.is_empty() {
-            return Err("SUMMARY.brf contains no @page entries".into());
+            return Err("SUMMARY.brf contains no @ref entries".into());
         }
 
-        // 4. First pass — parse every page to gather anchors and decide URLs.
+        // 4. First pass — run project pre-pass to gather anchors, then parse every page.
+        // Pre-pass errors are surfaced as `[error]`-prefixed entries in `warnings`
+        // rather than aborting: the offending page will fail again with full
+        // line/col context during `compile_to_doc`, and aborting here would hide
+        // which page caused the failure.
+        let (project_index, prepass_diags) = project::build_index(&src);
+        for fd in &prepass_diags {
+            for d in &fd.diagnostics {
+                if d.severity == Severity::Error {
+                    warnings.push(format!(
+                        "[error] {}: {} {}",
+                        fd.source.path,
+                        d.code.as_str(),
+                        d.code.message()
+                    ));
+                }
+            }
+        }
+        // Verify every SUMMARY entry exists.
         let mut docs: BTreeMap<PathBuf, Document> = BTreeMap::new();
-        let mut index = SiteIndex::default();
-        index.base_url = self.config.site.base_url.clone();
         for entry in &flat {
             let abs = src.join(&entry.path);
             if !abs.exists() {
@@ -143,16 +158,11 @@ impl Builder {
                     abs.display()
                 ));
             }
-            let doc = compile_to_doc(&abs, &registry)?;
-            let anchors = page::collect_anchors(&doc);
-            index.anchors.insert(entry.path.clone(), anchors);
-            index
-                .pages
-                .insert(entry.path.clone(), source_path_to_url(&entry.path));
+            let doc = compile_to_doc(&abs)?;
             docs.insert(entry.path.clone(), doc);
         }
 
-        // 5. Second pass — rewrite @page references and emit HTML.
+        // 5. Second pass — resolve @ref references and emit HTML.
         // Compute display titles from each doc's H1 so the sidebar shows the
         // page's actual title rather than whatever was in SUMMARY.brf.
         let mut display_titles: BTreeMap<PathBuf, String> = BTreeMap::new();
@@ -171,11 +181,23 @@ impl Builder {
         let site_title = theme::site_title(&self.config).to_string();
         for entry in &flat {
             let mut doc = docs.remove(&entry.path).expect("doc was inserted");
-            let errs = page::rewrite(&mut doc, &index, &entry.path);
-            for e in errs {
-                warnings.push(format!("{}", e));
+            let project_arg = ResolveProject {
+                index: &project_index,
+                current: &entry.path,
+            };
+            let extra_diags = resolve_with_project(&mut doc, &registry, Some(&project_arg));
+            for d in &extra_diags {
+                if d.severity == Severity::Error {
+                    warnings.push(format!(
+                        "[error] {}: {} {}",
+                        entry.path.display(),
+                        d.code.as_str(),
+                        d.code.message()
+                    ));
+                }
             }
-            let body_html = html::render(&doc, &registry);
+            let body_html =
+                prefix_relative_links(&html::render(&doc, &registry), &self.config.site.base_url);
             let title = derive_page_title(&doc, &entry.title);
             let description = first_paragraph_text(&doc);
             let ctx = PageContext {
@@ -208,26 +230,26 @@ impl Builder {
         Ok(BuildOutcome {
             pages_built: flat.len(),
             warnings,
-            site_index: index,
+            project_index,
         })
     }
 }
 
-fn compile_to_doc(path: &Path, registry: &Registry) -> Result<Document, String> {
+fn compile_to_doc(path: &Path) -> Result<Document, String> {
     let raw =
         fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
     let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw).to_string();
     let src = SourceMap::new(path.to_string_lossy(), raw);
     let tokens = lexer::lex(&src).map_err(|d| render_all(&d, &src))?;
-    let (mut doc, mut diags) = parser::parse(tokens, &src);
-    diags.extend(resolve::resolve(&mut doc, registry));
-    diags.extend(validate::validate(
-        &doc,
-        &validate::ValidateOpts::default(),
-        &src,
-    ));
-    if diags.iter().any(|d| d.severity == Severity::Error) {
-        return Err(render_all(&diags, &src));
+    let (doc, diags) = parser::parse(tokens, &src);
+    // Resolution is intentionally deferred to the project-aware pass in
+    // `build()`, where `resolve_with_project` populates `Document.resolved_refs`.
+    // Calling `resolve::resolve` here (without project context) would produce
+    // spurious B0604 errors for every `@ref` invocation.
+    let validate_diags = validate::validate(&doc, &validate::ValidateOpts::default(), &src);
+    let all_diags: Vec<_> = diags.into_iter().chain(validate_diags).collect();
+    if all_diags.iter().any(|d| d.severity == Severity::Error) {
+        return Err(render_all(&all_diags, &src));
     }
     Ok(doc)
 }
@@ -389,5 +411,110 @@ fn escape_attr(s: &str) -> String {
     out
 }
 
-#[allow(dead_code)]
-fn _unused(_: &Inline) {}
+/// Prefix relative `href="..."` URLs with `base_url` so links written by the
+/// core HTML emitter (which doesn't know about base_url) become correct
+/// site-rooted URLs at serve time.
+///
+/// Leaves alone:
+///   * already-absolute URLs (start with `/`),
+///   * fragment-only URLs (start with `#`),
+///   * external URLs (contain `://`).
+///
+/// Known limitations (acceptable for v1, see plan §Task 12):
+///   * `javascript:` and `mailto:` schemes lack `://` and would be prefixed
+///     if emitted. The core emitter does not currently produce them.
+///   * The scan is a naive string search; `href="..."` occurrences inside
+///     `<pre><code>` example blocks would also be rewritten. The current
+///     emitter does not produce such code blocks from valid Brief input.
+///   * Single-quoted attributes (`href='...'`) are not recognized; the core
+///     emitter only emits double-quoted attributes.
+///
+/// `base_url = "/"` is intentionally NOT short-circuited: `trim_end_matches('/')`
+/// reduces it to `""`, then we push `"" + "/" + href`, producing the correct
+/// site-rooted URL (e.g. `/other.html#sec`).
+fn prefix_relative_links(html: &str, base_url: &str) -> String {
+    if base_url.is_empty() {
+        return html.to_string();
+    }
+    let prefix = base_url.trim_end_matches('/');
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(idx) = rest.find("href=\"") {
+        out.push_str(&rest[..idx]);
+        out.push_str("href=\"");
+        rest = &rest[idx + 6..]; // skip past `href="`
+        // The href value runs up to the next `"`.
+        let end = rest.find('"').unwrap_or(rest.len());
+        let href = &rest[..end];
+        if href.starts_with('/') || href.starts_with('#') || href.contains("://") {
+            out.push_str(href);
+        } else {
+            out.push_str(prefix);
+            if !href.starts_with('/') {
+                out.push('/');
+            }
+            out.push_str(href);
+        }
+        out.push('"');
+        rest = &rest[end + 1..]; // skip past the closing `"`
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn write(p: &Path, content: &str) {
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn build_resolves_cross_page_ref_to_html() {
+        let td = tempfile::TempDir::new().unwrap();
+        let project = td.path();
+        // book.toml
+        write(
+            &project.join("book.toml"),
+            "[book]\ntitle = \"Test\"\n[build]\nsrc = \"src\"\nout = \"dist\"\n[site]\nbase_url = \"/\"\n",
+        );
+        // src/SUMMARY.brf
+        write(
+            &project.join("src/SUMMARY.brf"),
+            "# Summary\n\n- @ref[index.brf](Home)\n- @ref[other.brf](Other)\n",
+        );
+        write(
+            &project.join("src/index.brf"),
+            "# Home\n\nSee @ref[other.brf#sec](other section).\n",
+        );
+        write(
+            &project.join("src/other.brf"),
+            "# Other Title\n\n## Section {#sec}\n\nbody.\n",
+        );
+
+        let builder = Builder::new(project).unwrap();
+        let outcome = builder.build().unwrap();
+        assert!(outcome.pages_built >= 2);
+        assert!(
+            outcome.warnings.is_empty(),
+            "expected no warnings on happy path; got: {:?}",
+            outcome.warnings,
+        );
+        let index_html = fs::read_to_string(project.join("dist/index.html")).unwrap();
+        assert!(
+            index_html.contains("href=\"/other.html#sec\""),
+            "expected base_url-prefixed href; got: {}",
+            index_html,
+        );
+        assert!(
+            index_html.contains(">other section<"),
+            "expected display text in anchor; got: {}",
+            index_html
+        );
+    }
+}

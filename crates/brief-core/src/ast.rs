@@ -2,10 +2,25 @@ use crate::shortcode::ArgValue;
 use crate::span::Span;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Document {
     pub blocks: Vec<Block>,
     pub metadata: Option<toml::Table>,
+    /// Validated `@ref` invocations, keyed by source span. Populated by
+    /// `resolve_with_project`. Empty when the per-file resolver runs
+    /// without project context.
+    pub resolved_refs: std::collections::BTreeMap<crate::span::Span, ResolvedRef>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedRef {
+    /// Project-relative target file as a forward-slash-separated string,
+    /// validated by `resolve::parse_target`. Always ends in `.brf`.
+    pub target_path: String,
+    /// Anchor in the target file, or None for a whole-file reference.
+    pub target_anchor: Option<String>,
+    /// Display text (taken from the `title` positional arg).
+    pub display: String,
 }
 
 #[derive(Clone, Debug)]

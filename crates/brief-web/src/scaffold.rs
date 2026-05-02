@@ -77,8 +77,8 @@ Run `brief-web serve` and visit http://127.0.0.1:3000 to see it live.
 
 const SUMMARY_BRF: &str = r#"# Summary
 
-- @page[index.brf](Introduction)
-- @page[getting-started.brf](Getting Started)
+- @ref[index.brf](Introduction)
+- @ref[getting-started.brf](Getting Started)
 "#;
 
 const INDEX_MULTI_BRF: &str = r#"# Introduction
@@ -88,7 +88,7 @@ Welcome to your new Brief site.
 This is a multi-page project: `src/SUMMARY.brf` describes the navigation,
 and each list item points to a `.brf` file under `src/`.
 
-See @page[getting-started.brf](Getting Started) for a quick tour.
+See @ref[getting-started.brf](Getting Started) for a quick tour.
 "#;
 
 const GETTING_STARTED_BRF: &str = r#"# Getting Started
@@ -101,9 +101,9 @@ Edit any `.brf` file under `src/` and your browser will reload automatically.
 
 ## Linking between pages
 
-Use the `@page[...]` shortcode:
+Use the `@ref[...]` shortcode:
 
 ```brief
-See @page[index.brf](the introduction) for more.
+See @ref[index.brf](the introduction) for more.
 ```
 "#;

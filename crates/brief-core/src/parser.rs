@@ -30,7 +30,14 @@ pub fn parse(tokens: Vec<Token>, src: &SourceMap) -> (Document, Vec<Diagnostic>)
             }
         }
     }
-    (Document { blocks, metadata }, p.diags)
+    (
+        Document {
+            blocks,
+            metadata,
+            resolved_refs: Default::default(),
+        },
+        p.diags,
+    )
 }
 
 fn parse_frontmatter(

@@ -87,54 +87,51 @@ port = 3000
 
 ## `SUMMARY.brf`
 
-A `SUMMARY.brf` *is* the navigation tree:
+A `SUMMARY.brf` _is_ the navigation tree:
 
 ```brief
 # Summary
 
-- @page[introduction.brf](Introduction)
-- @page[getting-started.brf](Getting Started)
-  - @page[install.brf](Installation)
-  - @page[first-document.brf](Your First Document)
-- @page[reference/grammar.brf](Grammar Reference)
+- @ref[introduction.brf](Introduction)
+- @ref[getting-started.brf](Getting Started)
+  - @ref[install.brf](Installation)
+  - @ref[first-document.brf](Your First Document)
+- @ref[reference/grammar.brf](Grammar Reference)
 ```
 
 Headings (level 2+) become section dividers in the sidebar.
 
-## Cross-page links: `@page`
+## Cross-page links: `@ref`
 
-`brief-web` registers a `@page` inline shortcode and resolves it at build
+`brief-web` registers a `@ref` inline shortcode and resolves it at build
 time:
 
 ```brief
-See @page[getting-started.brf](Getting Started) for the next step.
-See @page[reference/grammar.brf#headings](Headings) for the heading rules.
+See @ref[getting-started.brf](Getting Started) for the next step.
+See @ref[reference/grammar.brf#headings](Headings) for the heading rules.
 ```
 
-- `path` is source-relative (resolved against the current page's directory).
+- `path` is project-relative (rooted at `brief.toml`).
 - An `#anchor` suffix targets a heading anchor in that page; missing
   files / missing anchors are build warnings.
-- When v0.3 ships the language-level `@ref` cross-reference, `@page` becomes
-  a thin alias.
 
 ## Themes
 
 `brief-web` ships an embedded default theme (light/dark via
 `prefers-color-scheme`, sticky sidebar, mobile collapse).
 
-To override, drop `theme/page.html` and/or `theme/style.css` into your
-project. The template is mustache-style with these placeholders:
+To override, drop `theme/page.html` and/or `theme/style.css` into your project. The template is mustache-style with these placeholders:
 
-| Placeholder        | Meaning                                          |
-|--------------------|--------------------------------------------------|
-| `{{ title }}`      | Page title (H1, falling back to SUMMARY title).  |
-| `{{ description }}`| First paragraph, used for `<meta description>`.  |
-| `{{ site_title }}` | `[book].title` from `book.toml`.                 |
-| `{{ content }}`    | Rendered HTML for the page body.                 |
-| `{{ sidebar }}`    | Rendered HTML for the navigation sidebar.        |
-| `{{ base_url }}`   | `[site].base_url`.                               |
-| `{{ stylesheet }}` | URL of `style.css`.                              |
-| `{{ reload_script }}` | Live-reload `<script>` (empty in `build`).    |
+| Placeholder           | Meaning                                         |
+| --------------------- | ----------------------------------------------- |
+| `{{ title }}`         | Page title (H1, falling back to SUMMARY title). |
+| `{{ description }}`   | First paragraph, used for `<meta description>`. |
+| `{{ site_title }}`    | `[book].title` from `book.toml`.                |
+| `{{ content }}`       | Rendered HTML for the page body.                |
+| `{{ sidebar }}`       | Rendered HTML for the navigation sidebar.       |
+| `{{ base_url }}`      | `[site].base_url`.                              |
+| `{{ stylesheet }}`    | URL of `style.css`.                             |
+| `{{ reload_script }}` | Live-reload `<script>` (empty in `build`).      |
 
 No conditionals or loops. Logic that needs them belongs in a Brief
 shortcode, not in the template.
@@ -158,7 +155,7 @@ brief-web serve  [PATH] [--host H]      # build + live-reload server
 
 `PATH` defaults to the current directory in every command.
 
-## What's *not* in here
+## What's _not_ in here
 
 Out of scope for v1: client-side search, WASM playground, print view, i18n,
 RSS, plugin/preprocessor protocol.

@@ -47,6 +47,29 @@ Rules:
   preserve it as a `+++` block at the top of the LLM output.
 - HTML mode never emits frontmatter.
 
+## Cross-document references
+
+Brief documents can link to anchors in other Brief documents in the same
+project:
+
+```brief
+See @ref[getting-started.brf#install](installation) for the steps.
+```
+
+Rules:
+
+- `@ref` is a built-in inline shortcode. The display text in `(...)` is
+  required.
+- The path is resolved relative to the directory holding `brief.toml`
+  (the project root). Leading `/`, `..` segments, and backslashes are
+  rejected.
+- The compiler walks up from the source file to find `brief.toml`. If
+  no project root is found, `@ref` is a compile error (`B0604`).
+- Missing target files and missing anchors are compile errors (`B0601`,
+  `B0602`).
+- LLM mode emits the display text only; the cross-document relationship
+  is dropped because it has no meaning in a flattened LLM context.
+
 ## Build
 
 ```

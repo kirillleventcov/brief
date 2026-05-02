@@ -18,7 +18,6 @@ use crate::diag::{Severity, render_all};
 use crate::emit::{html, llm};
 use crate::lexer;
 use crate::parser;
-use crate::resolve;
 use crate::shortcode::Registry;
 use crate::span::SourceMap;
 use crate::validate;
@@ -189,7 +188,64 @@ impl Engine {
             }
         };
         let (mut doc, mut diags) = parser::parse(tokens, &src);
-        diags.extend(resolve::resolve(&mut doc, &self.registry));
+        let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let project_root = crate::project::discover_root(&abs_path);
+        let project_index = match &project_root {
+            Some(root) => {
+                let (idx, prepass_diags) = crate::project::build_index(root);
+                let mut has_err = false;
+                for fd in &prepass_diags {
+                    if fd.diagnostics.is_empty() {
+                        continue;
+                    }
+                    if fd.diagnostics.iter().any(|d| d.severity == Severity::Error) {
+                        has_err = true;
+                    }
+                    let _ = write!(log, "{}", render_all(&fd.diagnostics, &fd.source));
+                }
+                if has_err {
+                    // Pre-pass error in some sibling file. Compile of the
+                    // current file is aborted; the user sees the error and
+                    // a follow-up watch tick after the fix will clear it.
+                    return CompileOutcome::Errors {
+                        src: path.to_path_buf(),
+                        count: prepass_diags
+                            .iter()
+                            .map(|fd| {
+                                fd.diagnostics
+                                    .iter()
+                                    .filter(|d| d.severity == Severity::Error)
+                                    .count()
+                            })
+                            .sum(),
+                    };
+                }
+                Some(idx)
+            }
+            None => None,
+        };
+        let resolve_project = match (&project_root, &project_index) {
+            (Some(root), Some(idx)) => {
+                let rel = abs_path
+                    .strip_prefix(root)
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|_| path.to_path_buf());
+                Some((idx, rel))
+            }
+            _ => None,
+        };
+        let project_arg =
+            resolve_project
+                .as_ref()
+                .map(|(idx, rel)| crate::resolve::ResolveProject {
+                    index: idx,
+                    current: rel.as_path(),
+                });
+        diags.extend(crate::resolve::resolve_with_project(
+            &mut doc,
+            &self.registry,
+            project_arg.as_ref(),
+        ));
         diags.extend(validate::validate(&doc, &opts, &src));
         let errors = diags
             .iter()
@@ -926,6 +982,49 @@ template_html = "<aside>{{content}}</aside>"
         assert!(
             html_path.exists(),
             "html output should exist after initial compile"
+        );
+    }
+
+    #[test]
+    fn watch_engine_runs_project_pre_pass_for_refs() {
+        use tempfile::TempDir;
+
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+
+        // Without brief.toml: @ref produces B0604.
+        std::fs::write(root.join("a.brf"), "# A {#x}\n").unwrap();
+        std::fs::write(root.join("b.brf"), "@ref[a.brf#x](X)\n").unwrap();
+
+        let opts = WatchOpts {
+            paths: vec![root.to_path_buf()],
+            target: Target::Html,
+            config_path: root.join("brief.toml"),
+            llm_opts: LlmOpts::default(),
+            no_clear: true,
+        };
+        let mut engine = Engine::load(&opts).unwrap();
+        let mut log = Vec::new();
+        let outcome = engine.compile_one(&root.join("b.brf"), &mut log);
+        let log_str = String::from_utf8(log).unwrap();
+        assert!(
+            matches!(outcome, CompileOutcome::Errors { .. }),
+            "outcome: {:?}, log: {}",
+            outcome,
+            log_str,
+        );
+        assert!(log_str.contains("B0604"), "log: {}", log_str);
+
+        // With brief.toml: clean compile.
+        std::fs::write(root.join("brief.toml"), "").unwrap();
+        let mut log = Vec::new();
+        let outcome = engine.compile_one(&root.join("b.brf"), &mut log);
+        let log_str = String::from_utf8(log).unwrap();
+        assert!(
+            matches!(outcome, CompileOutcome::Ok { .. }),
+            "outcome: {:?}, log: {}",
+            outcome,
+            log_str,
         );
     }
 }

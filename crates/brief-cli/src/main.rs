@@ -3,7 +3,6 @@ use brief::diag::{Severity, render_all};
 use brief::emit::{html, llm};
 use brief::lexer;
 use brief::parser;
-use brief::resolve;
 use brief::shortcode::Registry;
 use brief::span::SourceMap;
 use brief::validate;
@@ -280,6 +279,36 @@ fn run_compile(
         strict_heading_levels: cfg.compile.strict_heading_levels,
     };
 
+    let abs_input = input.canonicalize().unwrap_or_else(|_| input.clone());
+    let project_root = brief::project::discover_root(&abs_input);
+    let project_index = match &project_root {
+        Some(root) => {
+            let (idx, prepass_diags) = brief::project::build_index(root);
+            // Surface lex/parse errors from the pre-pass; each set of
+            // diagnostics is rendered against its own SourceMap so that
+            // line numbers and source excerpts refer to the correct file.
+            let mut has_err = false;
+            for fd in &prepass_diags {
+                if fd.diagnostics.is_empty() {
+                    continue;
+                }
+                if fd
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.severity == brief::diag::Severity::Error)
+                {
+                    has_err = true;
+                }
+                eprint!("{}", brief::diag::render_all(&fd.diagnostics, &fd.source));
+            }
+            if has_err {
+                return ExitCode::from(1);
+            }
+            Some(idx)
+        }
+        None => None,
+    };
+
     let tokens = match lexer::lex(&src) {
         Ok(t) => t,
         Err(d) => {
@@ -288,7 +317,27 @@ fn run_compile(
         }
     };
     let (mut doc, mut diags) = parser::parse(tokens, &src);
-    diags.extend(resolve::resolve(&mut doc, &registry));
+    let resolve_project = match (&project_root, &project_index) {
+        (Some(root), Some(idx)) => {
+            let rel = abs_input
+                .strip_prefix(root)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|_| input.clone());
+            Some((idx, rel))
+        }
+        _ => None,
+    };
+    let project_ref = resolve_project
+        .as_ref()
+        .map(|(idx, rel)| brief::resolve::ResolveProject {
+            index: idx,
+            current: rel.as_path(),
+        });
+    diags.extend(brief::resolve::resolve_with_project(
+        &mut doc,
+        &registry,
+        project_ref.as_ref(),
+    ));
     diags.extend(validate::validate(&doc, &opts, &src));
     let has_errors = diags.iter().any(|d| d.severity == Severity::Error);
     if has_errors {
@@ -360,7 +409,7 @@ fn run_explain(code: &str) -> ExitCode {
         ),
         (
             Code::UnknownShortcode,
-            "Shortcodes must be registered in `brief.toml` under `[shortcodes.<name>]` (or be a built-in: link, image, kbd, sub, sup, details, t, code, callout, math, footnote). Note: `@br` is intentionally not a shortcode — use `\\` at end of line for a hard break.",
+            "Shortcodes must be registered in `brief.toml` under `[shortcodes.<name>]` (or be a built-in: link, image, kbd, sub, sup, details, t, code, callout, math, footnote, ref). Note: `@br` is intentionally not a shortcode — use `\\` at end of line for a hard break.",
         ),
         (
             Code::TabCharacter,
@@ -393,6 +442,22 @@ fn run_explain(code: &str) -> ExitCode {
         (
             Code::RefusedLanguage,
             "Python, YAML, and Makefile use significant whitespace; minification cannot be performed safely without parsing the language. Such blocks are emitted verbatim and the LLM consumer pays full cost. Drop the `@minify` attribute or remove the language from `compile.llm.minify_languages`.",
+        ),
+        (
+            Code::RefMissingFile,
+            "Brief verifies cross-document references at compile time. The file referenced by `@ref[path.brf]` was not found anywhere under the project root (the directory containing `brief.toml`). Either fix the path, create the missing file, or move the file into the project tree.",
+        ),
+        (
+            Code::RefMissingAnchor,
+            "Brief verifies that the `#anchor` portion of `@ref[file.brf#anchor]` matches a heading anchor declared in the target file (e.g. `## Title {#anchor}`). The anchor was not found. The diagnostic's help text lists the anchors that *do* exist in the target file.",
+        ),
+        (
+            Code::RefBadTarget,
+            "`@ref` targets are project-relative `.brf` paths, optionally suffixed with `#anchor`. Leading `/`, `..` segments, backslashes, missing `.brf` extension, and anchors not matching `[a-z0-9-]+` are rejected. Restate the target in canonical form.",
+        ),
+        (
+            Code::RefNoProject,
+            "`@ref` only works inside a project rooted by a `brief.toml` file. The compiler walks up from the source file looking for one. Create a `brief.toml` (an empty file is fine) at the desired root, or remove the `@ref` invocation.",
         ),
     ];
     for (c, text) in table {

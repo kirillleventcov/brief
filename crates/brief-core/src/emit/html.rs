@@ -8,13 +8,14 @@ pub fn render(doc: &Document, reg: &Registry) -> String {
         reg,
         counter: 0,
         in_footnote: false,
+        resolved_refs: &doc.resolved_refs,
     };
     let mut out = String::new();
     for b in &doc.blocks {
         render_block(b, &mut ctx, &mut out);
     }
     if !footnotes.is_empty() {
-        emit_footnotes_section(&footnotes, reg, &mut out);
+        emit_footnotes_section(&footnotes, reg, &doc.resolved_refs, &mut out);
     }
     out
 }
@@ -23,6 +24,7 @@ struct Ctx<'a> {
     reg: &'a Registry,
     counter: u32,
     in_footnote: bool,
+    resolved_refs: &'a std::collections::BTreeMap<crate::span::Span, crate::ast::ResolvedRef>,
 }
 
 fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
@@ -194,6 +196,46 @@ fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
             out.push_str("<code>");
             out.push_str(&escape_html(value));
             out.push_str("</code>");
+        }
+        Inline::Shortcode {
+            name,
+            args,
+            content: _,
+            span,
+            ..
+        } if name == "ref" => {
+            // The display text for @ref lives in args["title"] after resolve
+            // (bind_positional moves positional arg 1 → keyword["title"]).
+            // Before resolve (third-test scenario), it stays in positional[0].
+            let title_kw = args.keyword.get("title").and_then(|v| v.as_str());
+            let title_pos = args.positional.first().and_then(|v| v.as_str());
+            let resolved = ctx.resolved_refs.get(span);
+            let display_text = resolved
+                .map(|r| r.display.as_str())
+                .or(title_kw)
+                .or(title_pos)
+                .unwrap_or("");
+            if let Some(r) = resolved {
+                let mut url = r.target_path.clone();
+                debug_assert!(
+                    url.ends_with(".brf"),
+                    "ResolvedRef.target_path must end in .brf"
+                );
+                url.replace_range(url.len() - 4.., ".html");
+                if let Some(a) = &r.target_anchor {
+                    url.push('#');
+                    url.push_str(a);
+                }
+                let _ = write!(
+                    out,
+                    "<a href=\"{}\">{}</a>",
+                    escape_attr(&url),
+                    escape_html(display_text)
+                );
+            } else {
+                // No project context — emit display text only, no anchor.
+                let _ = write!(out, "{}", escape_html(display_text));
+            }
         }
         Inline::Shortcode {
             name,
@@ -438,7 +480,12 @@ fn collect_inline(node: &Inline, out: &mut Vec<Vec<Inline>>) {
     }
 }
 
-fn emit_footnotes_section(footnotes: &[Vec<Inline>], reg: &Registry, out: &mut String) {
+fn emit_footnotes_section(
+    footnotes: &[Vec<Inline>],
+    reg: &Registry,
+    resolved_refs: &std::collections::BTreeMap<crate::span::Span, crate::ast::ResolvedRef>,
+    out: &mut String,
+) {
     out.push_str("<hr class=\"footnotes-sep\">\n<ol class=\"footnotes\">\n");
     for (i, body) in footnotes.iter().enumerate() {
         let n = i + 1;
@@ -447,6 +494,7 @@ fn emit_footnotes_section(footnotes: &[Vec<Inline>], reg: &Registry, out: &mut S
             reg,
             counter: 0,
             in_footnote: true,
+            resolved_refs,
         };
         render_inline_seq(body, &mut ctx, out);
         let _ = write!(
@@ -523,5 +571,79 @@ mod tests {
         assert!(!out.contains("+++"), "{}", out);
         assert!(!out.contains("title"), "{}", out);
         assert!(out.contains("<h1>Doc</h1>"));
+    }
+
+    fn parse_doc(s: &str) -> crate::ast::Document {
+        use crate::{lexer, parser, span::SourceMap};
+        let src = SourceMap::new("t.brf", s);
+        let tokens = lexer::lex(&src).expect("lex");
+        let (doc, _) = parser::parse(tokens, &src);
+        doc
+    }
+
+    #[test]
+    fn ref_lowers_to_anchor_using_resolved_refs() {
+        use crate::project::ProjectIndex;
+        use crate::resolve::{ResolveProject, resolve_with_project};
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        let src = "See @ref[other.brf#top](the top).\n".to_string();
+        let mut doc = parse_doc(&src);
+        let mut idx = ProjectIndex {
+            root: PathBuf::from("/tmp/p"),
+            ..Default::default()
+        };
+        idx.anchors
+            .insert("other.brf".to_string(), BTreeSet::from(["top".into()]));
+        let p = ResolveProject {
+            index: &idx,
+            current: &PathBuf::from("here.brf"),
+        };
+        let reg = crate::shortcode::Registry::with_builtins();
+        let _ = resolve_with_project(&mut doc, &reg, Some(&p));
+        let html = render(&doc, &reg);
+        assert!(
+            html.contains("<a href=\"other.html#top\">the top</a>"),
+            "got: {}",
+            html
+        );
+    }
+
+    #[test]
+    fn ref_without_anchor_lowers_to_html_with_no_fragment() {
+        use crate::project::ProjectIndex;
+        use crate::resolve::{ResolveProject, resolve_with_project};
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+        let mut doc = parse_doc("See @ref[a/b.brf](title).\n");
+        let mut idx = ProjectIndex::default();
+        idx.anchors.insert("a/b.brf".to_string(), BTreeSet::new());
+        let p = ResolveProject {
+            index: &idx,
+            current: &PathBuf::from("here.brf"),
+        };
+        let reg = crate::shortcode::Registry::with_builtins();
+        let _ = resolve_with_project(&mut doc, &reg, Some(&p));
+        let html = render(&doc, &reg);
+        assert!(
+            html.contains("<a href=\"a/b.html\">title</a>"),
+            "got: {}",
+            html
+        );
+    }
+
+    #[test]
+    fn unresolved_ref_falls_back_to_display_text() {
+        // No resolve_with_project call → resolved_refs stays empty.
+        let doc = parse_doc("See @ref[any.brf](fallback).\n");
+        let reg = crate::shortcode::Registry::with_builtins();
+        let html = render(&doc, &reg);
+        assert!(html.contains("fallback"), "got: {}", html);
+        assert!(
+            !html.contains("<a "),
+            "must not emit a broken link: {}",
+            html
+        );
     }
 }

@@ -8,7 +8,6 @@
 
 pub mod builder;
 pub mod config;
-pub mod page;
 pub mod scaffold;
 pub mod server;
 pub mod summary;

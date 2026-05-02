@@ -8,6 +8,7 @@ pub mod inline;
 pub mod lexer;
 pub mod minify;
 pub mod parser;
+pub mod project;
 pub mod resolve;
 pub mod shortcode;
 pub mod span;
