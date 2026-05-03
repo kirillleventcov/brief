@@ -83,12 +83,30 @@ impl Builder {
         }
         let out = self.out_dir();
         if out.exists() {
-            // Wipe the previous output so stale files don't leak into the new
-            // build. Only ever inside the project's own dist/.
-            fs::remove_dir_all(&out)
-                .map_err(|e| format!("cannot clear {}: {}", out.display(), e))?;
+            // Clear the previous output so stale files don't leak into the new
+            // build. Remove the *contents* rather than the directory itself —
+            // wiping `out` would emit IN_DELETE/IN_CREATE on the project root
+            // on Linux, which inotify can echo back into our file watcher
+            // (notify watches a file by watching its parent dir) and trigger
+            // an infinite rebuild loop.
+            for entry in
+                fs::read_dir(&out).map_err(|e| format!("cannot read {}: {}", out.display(), e))?
+            {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path();
+                let ft = entry.file_type().map_err(|e| e.to_string())?;
+                if ft.is_dir() {
+                    fs::remove_dir_all(&path)
+                        .map_err(|e| format!("cannot clear {}: {}", path.display(), e))?;
+                } else {
+                    fs::remove_file(&path)
+                        .map_err(|e| format!("cannot clear {}: {}", path.display(), e))?;
+                }
+            }
+        } else {
+            fs::create_dir_all(&out)
+                .map_err(|e| format!("cannot create {}: {}", out.display(), e))?;
         }
-        fs::create_dir_all(&out).map_err(|e| format!("cannot create {}: {}", out.display(), e))?;
 
         let theme = Theme::load(self.theme_dir().as_deref())?;
         let mut warnings = Vec::new();

@@ -35,8 +35,15 @@ pub fn watch(paths: &[PathBuf], mut on_change: impl FnMut() + Send + 'static) ->
         }
     }
     std::thread::spawn(move || {
-        for _event in rx {
-            on_change();
+        for res in rx {
+            // Ignore notify errors — they tend to be transient (e.g. a watched
+            // file briefly disappearing during an editor's atomic save) and
+            // treating them as change signals can drive a rebuild loop.
+            if let Ok(events) = res {
+                if !events.is_empty() {
+                    on_change();
+                }
+            }
         }
     });
     WatchHandles {

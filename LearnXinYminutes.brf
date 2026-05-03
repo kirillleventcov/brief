@@ -262,6 +262,7 @@ Built-in shortcodes that ship with the reference compiler:
 | callout | block | boxed note
 | math | both | LaTeX math, inline or block
 | footnote | inline | footnote text
+| ref | inline | cross-document reference (path#anchor → display text)
 
 Inline HTML has no general escape hatch in Brief. The four built-ins
 above (`@kbd`, `@sub`, `@sup`, `@details`) cover the inline tags that
@@ -297,6 +298,24 @@ Watch out for the @kbd[Shift+Delete] shortcut on Linux.
 It can wipe data without going through the trash.
 @end
 
+A cross-document reference — the body holds the target `path#anchor`
+verbatim and the parens supply the display text as positional arg #1
+(the inverse of `@link`'s sugar, because here the *target* is the
+unforgiving part):
+
+```brief
+See @ref[guide.brf#install](installation) for the steps.
+```
+
+The path is project-relative (rooted at the directory containing
+`brief.toml`) and must end in `.brf`. Leading `/`, `..` segments, and
+backslash separators are rejected (B0603). Missing target files are
+B0601, missing anchors are B0602, and if no `brief.toml` can be found
+by walking up from the source file, every `@ref` is B0604. The body
+must be a plain path — emphasis and nested shortcodes inside it are
+errors. In LLM mode the cross-document link is dropped and only the
+display text remains.
+
 Custom shortcodes are registered in `brief.toml` (see §13).
 User-defined shortcodes can NEVER be self-terminating — only `@t` and
 the triple-backtick fence are allowed that special form.
@@ -331,6 +350,8 @@ shortcodes render to compact forms:
 - `@math[x^2]` becomes `$x^2$`
 - `@footnote[body]` becomes `[^N]` inline; definitions are appended at
   the end of the document as `[^N]: body` lines
+- `@ref[path#anchor](text)` becomes just `text` — the cross-document
+  link is dropped because it has no meaning in a flattened LLM context
 
 `--report-tokens` prints a stderr line with a cl100k character/token
 estimate. The estimate is best-effort and not normative.
@@ -387,6 +408,8 @@ Code ranges:
 - B03xx — block parsing (headings, fences, comments)
 - B04xx — shortcode resolution (unknown, type, enum, form)
 - B05xx — semantic / cross-cutting (list sequence, table columns)
+- B06xx — cross-document references (missing file, missing anchor,
+  bad target, no project root)
 
 `brief explain B0204` prints the long-form explanation. There is no
 `--allow-warnings`. There never will be.
