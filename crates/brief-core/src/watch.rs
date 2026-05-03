@@ -11,7 +11,7 @@
 //!
 //! The watcher reuses the existing lex→parse→resolve→validate→emit pipeline.
 //! It writes outputs next to each source: `note.brf` → `note.html` /
-//! `note.llm.txt` / `note.json`.
+//! `note.txt` / `note.json`.
 
 use crate::config::{self, Config};
 use crate::diag::{Severity, render_all};
@@ -53,7 +53,7 @@ impl Target {
     pub fn out_ext(self) -> &'static str {
         match self {
             Target::Html => "html",
-            Target::Llm => "llm.txt",
+            Target::Llm => "txt",
             Target::Json => "json",
         }
     }
@@ -808,7 +808,7 @@ mod tests {
         let p = output_path(Path::new("/tmp/foo/note.brf"), Target::Html);
         assert_eq!(p, PathBuf::from("/tmp/foo/note.html"));
         let p = output_path(Path::new("/tmp/foo/note.brf"), Target::Llm);
-        assert_eq!(p, PathBuf::from("/tmp/foo/note.llm.txt"));
+        assert_eq!(p, PathBuf::from("/tmp/foo/note.txt"));
         let p = output_path(Path::new("/tmp/foo/note.brf"), Target::Json);
         assert_eq!(p, PathBuf::from("/tmp/foo/note.json"));
     }

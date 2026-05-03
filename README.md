@@ -27,7 +27,10 @@ Compile it for your AI Agent: `brief compile LearnXinYminutes.brf --target=llm`
 
 ```bash
 cargo build --release
-brief compile doc.brf --target=html
+brief compile doc.brf --target=html              # writes to stdout
+brief compile doc.brf --target=html -w           # writes doc.html next to source
+brief compile doc.brf --target=llm -w            # writes doc.txt next to source
+brief compile doc.brf --target=html -o out.html  # writes to an explicit path
 brief compile doc.brf --target=llm --report-tokens
 brief explain <CODE> # Explain compilation error
 ```

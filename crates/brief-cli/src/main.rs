@@ -40,6 +40,14 @@ enum Cmd {
         /// in one step.
         #[arg(long)]
         convert: bool,
+        /// Write output to a file derived from the input path
+        /// (`doc.brf` → `doc.html` / `doc.txt` / `doc.json`).
+        /// Mutually exclusive with `--output`.
+        #[arg(short = 'w', long, conflicts_with = "output")]
+        write: bool,
+        /// Write output to PATH. Mutually exclusive with `--write`.
+        #[arg(short = 'o', long, value_name = "PATH")]
+        output: Option<PathBuf>,
     },
     Explain {
         code: String,
@@ -112,6 +120,8 @@ fn main() -> ExitCode {
             keep_asset_urls,
             keep_metadata,
             convert,
+            write,
+            output,
         } => run_compile(
             input,
             target,
@@ -122,6 +132,8 @@ fn main() -> ExitCode {
             keep_asset_urls,
             keep_metadata,
             convert,
+            write,
+            output,
         ),
         Cmd::Explain { code } => run_explain(&code),
         Cmd::Convert {
@@ -214,6 +226,8 @@ fn run_compile(
     keep_asset_urls: bool,
     keep_metadata: bool,
     convert: bool,
+    write: bool,
+    output_path: Option<PathBuf>,
 ) -> ExitCode {
     let raw = match std::fs::read_to_string(&input) {
         Ok(s) => s,
@@ -375,7 +389,26 @@ fn run_compile(
         }
     };
 
-    print!("{}", output);
+    let dst: Option<PathBuf> = if let Some(p) = output_path {
+        Some(p)
+    } else if write {
+        Some(compile_output_path(&input, &target))
+    } else {
+        None
+    };
+
+    match &dst {
+        None => {
+            print!("{}", output);
+        }
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, &output) {
+                eprintln!("brief: cannot write {}: {}", path.display(), e);
+                return ExitCode::from(2);
+            }
+            eprintln!("brief: {} -> {}", input.display(), path.display());
+        }
+    }
 
     if report_tokens && target == "llm" {
         let chars = output.chars().count();
@@ -386,6 +419,16 @@ fn run_compile(
         );
     }
     ExitCode::SUCCESS
+}
+
+fn compile_output_path(input: &std::path::Path, target: &str) -> PathBuf {
+    let ext = match target {
+        "html" => "html",
+        "llm" => "txt",
+        "json" => "json",
+        _ => "out",
+    };
+    input.with_extension(ext)
 }
 
 fn run_explain(code: &str) -> ExitCode {

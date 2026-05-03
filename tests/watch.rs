@@ -246,14 +246,14 @@ fn new_brf_is_picked_up() {
 }
 
 #[test]
-fn llm_target_writes_llm_txt_output() {
+fn llm_target_writes_txt_output() {
     let dir = temp_dir("llm-output");
     let a = dir.join("a.brf");
     std::fs::write(&a, "# A\n").unwrap();
     let mut engine = Engine::load(&opts_for(&dir, Target::Llm)).unwrap();
     let mut log: Vec<u8> = Vec::new();
     engine.compile_all(&mut log);
-    assert!(dir.join("a.llm.txt").exists());
+    assert!(dir.join("a.txt").exists());
 }
 
 #[test]
