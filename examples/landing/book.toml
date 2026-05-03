@@ -1,0 +1,56 @@
+[book]
+title       = "Brief"
+description = "A strict markup language for documents written by humans and consumed by humans and LLMs."
+authors     = ["Kirill Leventcov"]
+
+[build]
+src = "src"
+out = "dist"
+
+[site]
+base_url = "/"
+theme    = "theme"
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+# ---- Landing-page shortcodes ----------------------------------------------
+
+[shortcodes.hero]
+kind = "block"
+template_html = "<section class=\"hero\"><div class=\"hero-inner\">{{content}}</div></section>"
+template_llm  = "{{content}}"
+
+[shortcodes.features]
+kind = "block"
+template_html = "<section class=\"features\"><div class=\"features-grid\">{{content}}</div></section>"
+template_llm  = "{{content}}"
+
+[shortcodes.feature]
+kind = "block"
+arguments = { title = { type = "string", required = true } }
+template_html = "<article class=\"feature\"><h3 class=\"feature-title\">{{args.title}}</h3><div class=\"feature-body\">{{content}}</div></article>"
+template_llm  = "### {{args.title}}\n{{content}}"
+
+[shortcodes.compare]
+kind = "block"
+template_html = "<section class=\"compare\"><div class=\"compare-grid\">{{content}}</div></section>"
+template_llm  = "{{content}}"
+
+[shortcodes.col]
+kind = "block"
+arguments = { label = { type = "string", required = true } }
+template_html = "<div class=\"compare-col\"><div class=\"compare-label\">{{args.label}}</div>{{content}}</div>"
+template_llm  = "**{{args.label}}**\n{{content}}"
+
+[shortcodes.diagnostic]
+kind = "block"
+template_html = "<aside class=\"diagnostic\">{{content}}</aside>"
+template_llm  = "{{content}}"
+
+[shortcodes.cta]
+kind = "inline"
+arguments = { href = { type = "string", required = true }, kind = { type = "string", required = true, oneof = ["primary", "secondary"] } }
+template_html = "<a class=\"cta cta-{{args.kind}}\" href=\"{{args.href}}\">{{content}}</a>"
+template_llm  = "[{{content}}]({{args.href}})"

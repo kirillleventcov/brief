@@ -1,0 +1,123 @@
+@hero
+A strict markup language for documents
+written by humans and consumed by humans _and_ LLMs.
+
+@cta(href: "https://github.com/kirillleventcov/brief", kind: primary)[View on GitHub] @cta(href: "https://github.com/kirillleventcov/brief/blob/main/LearnXinYminutes.brf", kind: secondary)[Read the spec]
+@end
+
+## Why it exists
+
+Markdown is forgiving — it silently accepts ambiguous input. That is fine for a blog post and bad for documents you feed to an LLM, where every token costs money. Worse, every Markdown product has its own dialect.
+
+Brief refuses ambiguity. Every construct has one canonical spelling, every error has a code, and every document compiles to a deterministic, token-minimized form for LLM prompts.
+
+## What makes Brief different
+
+@features
+@feature(title: "One way to do it")
+Every construct has a single canonical spelling. `*bold*`, not `**bold**`. `-` for bullets, never `*` or `+`.
+@end
+@feature(title: "Compiler-time errors")
+Ambiguous input is a compile error with a source span and an error code, in the style of `rustc`. There are no warnings.
+@end
+@feature(title: "Token-economic LLM target")
+`brief compile doc.brf --target=llm` produces a deterministic, token-minimized rendering for LLM prompts, with `--report-tokens` for budgeting.
+@end
+@feature(title: "No inline HTML")
+The single extension point is registered shortcodes — including the ones that built this page.
+@end
+@end
+
+## Pretty for humans, lean for LLMs
+
+Code blocks compile twice. The HTML rendering keeps your formatting intact. The `--target=llm` rendering minifies anything safe to minify — JSON in v0.2, C-family languages and SQL in v0.3 — for documents you'll feed to an LLM, where every token is on the bill.
+
+@compare
+@col(label: "Source")
+```json
+{
+  "model": "claude-opus-4-7",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Summarize the changelog."
+    }
+  ]
+}
+```
+@end
+@col(label: "--target=llm")
+```json
+{"model":"claude-opus-4-7","max_tokens":1024,"messages":[{"role":"user","content":"Summarize the changelog."}]}
+```
+@end
+@end
+
+Same JSON, same semantics, far fewer tokens. Opt out per-block with `@nominify` when the formatting itself is the lesson.
+
+## At a glance
+
+A self-contained example showing most of what Brief offers:
+
+```brief
+# Release notes
+
+The 0.4 release ships *strict* lists, _italic_ that doesn't fight you,
+and a real compiler.
+
+- [x] ship v0.4
+- [ ] write release notes
+- plain bullet, not a task
+
+@callout(kind: info)
+Press @kbd[Ctrl+C] to abort the long-running compile.
+@end
+
+Some claim Brief saves tokens.@footnote[Measured against Markdown
+on the project's own docs, roughly 25 percent on average.] The compiler can prove it.
+```
+
+## Markdown → Brief
+
+Same content, two languages.
+
+@compare
+@col(label: "Markdown")
+```markdown
+# Title
+**bold**, *italic*, ~~strike~~
+- one
+* two
++ three
+```
+@end
+@col(label: "Brief")
+```brief
+# Title
+*bold*, _italic_, ~strike~
+- one
+- two
+- three
+```
+@end
+@end
+
+Brief refuses the second and third bullet markers — pick one and use it.
+
+## Errors look like rustc
+
+Ambiguous input is a compile error, with a source span and an error code:
+
+@diagnostic
+```text
+error[B0204]: emphasis cannot nest with the same marker
+  --> doc.brf:14:23
+   |
+14 | This is *outer *inner* outer*.
+   |        ^^^^^^^ inner emphasis re-uses the `*` marker
+   |
+   = help: use a different emphasis marker for the inner span,
+           e.g. _outer *inner* outer_
+```
+@end

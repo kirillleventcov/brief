@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} — {{ site_title }}</title>
+  <meta name="description" content="{{ description }}">
+  <link rel="stylesheet" href="{{ stylesheet }}">
+</head>
+<body>
+  <header class="site-header">
+    <a class="site-wordmark" href="{{ base_url }}">Brief</a>
+    <button id="theme-toggle" type="button" aria-label="Toggle theme">◐</button>
+  </header>
+  <main>{{ content }}</main>
+  <footer class="site-footer">
+    <p>Built with <a href="https://github.com/kirillleventcov/brief">Brief</a> and <code>brief-web</code>. MIT.</p>
+  </footer>
+  {{ reload_script }}
+  <script>
+    (function () {
+      var key = "brief-web-theme";
+      var btn = document.getElementById("theme-toggle");
+      var saved = localStorage.getItem(key);
+      if (saved) document.documentElement.dataset.theme = saved;
+      if (btn) btn.addEventListener("click", function () {
+        var cur = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = cur;
+        localStorage.setItem(key, cur);
+      });
+    }());
+  </script>
+</body>
+</html>

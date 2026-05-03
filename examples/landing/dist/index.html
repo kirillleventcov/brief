@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Brief — Brief</title>
+  <meta name="description" content="Markdown is forgiving — it silently accepts ambiguous input. That is fine for a blog post and bad for documents you feed to an LLM, where every token costs money. Worse, every Markdown product has i…">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="site-wordmark" href="/">Brief</a>
+    <button id="theme-toggle" type="button" aria-label="Toggle theme">◐</button>
+  </header>
+  <main><section class="hero"><div class="hero-inner"><p>A strict markup language for documents written by humans and consumed by humans <em>and</em> LLMs.</p>
+<p><a class="cta cta-primary" href="https://github.com/kirillleventcov/brief">View on GitHub</a> <a class="cta cta-secondary" href="https://github.com/kirillleventcov/brief/blob/main/LearnXinYminutes.brf">Read the spec</a></p>
+</div></section><h2>Why it exists</h2>
+<p>Markdown is forgiving — it silently accepts ambiguous input. That is fine for a blog post and bad for documents you feed to an LLM, where every token costs money. Worse, every Markdown product has its own dialect.</p>
+<p>Brief refuses ambiguity. Every construct has one canonical spelling, every error has a code, and every document compiles to a deterministic, token-minimized form for LLM prompts.</p>
+<h2>What makes Brief different</h2>
+<section class="features"><div class="features-grid"><article class="feature"><h3 class="feature-title">One way to do it</h3><div class="feature-body"><p>Every construct has a single canonical spelling. <code>*bold*</code>, not <code>**bold**</code>. <code>-</code> for bullets, never <code>*</code> or <code>+</code>.</p>
+</div></article><article class="feature"><h3 class="feature-title">Compiler-time errors</h3><div class="feature-body"><p>Ambiguous input is a compile error with a source span and an error code, in the style of <code>rustc</code>. There are no warnings.</p>
+</div></article><article class="feature"><h3 class="feature-title">Token-economic LLM target</h3><div class="feature-body"><p><code>brief compile doc.brf --target=llm</code> produces a deterministic, token-minimized rendering for LLM prompts, with <code>--report-tokens</code> for budgeting.</p>
+</div></article><article class="feature"><h3 class="feature-title">No inline HTML</h3><div class="feature-body"><p>The single extension point is registered shortcodes — including the ones that built this page.</p>
+</div></article></div></section><h2>Pretty for humans, lean for LLMs</h2>
+<p>Code blocks compile twice. The HTML rendering keeps your formatting intact. The <code>--target=llm</code> rendering minifies anything safe to minify — JSON in v0.2, C-family languages and SQL in v0.3 — for documents you'll feed to an LLM, where every token is on the bill.</p>
+<section class="compare"><div class="compare-grid"><div class="compare-col"><div class="compare-label">Source</div><pre><code class="language-json">{
+  &quot;model&quot;: &quot;claude-opus-4-7&quot;,
+  &quot;max_tokens&quot;: 1024,
+  &quot;messages&quot;: [
+    {
+      &quot;role&quot;: &quot;user&quot;,
+      &quot;content&quot;: &quot;Summarize the changelog.&quot;
+    }
+  ]
+}</code></pre>
+</div><div class="compare-col"><div class="compare-label">--target=llm</div><pre><code class="language-json">{&quot;model&quot;:&quot;claude-opus-4-7&quot;,&quot;max_tokens&quot;:1024,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;Summarize the changelog.&quot;}]}</code></pre>
+</div></div></section><p>Same JSON, same semantics, far fewer tokens. Opt out per-block with <code>@nominify</code> when the formatting itself is the lesson.</p>
+<h2>At a glance</h2>
+<p>A self-contained example showing most of what Brief offers:</p>
+<pre><code class="language-brief"># Release notes
+
+The 0.4 release ships *strict* lists, _italic_ that doesn't fight you,
+and a real compiler.
+
+- [x] ship v0.4
+- [ ] write release notes
+- plain bullet, not a task
+
+@callout(kind: info)
+Press @kbd[Ctrl+C] to abort the long-running compile.
+@end
+
+Some claim Brief saves tokens.@footnote[Measured against Markdown
+on the project's own docs, roughly 25 percent on average.] The compiler can prove it.</code></pre>
+<h2>Markdown → Brief</h2>
+<p>Same content, two languages.</p>
+<section class="compare"><div class="compare-grid"><div class="compare-col"><div class="compare-label">Markdown</div><pre><code class="language-markdown"># Title
+**bold**, *italic*, ~~strike~~
+- one
+* two
++ three</code></pre>
+</div><div class="compare-col"><div class="compare-label">Brief</div><pre><code class="language-brief"># Title
+*bold*, _italic_, ~strike~
+- one
+- two
+- three</code></pre>
+</div></div></section><p>Brief refuses the second and third bullet markers — pick one and use it.</p>
+<h2>Errors look like rustc</h2>
+<p>Ambiguous input is a compile error, with a source span and an error code:</p>
+<aside class="diagnostic"><pre><code class="language-text">error[B0204]: emphasis cannot nest with the same marker
+  --&gt; doc.brf:14:23
+   |
+14 | This is *outer *inner* outer*.
+   |        ^^^^^^^ inner emphasis re-uses the `*` marker
+   |
+   = help: use a different emphasis marker for the inner span,
+           e.g. _outer *inner* outer_</code></pre>
+</aside></main>
+  <footer class="site-footer">
+    <p>Built with <a href="https://github.com/kirillleventcov/brief">Brief</a> and <code>brief-web</code>. MIT.</p>
+  </footer>
+  
+  <script>
+    (function () {
+      var key = "brief-web-theme";
+      var btn = document.getElementById("theme-toggle");
+      var saved = localStorage.getItem(key);
+      if (saved) document.documentElement.dataset.theme = saved;
+      if (btn) btn.addEventListener("click", function () {
+        var cur = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = cur;
+        localStorage.setItem(key, cur);
+      });
+    }());
+  </script>
+</body>
+</html>
