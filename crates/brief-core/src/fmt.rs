@@ -771,4 +771,14 @@ mod tests {
         let src = "@callout(kind: warning)\nhello\n@end\n";
         assert_eq!(fmt(src), src);
     }
+
+    #[test]
+    fn fmt_idempotent_on_dl_example() {
+        let src = "@dl\nTerm 1\n: Definition of term 1.\nTerm 2\n: Definition of term 2.\n@end\n";
+        let once = fmt(src);
+        let twice = fmt(&once);
+        assert_eq!(once, twice, "fmt is not idempotent on @dl");
+        // Canonical input shouldn't be rewritten.
+        assert_eq!(once, src, "fmt rewrote canonical @dl source");
+    }
 }

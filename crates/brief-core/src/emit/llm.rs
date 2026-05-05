@@ -182,6 +182,17 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String, indent: usize) {
             emit_code_block(lang.as_deref(), body, attrs, ctx, out);
         }
         Block::Table { header, rows, .. } => render_table(header, rows, ctx, out),
+        Block::DefinitionList { items, .. } => {
+            out.push_str("@dl\n");
+            for it in items {
+                render_inline_seq(&it.term, ctx, out);
+                out.push('\n');
+                out.push_str(": ");
+                render_inline_seq(&it.definition, ctx, out);
+                out.push('\n');
+            }
+            out.push_str("@end\n");
+        }
         Block::HorizontalRule { .. } => out.push_str("---\n"),
         Block::BlockShortcode {
             name,
@@ -616,6 +627,16 @@ fn collect_block(b: &Block, out: &mut Vec<Vec<Inline>>) {
                     for n in cell {
                         collect_inline(n, out);
                     }
+                }
+            }
+        }
+        Block::DefinitionList { items, .. } => {
+            for it in items {
+                for n in &it.term {
+                    collect_inline(n, out);
+                }
+                for n in &it.definition {
+                    collect_inline(n, out);
                 }
             }
         }
@@ -1057,5 +1078,50 @@ mod tests {
         let (out, _) = render(&doc, &reg, &opts);
         assert!(out.contains("just text"), "got: {}", out);
         assert!(!out.contains("a.brf"));
+    }
+
+    #[test]
+    fn dl_renders_verbatim_brief_form() {
+        use crate::ast::{Block, DefinitionItem, Document, Inline, ShortArgs};
+        use crate::span::Span;
+        let doc = Document {
+            blocks: vec![Block::DefinitionList {
+                args: ShortArgs::default(),
+                items: vec![
+                    DefinitionItem {
+                        term: vec![Inline::Text {
+                            value: "Term1".into(),
+                            span: Span::DUMMY,
+                        }],
+                        definition: vec![Inline::Text {
+                            value: "Def1.".into(),
+                            span: Span::DUMMY,
+                        }],
+                        span: Span::DUMMY,
+                    },
+                    DefinitionItem {
+                        term: vec![Inline::Text {
+                            value: "Term2".into(),
+                            span: Span::DUMMY,
+                        }],
+                        definition: vec![Inline::Text {
+                            value: "Def2.".into(),
+                            span: Span::DUMMY,
+                        }],
+                        span: Span::DUMMY,
+                    },
+                ],
+                span: Span::DUMMY,
+            }],
+            metadata: None,
+            resolved_refs: Default::default(),
+        };
+        let reg = Registry::with_builtins();
+        let opts = Opts::default();
+        let (out, _w) = render(&doc, &reg, &opts);
+        assert!(out.contains("@dl\n"), "got: {}", out);
+        assert!(out.contains("Term1\n: Def1.\n"), "got: {}", out);
+        assert!(out.contains("Term2\n: Def2.\n"), "got: {}", out);
+        assert!(out.contains("@end\n"), "got: {}", out);
     }
 }

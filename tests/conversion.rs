@@ -615,6 +615,34 @@ use brief::span::SourceMap;
 use brief::validate::{ValidateOpts, validate};
 
 #[test]
+fn convert_simple_dl() {
+    let md = "Term\n:   Definition.\n";
+    let (out, holes) = run(md);
+    assert!(out.contains("@dl\n"), "got: {}", out);
+    assert!(out.contains("Term\n: Definition.\n"), "got: {}", out);
+    assert!(out.contains("@end\n"), "got: {}", out);
+    assert!(holes.is_empty(), "unexpected holes: {:?}", holes);
+}
+
+#[test]
+fn convert_dl_multiple_defs_emits_hole() {
+    let md = "Term\n:   First.\n:   Second.\n";
+    let (out, holes) = run(md);
+    // The term must be repeated for each definition so the Brief output
+    // is valid v0.3 source.
+    let term_count = out.matches("Term\n").count();
+    assert_eq!(term_count, 2, "term should be duplicated, got: {}", out);
+    assert!(out.contains(": First."), "got: {}", out);
+    assert!(out.contains(": Second."), "got: {}", out);
+    // Exactly one Hole per term that had >1 definitions.
+    let dl_holes: Vec<_> = holes
+        .iter()
+        .filter(|h| **h == Hole::DefinitionListMultipleDefs)
+        .collect();
+    assert_eq!(dl_holes.len(), 1, "got: {:?}", holes);
+}
+
+#[test]
 fn roundtrip_sample_compiles_clean() {
     let md = include_str!("fixtures/sample.md");
     let result = convert(md, "sample.md");

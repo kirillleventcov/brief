@@ -56,6 +56,11 @@ pub enum Block {
         rows: Vec<Row>,
         span: Span,
     },
+    DefinitionList {
+        args: ShortArgs,
+        items: Vec<DefinitionItem>,
+        span: Span,
+    },
     BlockShortcode {
         name: String,
         args: ShortArgs,
@@ -97,6 +102,13 @@ pub struct ListItem {
 #[derive(Clone, Debug)]
 pub struct Row {
     pub cells: Vec<Vec<Inline>>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct DefinitionItem {
+    pub term: Vec<Inline>,
+    pub definition: Vec<Inline>,
     pub span: Span,
 }
 

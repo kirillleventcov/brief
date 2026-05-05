@@ -22,6 +22,7 @@ pub struct Diag {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Hole {
     SetextHeading,
+    DefinitionListMultipleDefs,
     DoubleEmphasis,   // **x**, __x__, ~~x~~
     AsteriskEmphasis, // *em* (Markdown italic)
     AltBullet,        // * or + bullet
@@ -46,6 +47,7 @@ impl Hole {
     pub fn slug(self) -> &'static str {
         match self {
             Hole::SetextHeading => "setext-heading",
+            Hole::DefinitionListMultipleDefs => "definition-list-multiple-defs",
             Hole::DoubleEmphasis => "double-emphasis",
             Hole::AsteriskEmphasis => "asterisk-emphasis",
             Hole::AltBullet => "alt-bullet",
@@ -70,6 +72,9 @@ impl Hole {
     pub fn message(self) -> &'static str {
         match self {
             Hole::SetextHeading => "setext heading rewritten to ATX",
+            Hole::DefinitionListMultipleDefs => {
+                "definition list term repeated for each of multiple Markdown definitions (Brief v0.3 limitation)"
+            }
             Hole::DoubleEmphasis => "doubled emphasis marker rewritten to single",
             Hole::AsteriskEmphasis => "Markdown `*italic*` rewritten to Brief `_italic_`",
             Hole::AltBullet => "`*`/`+` bullet rewritten to `-`",
@@ -107,6 +112,7 @@ pub fn convert(input: &str, source_path: &str) -> ConvertResult {
     opts.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
     opts.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
     opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    opts.insert(Options::ENABLE_DEFINITION_LIST);
 
     let line_offsets = compute_line_offsets(input);
     let events: Vec<(Event<'_>, std::ops::Range<usize>)> =
@@ -195,6 +201,8 @@ struct Walker<'a> {
     container_stack: Vec<Container>,
     /// Active table accumulator (we only ever have one in flight).
     table: Option<TableState>,
+    /// Active definition-list accumulator.
+    dl: Option<DefinitionListState>,
     /// Stack of (dest_url, optional diagnostic to emit on End) for active links/images.
     link_stack: Vec<(String, Option<(Hole, String)>)>,
     /// Footnote labels → body text (rendered as a flat string).
@@ -218,6 +226,20 @@ struct TableState {
     current_row: Vec<String>,
     current_cell: String,
     in_cell: bool,
+}
+
+struct DefinitionListState {
+    /// Finalized (term_brief, definition_brief) pairs.
+    items: Vec<(String, String)>,
+    /// In-progress term content (writes are redirected here while `in_term`).
+    current_term: String,
+    /// In-progress definition content.
+    current_def: String,
+    /// Number of `DefinitionListDefinition` events seen for the *current*
+    /// term. Used to detect "multiple definitions per term" (Task 8).
+    defs_for_current_term: usize,
+    in_term: bool,
+    in_def: bool,
 }
 
 struct ListFrame {
@@ -269,6 +291,16 @@ impl HtmlInlineKind {
 
 impl<'a> Walker<'a> {
     fn write(&mut self, s: &str) {
+        if let Some(d) = self.dl.as_mut() {
+            if d.in_term {
+                d.current_term.push_str(s);
+                return;
+            }
+            if d.in_def {
+                d.current_def.push_str(s);
+                return;
+            }
+        }
         if let Some(t) = self.table.as_mut() {
             if t.in_cell {
                 t.current_cell.push_str(s);
@@ -282,6 +314,16 @@ impl<'a> Walker<'a> {
         }
     }
     fn write_char(&mut self, c: char) {
+        if let Some(d) = self.dl.as_mut() {
+            if d.in_term {
+                d.current_term.push(c);
+                return;
+            }
+            if d.in_def {
+                d.current_def.push(c);
+                return;
+            }
+        }
         if let Some(t) = self.table.as_mut() {
             if t.in_cell {
                 t.current_cell.push(c);
@@ -295,6 +337,14 @@ impl<'a> Walker<'a> {
         }
     }
     fn current_ends_with(&self, c: char) -> bool {
+        if let Some(d) = self.dl.as_ref() {
+            if d.in_term {
+                return d.current_term.ends_with(c);
+            }
+            if d.in_def {
+                return d.current_def.ends_with(c);
+            }
+        }
         if let Some(t) = self.table.as_ref() {
             if t.in_cell {
                 return t.current_cell.ends_with(c);
@@ -320,6 +370,7 @@ impl<'a> Walker<'a> {
             out_stack: Vec::new(),
             container_stack: Vec::new(),
             table: None,
+            dl: None,
             link_stack: Vec::new(),
             footnote_defs: std::collections::BTreeMap::new(),
             pending_html_comments: Vec::new(),
@@ -877,6 +928,78 @@ impl<'a> Walker<'a> {
                     let cell = std::mem::take(&mut t.current_cell);
                     t.current_row.push(cell);
                     t.in_cell = false;
+                }
+            }
+            Event::Start(Tag::DefinitionList) => {
+                // Ensure preceding blank line, same convention as paragraphs
+                // and lists.
+                if !self.out.is_empty() && !self.out.ends_with("\n\n") {
+                    if !self.out.ends_with('\n') {
+                        self.out.push('\n');
+                    }
+                    self.out.push('\n');
+                }
+                self.dl = Some(DefinitionListState {
+                    items: Vec::new(),
+                    current_term: String::new(),
+                    current_def: String::new(),
+                    defs_for_current_term: 0,
+                    in_term: false,
+                    in_def: false,
+                });
+            }
+            Event::End(TagEnd::DefinitionList) => {
+                let state = self.dl.take().expect("DefinitionList without state");
+                if !state.items.is_empty() {
+                    self.out.push_str("@dl\n");
+                    for (term, def) in &state.items {
+                        self.out.push_str(term.trim_end());
+                        self.out.push('\n');
+                        self.out.push_str(": ");
+                        self.out.push_str(def.trim_end());
+                        self.out.push('\n');
+                    }
+                    self.out.push_str("@end\n\n");
+                }
+            }
+            Event::Start(Tag::DefinitionListTitle) => {
+                if let Some(d) = self.dl.as_mut() {
+                    d.in_term = true;
+                    d.current_term.clear();
+                    d.defs_for_current_term = 0;
+                }
+            }
+            Event::End(TagEnd::DefinitionListTitle) => {
+                if let Some(d) = self.dl.as_mut() {
+                    d.in_term = false;
+                }
+            }
+            Event::Start(Tag::DefinitionListDefinition) => {
+                if let Some(d) = self.dl.as_mut() {
+                    d.in_def = true;
+                    d.current_def.clear();
+                    d.defs_for_current_term += 1;
+                }
+                let crossed_to_two = self
+                    .dl
+                    .as_ref()
+                    .map(|d| d.defs_for_current_term == 2)
+                    .unwrap_or(false);
+                if crossed_to_two {
+                    self.push_diag(
+                        Hole::DefinitionListMultipleDefs,
+                        range.clone(),
+                        "definition list term repeated for each definition (Brief v0.3 limitation)"
+                            .into(),
+                    );
+                }
+            }
+            Event::End(TagEnd::DefinitionListDefinition) => {
+                if let Some(d) = self.dl.as_mut() {
+                    d.in_def = false;
+                    let term = d.current_term.clone();
+                    let def = std::mem::take(&mut d.current_def);
+                    d.items.push((term, def));
                 }
             }
             Event::Start(Tag::MetadataBlock(kind)) => {

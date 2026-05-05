@@ -906,3 +906,29 @@ fn heading_anchor_valid_hyphens_and_digits() {
     assert!(codes.is_empty(), "{:?}", codes);
     assert!(html.contains("id=\"valid-name-123\""), "html: {}", html);
 }
+
+#[test]
+fn t_definition_list_basic() {
+    let input = "@dl\nApple\n: A pomaceous fruit.\nBrief\n: A markup language.\n@end\n";
+    let (html, codes) = compile(input);
+    assert!(codes.is_empty(), "{:?}", codes);
+    assert!(html.contains("<dl>"), "html: {}", html);
+    assert!(html.contains("<dt>Apple</dt>"), "html: {}", html);
+    assert!(
+        html.contains("<dd>A pomaceous fruit.</dd>"),
+        "html: {}",
+        html
+    );
+    assert!(html.contains("<dt>Brief</dt>"), "html: {}", html);
+    assert!(
+        html.contains("<dd>A markup language.</dd>"),
+        "html: {}",
+        html
+    );
+}
+
+#[test]
+fn t_definition_list_malformed_is_b0505() {
+    let (_, codes) = compile("@dl\n: Stray definition.\n@end\n");
+    assert!(codes.contains(&Code::BadDefinitionList), "{:?}", codes);
+}

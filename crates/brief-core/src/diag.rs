@@ -55,6 +55,7 @@ pub enum Code {
     TableColumnMismatch = 502,
     HeadingMonotonic = 503,
     AlignArrayLength = 504,
+    BadDefinitionList = 505,
     DuplicateHeadingAnchor = 506,
 
     RefMissingFile = 601,
@@ -97,6 +98,7 @@ impl Code {
             UnknownCodeAttribute => "unknown code-fence attribute",
             ConflictingCodeAttributes => "conflicting code-fence attributes",
             BadHeadingAnchor => "invalid heading anchor",
+            BadDefinitionList => "malformed definition list",
             CodeBlockLineCount => {
                 "minified code block was originally many lines; LLM consumers cannot reference specific lines"
             }
@@ -232,5 +234,12 @@ mod tests {
         assert!(RefMissingAnchor.message().contains("anchor"));
         assert!(RefBadTarget.message().contains("target"));
         assert!(RefNoProject.message().contains("brief.toml"));
+    }
+
+    #[test]
+    fn bad_definition_list_code_renders() {
+        use Code::*;
+        assert_eq!(BadDefinitionList.as_str(), "B0505");
+        assert!(BadDefinitionList.message().contains("definition list"));
     }
 }

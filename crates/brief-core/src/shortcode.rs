@@ -195,6 +195,14 @@ impl Registry {
         );
 
         m.insert(
+            "dl".into(),
+            Shortcode {
+                kind: ShortKindOpt::Block,
+                ..Default::default()
+            },
+        );
+
+        m.insert(
             "t".into(),
             Shortcode {
                 kind: ShortKindOpt::Block,
@@ -328,5 +336,13 @@ mod tests {
         assert!(title.required);
         assert_eq!(title.position, Some(1));
         assert!(matches!(title.ty, ArgType::String));
+    }
+
+    #[test]
+    fn dl_is_a_builtin_block_shortcode() {
+        let reg = Registry::with_builtins();
+        let sc = reg.get("dl").expect("@dl must be a built-in");
+        assert!(matches!(sc.kind, ShortKindOpt::Block));
+        assert!(sc.arguments.is_empty(), "@dl takes no arguments in v0.3");
     }
 }

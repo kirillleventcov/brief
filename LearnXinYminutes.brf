@@ -106,6 +106,37 @@ because you cannot escape inside a verbatim region.
 Run ``echo `whoami` `` to print the user.
 ```
 
+## 5a. Definition lists
+
+Definition lists pair a term with its definition. They are uncommon
+enough that Brief expresses them as a block shortcode, `@dl`, rather
+than growing the top-level grammar.
+
+```brief
+@dl
+Term 1
+: Definition of term 1.
+Term 2
+: Definition of term 2, which can
+  span multiple lines via continuation.
+@end
+```
+
+The `: ` marker is exact: colon followed by one space. Two spaces, no
+space, or any other character after the colon is a B0505 error.
+Continuation lines align to the content column of `: ` (parent indent
+plus two spaces). Multiple definitions per term are not supported in
+v0.3 — two `: ` lines under one term is a B0505 error.
+
+A live definition list:
+
+@dl
+Term 1
+: Definition of term 1.
+Term 2
+: Definition of term 2.
+@end
+
 ## 6. Lists
 
 Two kinds — unordered and ordered — and they do NOT mix at the same

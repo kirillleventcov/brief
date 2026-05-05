@@ -78,6 +78,10 @@ fn collect_anchor(
                 }
             }
         }
-        _ => {}
+        Block::DefinitionList { .. } => {}
+        Block::Paragraph { .. }
+        | Block::CodeBlock { .. }
+        | Block::Table { .. }
+        | Block::HorizontalRule { .. } => {}
     }
 }

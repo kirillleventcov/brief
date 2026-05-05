@@ -88,6 +88,17 @@ fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
         } => {
             render_table(args, header, rows, ctx, out);
         }
+        Block::DefinitionList { items, .. } => {
+            out.push_str("<dl>\n");
+            for it in items {
+                out.push_str("<dt>");
+                render_inline_seq(&it.term, ctx, out);
+                out.push_str("</dt>\n<dd>");
+                render_inline_seq(&it.definition, ctx, out);
+                out.push_str("</dd>\n");
+            }
+            out.push_str("</dl>\n");
+        }
         Block::HorizontalRule { .. } => out.push_str("<hr>\n"),
         Block::BlockShortcode {
             name,
@@ -447,6 +458,16 @@ fn collect_block(b: &Block, out: &mut Vec<Vec<Inline>>) {
                 }
             }
         }
+        Block::DefinitionList { items, .. } => {
+            for it in items {
+                for n in &it.term {
+                    collect_inline(n, out);
+                }
+                for n in &it.definition {
+                    collect_inline(n, out);
+                }
+            }
+        }
         Block::CodeBlock { .. } | Block::HorizontalRule { .. } => {}
     }
 }
@@ -645,5 +666,36 @@ mod tests {
             "must not emit a broken link: {}",
             html
         );
+    }
+
+    #[test]
+    fn dl_renders_as_dl_dt_dd() {
+        use crate::ast::{Block, DefinitionItem, Document, Inline, ShortArgs};
+        use crate::span::Span;
+        let doc = Document {
+            blocks: vec![Block::DefinitionList {
+                args: ShortArgs::default(),
+                items: vec![DefinitionItem {
+                    term: vec![Inline::Text {
+                        value: "Term".into(),
+                        span: Span::DUMMY,
+                    }],
+                    definition: vec![Inline::Text {
+                        value: "Definition.".into(),
+                        span: Span::DUMMY,
+                    }],
+                    span: Span::DUMMY,
+                }],
+                span: Span::DUMMY,
+            }],
+            metadata: None,
+            resolved_refs: Default::default(),
+        };
+        let reg = Registry::with_builtins();
+        let out = render(&doc, &reg);
+        assert!(out.contains("<dl>"), "got: {}", out);
+        assert!(out.contains("<dt>Term</dt>"), "got: {}", out);
+        assert!(out.contains("<dd>Definition.</dd>"), "got: {}", out);
+        assert!(out.contains("</dl>"), "got: {}", out);
     }
 }

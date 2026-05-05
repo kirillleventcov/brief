@@ -206,6 +206,9 @@ impl<'a> Parser<'a> {
         if trimmed == "@t" || trimmed.starts_with("@t ") || trimmed.starts_with("@t(") {
             return Some(self.parse_table(indent));
         }
+        if trimmed == "@dl" || trimmed.starts_with("@dl ") || trimmed.starts_with("@dl(") {
+            return Some(self.parse_definition_list(indent));
+        }
         if trimmed.starts_with('@') {
             return self.parse_block_shortcode_or_inline(indent);
         }
@@ -711,6 +714,191 @@ impl<'a> Parser<'a> {
             header,
             rows,
             span,
+        }
+    }
+
+    fn parse_definition_list(&mut self, indent: u16) -> Block {
+        use crate::ast::DefinitionItem;
+        let directive = self.peek().clone();
+        let line = if let TokenKind::Line(ref s) = directive.kind {
+            s.clone()
+        } else {
+            unreachable!()
+        };
+        self.pos += 1;
+        let trimmed = &line[indent as usize..];
+        let mut cursor = 3usize;
+        let args = if trimmed.as_bytes().get(cursor) == Some(&b'(') {
+            match parse_args(trimmed, &mut cursor) {
+                Ok(a) => a,
+                Err(d) => {
+                    self.diags.push(d);
+                    ShortArgs::default()
+                }
+            }
+        } else {
+            ShortArgs::default()
+        };
+
+        let mut items: Vec<DefinitionItem> = Vec::new();
+        let mut pending_term: Option<(Vec<Inline>, Span)> = None;
+        // (text accumulator, base offset of first line, span covering the
+        // definition's lines).
+        let mut pending_def: Option<(String, u32, Span)> = None;
+        let cont_indent = indent + 2;
+        let mut end_span = directive.span;
+
+        // Closes any open definition into items, paired with the pending term.
+        let finalize_def = |items: &mut Vec<DefinitionItem>,
+                            pending_term: &mut Option<(Vec<Inline>, Span)>,
+                            pending_def: &mut Option<(String, u32, Span)>,
+                            diags: &mut Vec<Diagnostic>| {
+            if let Some((text, base, span)) = pending_def.take() {
+                let term_pair = pending_term.take();
+                let (def_inl, dd) = parse_inline(&text, base);
+                diags.extend(dd);
+                if let Some((term, t_span)) = term_pair {
+                    let pair_span = t_span.join(span);
+                    items.push(DefinitionItem {
+                        term,
+                        definition: def_inl,
+                        span: pair_span,
+                    });
+                } else {
+                    // Should not happen — a definition without a term is
+                    // caught at the `: ` line itself.
+                }
+            }
+        };
+
+        loop {
+            if self.at_eof() {
+                self.diags.push(
+                    Diagnostic::new(Code::UnterminatedBlock, directive.span)
+                        .label("`@dl` block was never closed with `@end`"),
+                );
+                break;
+            }
+            let tok = self.peek().clone();
+            match tok.kind {
+                TokenKind::Eof => {
+                    self.diags.push(
+                        Diagnostic::new(Code::UnterminatedBlock, directive.span)
+                            .label("`@dl` block was never closed with `@end`"),
+                    );
+                    break;
+                }
+                TokenKind::Blank => {
+                    finalize_def(
+                        &mut items,
+                        &mut pending_term,
+                        &mut pending_def,
+                        &mut self.diags,
+                    );
+                    self.pos += 1;
+                    continue;
+                }
+                TokenKind::Line(ref s) => {
+                    if let Some(pd) = pending_def.as_mut()
+                        && tok.indent == cont_indent
+                    {
+                        // Continuation of the active definition.
+                        let body = &s[cont_indent as usize..];
+                        pd.0.push(' ');
+                        pd.0.push_str(body);
+                        pd.2 = pd.2.join(tok.span);
+                        self.pos += 1;
+                        continue;
+                    }
+                    if tok.indent != indent {
+                        // Anything else not at @dl's indent inside a `@dl`
+                        // body is unexpected — skip it; subsequent tasks
+                        // refine error reporting.
+                        self.pos += 1;
+                        continue;
+                    }
+                    let body = &s[indent as usize..];
+                    if body.trim() == "@end" {
+                        finalize_def(
+                            &mut items,
+                            &mut pending_term,
+                            &mut pending_def,
+                            &mut self.diags,
+                        );
+                        end_span = tok.span;
+                        self.pos += 1;
+                        break;
+                    }
+                    if let Some(rest) = body.strip_prefix(": ") {
+                        if pending_term.is_none() && pending_def.is_none() {
+                            self.diags.push(
+                                Diagnostic::new(Code::BadDefinitionList, tok.span)
+                                    .label("definition without a term"),
+                            );
+                            self.pos += 1;
+                            continue;
+                        }
+                        if pending_def.is_some() {
+                            self.diags.push(
+                                Diagnostic::new(Code::BadDefinitionList, tok.span).label(
+                                    "multiple definitions per term are not supported in v0.3",
+                                ),
+                            );
+                            // Drop the duplicate definition: do not consume
+                            // pending_term, do not start a new pending_def.
+                            self.pos += 1;
+                            continue;
+                        }
+                        let base = tok.span.start + indent as u32 + 2;
+                        pending_def = Some((rest.to_string(), base, tok.span));
+                        self.pos += 1;
+                    } else {
+                        // Term line.
+                        finalize_def(
+                            &mut items,
+                            &mut pending_term,
+                            &mut pending_def,
+                            &mut self.diags,
+                        );
+                        if let Some((_t, t_span)) = pending_term.take() {
+                            self.diags.push(
+                                Diagnostic::new(Code::BadDefinitionList, t_span)
+                                    .label("term without a definition"),
+                            );
+                        }
+                        let base = tok.span.start + indent as u32;
+                        let (term, td) = parse_inline(body, base);
+                        self.diags.extend(td);
+                        pending_term = Some((term, tok.span));
+                        self.pos += 1;
+                    }
+                }
+            }
+        }
+
+        // Final flush after EOF or @end.
+        finalize_def(
+            &mut items,
+            &mut pending_term,
+            &mut pending_def,
+            &mut self.diags,
+        );
+        if let Some((_t, t_span)) = pending_term {
+            self.diags.push(
+                Diagnostic::new(Code::BadDefinitionList, t_span).label("term without a definition"),
+            );
+        }
+        if items.is_empty() && !self.diags.iter().any(|d| d.code == Code::BadDefinitionList) {
+            self.diags.push(
+                Diagnostic::new(Code::BadDefinitionList, directive.span)
+                    .label("`@dl` must contain at least one term/definition pair"),
+            );
+        }
+
+        Block::DefinitionList {
+            args,
+            items,
+            span: directive.span.join(end_span),
         }
     }
 
@@ -1333,5 +1521,98 @@ mod tests {
         assert!(d.is_empty(), "{:?}", d);
         let meta = doc.metadata.as_ref().expect("metadata present");
         assert_eq!(meta.get("title").and_then(|v| v.as_str()), Some("hi"));
+    }
+
+    #[test]
+    fn dl_basic_two_pairs() {
+        let (doc, d) = p("@dl\nTerm 1\n: Definition 1.\nTerm 2\n: Definition 2.\n@end\n");
+        assert!(d.is_empty(), "{:?}", d);
+        let dl = match &doc.blocks[0] {
+            Block::DefinitionList { items, .. } => items,
+            other => panic!("expected DefinitionList, got {:?}", other),
+        };
+        assert_eq!(dl.len(), 2);
+        let term0 = match &dl[0].term[0] {
+            Inline::Text { value, .. } => value.as_str(),
+            _ => panic!("expected Text in term"),
+        };
+        let def0 = match &dl[0].definition[0] {
+            Inline::Text { value, .. } => value.as_str(),
+            _ => panic!("expected Text in definition"),
+        };
+        assert_eq!(term0, "Term 1");
+        assert_eq!(def0, "Definition 1.");
+        let term1 = match &dl[1].term[0] {
+            Inline::Text { value, .. } => value.as_str(),
+            _ => panic!("expected Text in term"),
+        };
+        assert_eq!(term1, "Term 2");
+    }
+
+    #[test]
+    fn dl_continuation_joins_with_space() {
+        let input = "@dl\nTerm\n: Definition that\n  spans two lines.\n@end\n";
+        let (doc, d) = p(input);
+        assert!(d.is_empty(), "{:?}", d);
+        let items = match &doc.blocks[0] {
+            Block::DefinitionList { items, .. } => items,
+            other => panic!("expected DefinitionList, got {:?}", other),
+        };
+        assert_eq!(items.len(), 1);
+        let def_text = match &items[0].definition[0] {
+            Inline::Text { value, .. } => value.as_str(),
+            _ => panic!("expected Text"),
+        };
+        assert_eq!(def_text, "Definition that spans two lines.");
+    }
+
+    #[test]
+    fn dl_definition_without_term_is_b0505() {
+        let (_, d) = p("@dl\n: Stray definition.\nTerm\n: Def.\n@end\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::BadDefinitionList),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn dl_term_without_definition_is_b0505() {
+        let (_, d) = p("@dl\nLonely term\n@end\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::BadDefinitionList),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn dl_multiple_definitions_per_term_is_b0505() {
+        let (_, d) = p("@dl\nTerm\n: First def.\n: Second def.\n@end\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::BadDefinitionList),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn dl_empty_body_is_b0505() {
+        let (_, d) = p("@dl\n@end\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::BadDefinitionList),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn dl_unterminated_is_b0306() {
+        let (_, d) = p("@dl\nTerm\n: Def.\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::UnterminatedBlock),
+            "{:?}",
+            d
+        );
     }
 }

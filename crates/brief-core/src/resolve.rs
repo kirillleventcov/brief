@@ -74,6 +74,16 @@ fn scan_refs_block(
                 }
             }
         }
+        Block::DefinitionList { items, .. } => {
+            for it in items {
+                for n in &it.term {
+                    scan_refs_inline(n, project, diags, out);
+                }
+                for n in &it.definition {
+                    scan_refs_inline(n, project, diags, out);
+                }
+            }
+        }
         Block::CodeBlock { .. } | Block::HorizontalRule { .. } => {}
     }
 }
@@ -299,6 +309,16 @@ fn resolve_block(block: &mut Block, reg: &Registry, diags: &mut Vec<Diagnostic>)
                     for n in cell {
                         resolve_inline(n, reg, diags);
                     }
+                }
+            }
+        }
+        Block::DefinitionList { items, .. } => {
+            for it in items {
+                for n in &mut it.term {
+                    resolve_inline(n, reg, diags);
+                }
+                for n in &mut it.definition {
+                    resolve_inline(n, reg, diags);
                 }
             }
         }
