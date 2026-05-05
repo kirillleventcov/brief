@@ -2,6 +2,8 @@
 
 A strict markup language for documents written by humans and consumed by humans _and_ LLMs.
 
+**Docs: [docs.brief.kirillleventcov.com](https://docs.brief.kirillleventcov.com/)**
+
 > [!WARNING]
 > This is a personal project. It's **nowhere near production grade**, nor contains best quality code. It exists because it solves a set of very specific problems I have with Markdown.
 > It may improve over time, or it may not.
