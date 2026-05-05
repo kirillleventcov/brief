@@ -1,0 +1,47 @@
+# Summary
+
+## Get started
+
+- @ref[index.brf](Overview)
+- @ref[getting-started/installation.brf](Installation)
+- @ref[getting-started/first-document.brf](Your first document)
+- @ref[getting-started/compile-targets.brf](Compile targets)
+
+## The Brief language
+
+- @ref[language/comments.brf](Comments)
+- @ref[language/headings.brf](Headings)
+- @ref[language/paragraphs.brf](Paragraphs and line breaks)
+- @ref[language/emphasis.brf](Emphasis)
+- @ref[language/inline-code.brf](Inline code)
+- @ref[language/lists.brf](Lists)
+- @ref[language/definition-lists.brf](Definition lists)
+- @ref[language/blockquotes.brf](Blockquotes)
+- @ref[language/code-blocks.brf](Code blocks)
+- @ref[language/tables.brf](Tables)
+- @ref[language/horizontal-rule.brf](Horizontal rule)
+- @ref[language/shortcodes.brf](Shortcodes)
+- @ref[language/escapes.brf](Escapes)
+
+## Reference
+
+- @ref[reference/built-in-shortcodes.brf](Built-in shortcodes)
+- @ref[reference/cli.brf](Command-line interface)
+- @ref[reference/brief-toml.brf](brief.toml)
+- @ref[reference/error-codes.brf](Error code registry)
+
+## LLM mode
+
+- @ref[llm-mode/overview.brf](Overview)
+- @ref[llm-mode/code-minification.brf](Code-block minification)
+- @ref[llm-mode/token-budgeting.brf](Token budgeting)
+
+## Tooling
+
+- @ref[tooling/brief-web.brf](brief-web)
+- @ref[tooling/markdown-converter.brf](Markdown converter)
+
+## Design
+
+- @ref[design/philosophy.brf](Philosophy)
+- @ref[design/compared-to-markdown.brf](Compared to Markdown)

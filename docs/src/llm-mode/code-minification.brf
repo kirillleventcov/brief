@@ -1,0 +1,177 @@
+# Code-block minification
+
+@lede
+Fenced code blocks compile twice. The HTML target keeps your formatting.
+The LLM target strips whitespace and comments where it is safe to.
+@end
+
+## Supported languages
+
+@t
+| Languages | Status
+| `json`, `jsonl` | Minified
+| `js`, `ts`, `rust`, `c`, `cpp`, `java`, `go`, `sql` | Minified
+| `python`, `yaml`, `makefile` | Permanently refused
+
+Refused languages have significant whitespace. Forcing minification on
+them via `@minify` or by adding the tag to `minify_languages` is @ec[B0704]
+*"language uses significant whitespace and cannot be safely minified"* —
+the compiler emits the error and falls back to verbatim.
+
+## The three states
+
+A fenced block can be in one of three minification states. The state is
+set by an attribute after the language tag.
+
+State 1 — *full minification* (default for languages in the allowlist).
+The block strips all whitespace and all comments.
+
+State 2 — *verbatim*. Add `@nominify` after the language tag. The block
+is emitted unchanged.
+
+State 3 — *strip whitespace, keep comments*. Add `@minify-keep-comments`
+after the language tag. Comments survive; whitespace collapses to the
+minimum required to preserve token boundaries.
+
+## A worked example
+
+Source:
+
+```rust
+fn add(a: i32, b: i32) -> i32 {
+    // Adds two numbers.
+    a + b
+}
+```
+
+LLM-mode output (State 1, full minification):
+
+```text
+fn add(a:i32,b:i32)->i32{a+b}
+```
+
+Same source with `@minify-keep-comments` (State 3):
+
+```text
+fn add(a:i32,b:i32)->i32{/* Adds two numbers.*/a+b}
+```
+
+The conversion from `//` to `/* */` triggers @ec[B0703] *"line comment
+converted to block-comment form for minification"* per converted line.
+Silence with `--allow B0703` if you have manually verified the line
+comments do not contain `*/`.
+
+## Per-block opt-in
+
+```rust @minify
+{
+  "force_minify": true
+}
+```
+
+`@minify` overrides `compile.llm.minify_code_blocks = false` and the
+document-level `minify_code = false` from frontmatter.
+
+## Per-block opt-out
+
+```rust @nominify
+fn add(a: i32, b: i32) -> i32 {
+    // Adds two numbers.
+    a + b
+}
+```
+
+Use `@nominify` when the formatting itself is the lesson — pretty-printed
+JSON in a "how to format your config" page, indented Rust in a "writing
+readable code" guide. The block is emitted exactly as written.
+
+## Per-language preservation rules
+
+Each minifier respects its language's lexical structure:
+
+@dl
+JS / TS
+: Newlines preserved; ASI behavior would otherwise change. The minifier
+  inserts an explicit `;` before stripping a newline that would have
+  terminated a statement.
+Go
+: Same as JS / TS. Lexical newlines drive automatic semicolon insertion.
+C / C++
+: Newlines around `#`-preprocessor lines are preserved. Collapsing them
+  breaks the preprocessor.
+Rust
+: Raw strings (`r#"..."#`, with arbitrary `#` counts), byte strings, and
+  the fact that block comments *nest* are all handled.
+Java
+: Block comments do *not* nest. Annotations (`@Override`, etc.) are
+  tokens, not comments — preserved.
+SQL
+: Whitespace stripped. Keyword case is left alone.
+JSON / JSONL
+: Single-line for JSON. JSONL minifies each line independently; empty
+  lines and lines that fail to parse fall back to verbatim with a
+  warning.
+@end
+
+## Correctness
+
+Minification is *semantically lossless*. Each minifier passes a property
+test:
+
+```text
+parse → minify → re-parse  ⇒  AST equal
+```
+
+If a minifier cannot guarantee this for a given input, it falls back to
+verbatim and emits @ec[B0701]. Emitting silently broken code to an LLM is
+worse than emitting verbose code.
+
+## Reference-destruction warning
+
+A fenced block longer than 50 source lines that gets minified emits
+@ec[B0702] *"minified code block was originally many lines; LLM consumers
+cannot reference specific lines"* once.
+
+This is a warning, not an error. Suppress with `--allow B0702` if your
+prompt does not depend on line references inside code samples. Keep it on
+if your prompt asks the LLM to "look at line 12" — minification deletes
+that addressability.
+
+## Configuration knobs
+
+`brief.toml`:
+
+```toml
+[compile.llm]
+minify_code_blocks = true
+minify_languages = ["json", "jsonl", "rust", "go"]
+preserve_code_fences = true
+```
+
+@dl
+minify_code_blocks
+: Master switch. Default true. When false, all blocks are verbatim.
+minify_languages
+: Allowlist. The compiler refuses to minify languages not in this list,
+  even if a built-in minifier exists for them. Lets users gate which
+  languages are minified per project.
+preserve_code_fences
+: Default true. When false, fences are dropped from minified blocks in
+  LLM output. Saves a few tokens per block; loses the structural cue
+  that the LLM is looking at code.
+@end
+
+## Cost savings
+
+Empirical measurements on the project's own corpus:
+
+@t
+| Document shape | Token reduction (LLM mode vs. Markdown)
+| Prose-heavy | around 20 percent
+| Mixed prose + tables | around 25 percent
+| JSON-heavy | over 50 percent
+
+JSON-heavy documents get the largest win because Brief is the only Markdown
+replacement that ships JSON minification by default. The reduction is
+durable: the Markdown ecosystem cannot ship this without breaking changes
+to renderer behavior.

@@ -1,0 +1,68 @@
+# Comments
+
+@lede
+Two comment forms, both stripped before any output. Brief refuses to put
+comments inside text.
+@end
+
+## Line comments
+
+A line comment starts with `//` and must occupy the entire line.
+
+```brief
+// This is a line comment.
+// It will not appear in any output.
+The next paragraph starts here.
+```
+
+Inline trailing comments do *not* exist. `paragraph text // comment` is a
+literal paragraph; the `//` is text. This is intentional — restricting
+comments to whole lines keeps the parser context-free.
+
+## Block comments
+
+Block comments use C-style `/* */` delimiters and may span multiple lines.
+
+```brief
+/*
+This is a block comment.
+It can span as many lines as it needs.
+*/
+```
+
+Rules:
+
+- Block comments cannot nest.
+- The opening `/*` must appear at the start of a line, end of a line, or
+  on its own line.
+- The closing `*/` must appear at the start of a line, end of a line, or
+  on its own line.
+- A block comment in the middle of a paragraph is a compile error.
+
+## What gets stripped
+
+Comments are removed during the AST build phase. They do not appear in:
+
+- HTML output.
+- LLM output.
+- JSON-AST output (the AST does not have comment nodes).
+
+## When to use what
+
+@dl
+Line comments
+: For one-shot annotations, TODO markers, and short context. The
+  Markdown converter emits `// TODO[B-hole:...]` lines for constructs it
+  could not translate cleanly.
+Block comments
+: For temporarily removing chunks of text — drafts, deprecated sections,
+  scratch notes — without deleting the source.
+@end
+
+## Why no inline comments
+
+Inline trailing comments would force the parser to track "is this `//` at
+column 47 inside a code span, inside an emphasis, inside a shortcode body,
+or inside plain text?" That kind of context-sensitivity is exactly what
+Brief refuses elsewhere; allowing it for comments alone would be
+inconsistent. Whole-line comments cost nothing and remove the question.

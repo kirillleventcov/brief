@@ -1,0 +1,133 @@
+# Command-line interface
+
+@lede
+Two binaries: `brief` (the compiler) and `brief-web` (the static-site
+generator). Everything else lives behind a subcommand.
+@end
+
+## `brief`
+
+The compiler. Subcommands: `compile`, `convert`, `explain`.
+
+### `brief compile`
+
+Compile a `.brf` file to one of three targets.
+
+```bash
+brief compile <file.brf> --target=<html|llm|json> [options]
+```
+
+Options:
+
+@dl
+--target=html | llm | json
+: The output format. Default is `html`, override in `brief.toml` with
+  `compile.default_target`.
+-w, --write
+: Write the output to a file next to the source. `.brf` becomes `.html`,
+  `.txt`, or `.json` depending on the target.
+-o, --output PATH
+: Write to a specific path. Mutually exclusive with `-w`.
+--report-tokens
+: Only valid with `--target=llm`. Prints a stderr line with the cl100k
+  character/token estimate of the output.
+--strip-emphasis
+: LLM target only. Drop emphasis markers entirely; text content survives.
+--keep-asset-urls
+: LLM target only. Preserve image URLs in `@image` rendering. Default is
+  to drop them (the alt text alone reaches the LLM).
+--keep-table-rule
+: LLM target only. Emit a `|---|` line under table headers. Default
+  omits it to save tokens.
+--keep-metadata
+: LLM target only. Emit frontmatter as-is rather than stripping it.
+@end
+
+Exit codes:
+
+- `0` — success.
+- `1` — one or more compile errors. Diagnostics go to `stderr`.
+
+### `brief convert`
+
+Convert a Markdown document to Brief.
+
+```bash
+brief convert notes.md                      # writes notes.brf
+brief convert notes.md -o renamed.brf       # rename single output
+brief convert notes.md --stdout             # pipe to stdout
+brief convert *.md                          # batch
+```
+
+The converter is *lossy by design*. Constructs without a clean Brief
+equivalent are flagged as design holes — written to stderr and inserted
+into the output as `// TODO[B-hole:...]` comments. Inline HTML, raw HTML
+blocks, and YAML frontmatter are the most common holes.
+
+Per-file failures in batch mode do not abort the run; each file is
+converted independently.
+
+### `brief explain`
+
+Print the long-form explanation of an error code.
+
+```bash
+brief explain B0204
+```
+
+Output is the rule, why it exists, a worked example of the error, and a
+worked example of the fix. See @ref[reference/error-codes.brf](Error code registry)
+for the full list.
+
+## `brief-web`
+
+The static-site generator. Subcommands: `init`, `build`, `serve`.
+
+### `brief-web init`
+
+Scaffold a new project.
+
+```bash
+brief-web init my-site            # single-page mode (just index.brf)
+brief-web init my-site --multi    # multi-page mode (with SUMMARY.brf)
+brief-web init my-site --force    # overwrite existing files
+```
+
+### `brief-web build`
+
+One-shot build. Reads `book.toml`, walks `src/`, writes `dist/`.
+
+```bash
+brief-web build                # build the project in the current directory
+brief-web build path/to/site   # build a specific project
+```
+
+The previous `dist/` contents are cleared before each build.
+
+### `brief-web serve`
+
+Build, then run a development HTTP server with file watching.
+
+```bash
+brief-web serve                              # default: 127.0.0.1:3000
+brief-web serve --host 0.0.0.0 --port 8080
+brief-web serve --no-watch                   # one-shot serve, no live reload
+```
+
+A tiny client is injected into every served page. It listens to a
+Server-Sent-Events stream at `/__brief_web_events` and reloads the page
+when the build finishes. No WebSockets, no polling.
+
+## Common patterns
+
+```bash
+# Render and budget a prompt.
+brief compile prompt.brf --target=llm --report-tokens > prompt.txt
+
+# Round-trip a Markdown document.
+brief convert notes.md && brief compile notes.brf --target=html -w
+
+# Live-edit a docs site.
+brief-web serve docs/ &
+$EDITOR docs/src/some-page.brf
+```

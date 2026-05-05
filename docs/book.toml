@@ -1,0 +1,88 @@
+[book]
+title       = "Brief"
+description = "A strict markup language for documents written by humans and consumed by humans and LLMs."
+authors     = ["Kirill Leventcov"]
+
+[build]
+src = "src"
+out = "dist"
+
+[site]
+base_url = "/"
+theme    = "theme"
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+# ---- Custom shortcodes for the docs site ----------------------------------
+
+# A single hero block on the landing page.
+[shortcodes.hero]
+kind = "block"
+template_html = "<section class=\"hero\"><div class=\"hero-inner\">{{content}}</div></section>"
+template_llm  = "{{content}}"
+
+# A grid of feature cards (call inside @hero or as its own section).
+[shortcodes.features]
+kind = "block"
+template_html = "<section class=\"features\"><div class=\"features-grid\">{{content}}</div></section>"
+template_llm  = "{{content}}"
+
+# One feature card.
+[shortcodes.feature]
+kind = "block"
+arguments = { title = { type = "string", required = true } }
+template_html = "<article class=\"feature\"><h3 class=\"feature-title\">{{args.title}}</h3><div class=\"feature-body\">{{content}}</div></article>"
+template_llm  = "### {{args.title}}\n{{content}}"
+
+# Two-column compare block (e.g. Markdown vs Brief).
+[shortcodes.compare]
+kind = "block"
+template_html = "<section class=\"compare\"><div class=\"compare-grid\">{{content}}</div></section>"
+template_llm  = "{{content}}"
+
+# One column inside @compare.
+[shortcodes.col]
+kind = "block"
+arguments = { label = { type = "string", required = true } }
+template_html = "<div class=\"compare-col\"><div class=\"compare-label\">{{args.label}}</div>{{content}}</div>"
+template_llm  = "**{{args.label}}**\n{{content}}"
+
+# Stylized rustc-shaped diagnostic block.
+[shortcodes.diagnostic]
+kind = "block"
+template_html = "<aside class=\"diagnostic\">{{content}}</aside>"
+template_llm  = "{{content}}"
+
+# Pill-style call-to-action button (used in landing).
+[shortcodes.cta]
+kind = "inline"
+arguments = { href = { type = "string", required = true }, kind = { type = "string", required = true, oneof = ["primary", "secondary"] } }
+template_html = "<a class=\"cta cta-{{args.kind}}\" href=\"{{args.href}}\">{{content}}</a>"
+template_llm  = "[{{content}}]({{args.href}})"
+
+# Card grid for the "browse by topic" section on the landing page.
+[shortcodes.cards]
+kind = "block"
+template_html = "<section class=\"cards\"><div class=\"cards-grid\">{{content}}</div></section>"
+template_llm  = "{{content}}"
+
+# One card with a heading and a link.
+[shortcodes.card]
+kind = "block"
+arguments = { title = { type = "string", required = true }, href = { type = "string", required = true } }
+template_html = "<a class=\"card\" href=\"{{args.href}}\"><h3 class=\"card-title\">{{args.title}}</h3><div class=\"card-body\">{{content}}</div></a>"
+template_llm  = "### {{args.title}}\n{{content}}"
+
+# A small inline error-code badge: @ec[B0204]
+[shortcodes.ec]
+kind = "inline"
+template_html = "<code class=\"ec\">{{content}}</code>"
+template_llm  = "{{content}}"
+
+# A wide pre-formatted "lede" paragraph beneath an H1.
+[shortcodes.lede]
+kind = "block"
+template_html = "<div class=\"lede\">{{content}}</div>"
+template_llm  = "{{content}}"

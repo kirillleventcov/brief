@@ -1,0 +1,100 @@
+# Markdown converter
+
+@lede
+`brief convert` turns Markdown into Brief. Lossy by design; gaps are
+documented as you go.
+@end
+
+## The command
+
+```bash
+brief convert notes.md                      # writes notes.brf next to input
+brief convert notes.md -o renamed.brf       # rename single output
+brief convert notes.md --stdout             # pipe to stdout
+brief convert *.md                          # batch; per-file failures don't abort
+```
+
+Per-file failures in batch mode do not abort the run. Each file is
+converted independently.
+
+## What translates cleanly
+
+@t
+| Markdown | Brief
+| `# H1` through `###### H6` | `# H1` through `###### H6`
+| `**bold**` | `*bold*`
+| `*italic*` or `_italic_` | `_italic_`
+| `~~strikethrough~~` | `~strikethrough~`
+| `` `code` `` | `` `code` ``
+| Triple-backtick fences | Triple-backtick fences (untouched)
+| `- item` / `* item` / `+ item` | `- item`
+| `1. item` (any starting number) | `1. item` (renumbered to start at 1)
+| Tables | `@t` block with `align: [...]` if alignment is present
+| Blockquotes | `> ...`
+
+## What's a "design hole"
+
+Constructs without a clean Brief equivalent. The converter:
+
+1. Emits a warning to stderr describing the hole.
+2. Writes a `// TODO[B-hole:<kind>]` line at the source location, so the
+   hole stays greppable in the converted corpus.
+
+Common holes:
+
+@dl
+Inline HTML
+: Tags like `<img>`, `<a target="_blank">`, `<div class="...">`. The
+  converter does not auto-rewrite — the user decides whether to register
+  a custom shortcode (`@image`, `@link`) or to drop the inline.
+HTML blocks
+: A standalone `<div>...</div>` paragraph. The converter writes a TODO
+  line; auto-converting arbitrary HTML is a trap.
+YAML frontmatter
+: `---` ... `---` at the top of a file. Frontmatter exists in Brief but
+  uses TOML inside `+++` delimiters. The converter writes a TODO
+  referencing the original frontmatter content.
+Wikilinks
+: `[[Page]]` syntax. Out of scope for the language; if a docs platform
+  built on Brief wants this, it should add a shortcode (e.g. `@wiki[Page]`).
+GFM emoji
+: `:smile:`. Use plain Unicode. The converter passes through verbatim.
+@end
+
+## What gets canonicalized
+
+The converter normalizes constructs that have multiple valid Markdown
+spellings to Brief's single canonical form:
+
+- Setext headings (`===` and `---` underlines) become `#`-prefixed
+  headings.
+- `*` and `+` unordered list markers become `-`.
+- Out-of-order ordered list numbering is renumbered to start at 1.
+- Reference-style links become `@link[text](url)`.
+
+## What gets transformed
+
+@t
+| Markdown | Brief
+| `[text](url)` | `@link[text](url)`
+| `![alt](src)` | `@image(src: "src", alt: "alt")[]`
+| `<kbd>X</kbd>` | `@kbd[X]`
+| `<sub>2</sub>` | `@sub[2]`
+| `<sup>2</sup>` | `@sup[2]`
+| GFM `> [!NOTE]` blocks | `@callout(kind: note) ... @end`
+| `- [x] done` | `- [x] done` (passes through)
+
+## When to hand-edit instead
+
+For best results, hand re-write Markdown to Brief. The converter is for
+quick wins on a corpus with mostly clean Markdown. A document that leans
+heavily on inline HTML, custom HTML blocks, or YAML frontmatter will
+need targeted edits anyway — converting first and patching second is
+usually faster than rewriting from scratch, but only just.
+
+## Round-trip claim
+
+The converter does *not* round-trip. There is no `brief convert
+--reverse` to turn Brief back into Markdown, and there will not be one.
+Brief is the canonical form; Markdown is the legacy format you are
+moving away from.

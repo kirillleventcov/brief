@@ -1,0 +1,105 @@
+# Your first document
+
+@lede
+Write a `.brf` file. Compile it. Read the output. That is the loop.
+@end
+
+## A minimum file
+
+Save the following as `notes.brf`:
+
+```brief
+# Quarterly notes
+
+The team delivered *strong* numbers, with _revenue_ up 23 percent.
+
+- shipped the v0.4 release
+- closed the old auth refactor
+- backlog: error message rewrite
+
+@callout(kind: tip)
+Press @kbd[Ctrl+C] to abort the long-running build.
+@end
+```
+
+That is a complete, valid Brief document. Five constructs are at play —
+heading, paragraph with emphasis, unordered list, block callout, inline
+keyboard input.
+
+## Compile it
+
+```bash
+brief compile notes.brf --target=html
+```
+
+By default the rendering goes to `stdout`. Pipe it to a file or pass `-w`
+to write next to the source:
+
+```bash
+brief compile notes.brf --target=html -w           # writes notes.html
+brief compile notes.brf --target=html -o out.html  # explicit path
+```
+
+The same source compiles for an LLM:
+
+```bash
+brief compile notes.brf --target=llm -w            # writes notes.txt
+brief compile notes.brf --target=llm --report-tokens
+```
+
+`--report-tokens` adds a stderr line with the cl100k character/token
+estimate, useful for budgeting LLM prompts.
+
+## What the compiler enforces
+
+Try changing `*strong*` to `**strong**`. Recompile:
+
+@diagnostic
+```text
+error[B0206]: doubled emphasis markers are not valid; use a single marker
+  --> notes.brf:3:21
+   |
+ 3 | The team delivered **strong** numbers, with _revenue_ up 23 percent.
+   |                    ^^ use a single `*` on each side
+   |
+   = help: Brief uses one marker per side. Doubled markers are reserved
+           for diagnostic clarity, not as a second emphasis style.
+```
+@end
+
+This is the entire ethos. Ambiguous input is a compile error, with a span
+and a code. Run `brief explain B0206` for the long form.
+
+## A first project
+
+A project is a directory with a `brief.toml` at its root. Most useful
+features — custom shortcodes, cross-document `@ref` links, the formatter's
+defaults — read configuration from there.
+
+```bash
+mkdir my-project
+cd my-project
+cat > brief.toml <<'EOF'
+[project]
+name = "my-project"
+
+[compile]
+default_target = "html"
+EOF
+echo '# Hello' > index.brf
+brief compile index.brf --target=html -w
+```
+
+You now have a project. Adding more `.brf` files, or registering custom
+shortcodes in `brief.toml`, is incremental from here.
+
+## Next
+
+@cards
+@card(title: "Compile targets", href: "/getting-started/compile-targets.html")
+HTML, LLM, and JSON-AST. When to reach for which.
+@end
+@card(title: "brief.toml reference", href: "/reference/brief-toml.html")
+Every key the compiler reads.
+@end
+@end

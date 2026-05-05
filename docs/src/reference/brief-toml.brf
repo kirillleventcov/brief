@@ -1,0 +1,135 @@
+# brief.toml
+
+@lede
+The project-level configuration file. Declares custom shortcodes, sets
+strictness flags, and points at templates.
+@end
+
+A `brief.toml` at the project root tells the compiler this directory is a
+Brief project. Cross-document references (`@ref`) resolve relative to the
+nearest `brief.toml`. Without one, every `@ref` is @ec[B0604].
+
+## A worked example
+
+```toml
+[project]
+name = "my-docs"
+version = "0.1.0"
+
+[compile]
+strict_heading_levels = true
+default_target = "html"
+
+[compile.llm]
+minify_code_blocks = true
+minify_languages = ["json", "jsonl"]
+preserve_code_fences = true
+
+[shortcodes.note]
+kind = "block"
+template_html = "<aside class=\"note\">{{content}}</aside>"
+template_llm  = "[note] {{content}} [/note]"
+
+[shortcodes.callout]
+kind = "block"
+arguments = { kind = { type = "string", required = true,
+  oneof = ["note", "tip", "important", "warning", "caution"] } }
+template_html = "templates/callout.html"
+```
+
+## Sections
+
+### `[project]`
+
+@dl
+name
+: Required. Free-form string. Used in error messages and the project index.
+version
+: Optional. SemVer string. Reserved for conformance reports; the
+  compiler does not consume it today.
+@end
+
+### `[compile]`
+
+@dl
+default_target
+: One of `html`, `llm`, `json`. Used when `brief compile` is run without
+  `--target`.
+strict_heading_levels
+: Boolean. When true, skipping heading levels (e.g., `##` → `####`) is
+  @ec[B0503]. Default false.
+@end
+
+### `[compile.llm]`
+
+LLM-mode-specific knobs:
+
+@dl
+minify_code_blocks
+: Boolean, default true. Master switch for code-block minification.
+minify_languages
+: Array of language tags. Default is the languages the compiler has a
+  built-in minifier for. Forcing `python` or `yaml` here does nothing —
+  they are hardcoded refused (@ec[B0704]).
+preserve_code_fences
+: Boolean, default true. When false, fences are dropped from minified
+  blocks in LLM output. Saves a few tokens; loses structural cues.
+@end
+
+### `[shortcodes.<name>]`
+
+Each entry registers one shortcode under that name. Fields:
+
+@dl
+kind
+: Required. One of `inline`, `block`, or `both`.
+arguments
+: Optional. A table of argument specs. Each spec has `type` (one of
+  `string`, `int`, `ident`, `array`), an optional `required` boolean,
+  an optional `position` integer (for positional arguments), and an
+  optional `oneof` array (for enum-constrained string values).
+template_html
+: Either an inline string or a path to a template file. Mustache-style
+  with `{{content}}` and `{{args.<name>}}` placeholders.
+template_llm
+: Same as `template_html`, used when the compile target is `llm`.
+@end
+
+## Templates
+
+Templates are *minimal* mustache. Placeholders only:
+
+- `{{content}}` — the rendered children of the shortcode.
+- `{{args.<name>}}` — the value of an argument by name.
+
+There are no conditionals, no loops, no embedded code. Logic that wants
+those belongs in a custom shortcode that wraps the conditional content,
+not in the template itself.
+
+## Hooks
+
+Hooks are external programs invoked before or after compilation:
+
+```toml
+[hooks]
+before_compile = ["scripts/lint.sh"]
+after_compile  = ["scripts/upload.sh"]
+```
+
+Hooks receive the source path on stdin or as `argv[1]`. A non-zero exit
+from a `before_compile` hook aborts compilation.
+
+## Where the compiler looks
+
+The compiler walks up from the source file's directory until it finds a
+`brief.toml`. That file's directory is the project root; cross-document
+`@ref` paths are rooted there. If no `brief.toml` is found, the compiler
+runs in standalone mode — every feature works *except* `@ref`.
+
+## What's separate: `book.toml`
+
+`brief-web` reads its own configuration file (`book.toml`) for site
+title, theme, server port, and site-scoped shortcodes. The two files
+coexist — `brief.toml` is the language layer, `book.toml` is the site
+layer. Shortcodes registered in `book.toml` extend (do not replace) those
+registered in `brief.toml`.

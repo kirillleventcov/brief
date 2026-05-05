@@ -1,0 +1,123 @@
+# Shortcodes
+
+@lede
+The single extension point for the language. They replace inline HTML.
+Two forms, registered names, validated arguments.
+@end
+
+## The two forms
+
+@dl
+Inline
+: `@name(args)[content]` — appears inside a paragraph, heading, list item,
+  table cell, or other inline context.
+Block
+: `@name(args)` ... `@end` — opens on its own line, has a body parsed as
+  full blocks (recursively), closes with `@end` on its own line at the
+  same indentation.
+@end
+
+## Inline form
+
+```brief
+See @link[the spec](https://example.com/brief) for details.
+Press @kbd[Ctrl+C] to abort.
+The energy is @math[E = m c^2].
+```
+
+The `[...]` body is parsed as inline content. Argument syntax is in §3
+below.
+
+## Block form
+
+```brief
+@callout(kind: warning)
+Watch out for @kbd[Shift+Delete] on Linux. It can wipe data without going
+through the trash.
+@end
+```
+
+Block bodies parse recursively — a callout can contain paragraphs, lists,
+nested blocks, and other shortcodes.
+
+## Argument syntax
+
+Arguments inside `(...)` are positional or keyword. Mixed usage is
+allowed, with positionals first:
+
+```brief
+@callout(kind: warning)
+@image(src: "diagram.png", alt: "architecture diagram")[]
+@link[GitHub](https://github.com/kirillleventcov/brief)
+```
+
+Argument values are one of:
+
+- Bare identifiers: `kind: warning`
+- Integers: `width: 800`
+- Quoted strings: `src: "diagram.png"`
+- Arrays: `align: [left, right, center]`
+
+The compiler validates each invocation against the registered shortcode:
+required arguments, types, allowed values (the `oneof` constraint). A
+type mismatch is @ec[B0402]; a required-argument omission is @ec[B0403];
+a `oneof` violation is @ec[B0404].
+
+## Registration
+
+All shortcodes must be registered. Using an unregistered name is @ec[B0401].
+
+The reference compiler ships @ref[reference/built-in-shortcodes.brf](built-ins)
+covering links, images, keyboard input, sub/superscript, collapsible
+details, callouts, math, footnotes, definition lists, tables, code, and
+cross-document references.
+
+User-defined shortcodes live in `brief.toml`:
+
+```toml
+[shortcodes.note]
+kind = "block"
+template_html = "<aside class=\"note\">{{content}}</aside>"
+template_llm  = "[note] {{content}} [/note]"
+```
+
+See @ref[reference/brief-toml.brf](brief.toml) for the full
+configuration grammar.
+
+## Self-terminating shortcodes
+
+Two shortcodes do not require `@end`:
+
+- `@t` (tables) — terminates at the first non-`|` line.
+- The triple-backtick code fence — terminates at its closing fence.
+
+User-defined shortcodes can *never* be self-terminating. The restriction
+is permanent.
+
+## Why no inline HTML
+
+A markup language whose extension story is "drop in arbitrary HTML"
+trades determinism for flexibility, and Brief is an explicit refusal of
+that trade. Shortcodes give the same flexibility under structural
+constraints: the parser stays context-free, the AST stays clean, and
+non-HTML targets (LLM, JSON-AST) get a real translation, not a
+passthrough.
+
+## A note on the `[content]` body
+
+Inline shortcodes have a *single-line* `[content]` body. A line break
+inside `[...]` is invalid. If you need block content, use the block form.
+
+## In LLM mode
+
+Shortcodes render via their `template_llm` if registered, or to a compact
+default if not. Some examples:
+
+@t
+| Source | LLM-mode output
+| `@link[text](url)` | `[text](url)`
+| `@image(src, alt)` | `[image: alt]`
+| `@callout(kind: warning) ... @end` | `[!warning] ... [/!]`
+| `@math[x^2]` | `$x^2$`
+| `@footnote[body]` | `[^1]` inline; definition appended at end
+| `@ref[path#anchor](text)` | `text` — the link target is dropped

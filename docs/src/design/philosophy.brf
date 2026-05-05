@@ -1,0 +1,133 @@
+# Philosophy
+
+@lede
+Brief is a refusal. Not of Markdown — of what Markdown became after
+twenty years of accreted dialects.
+@end
+
+## The problem Markdown solved, briefly
+
+Markdown's original 2004 design was elegant: plain-text input, easy to
+read in a terminal, renders to HTML. It became the lingua franca of
+README files, Stack Overflow answers, and every chat tool with a code
+block button.
+
+That elegance came from *forgivingness*. The parser would accept almost
+any input and produce a best-effort rendering. For its original use case
+— individual humans writing short documents — this was correct.
+
+## The problem Markdown introduced
+
+Forgivingness compounds badly across:
+
+@dl
+Multiple renderers
+: GitHub-Flavored Markdown, CommonMark, MultiMarkdown, Discord's flavor,
+  Slack's flavor, Notion's variant. The same source produces different
+  output depending on the consumer. There is no single Markdown.
+Long documents
+: A 100-page book in Markdown collects a long tail of "this looks fine
+  but renders weird in some renderers" bugs. The forgiveness that helped
+  short documents now hurts.
+LLM consumers
+: Every token costs money. Forgiving parsers preserve typographic noise
+  the model has to weigh equally with semantic content. There is no
+  affordance for "this is a prompt; squeeze it."
+Tooling
+: Without strict syntax, every tool reimplements the parser, and every
+  tool has its own bugs. There is no canonical AST to share.
+@end
+
+The story of Markdown's success is a story of network effects winning
+over correctness. Brief is an attempt to take the second turn.
+
+## The design rules
+
+@features
+@feature(title: "One way to do it")
+Every construct has a single canonical spelling. If two surface forms
+produce the same AST, only one is legal. The compiler refuses ambiguous
+input rather than guessing.
+@end
+
+@feature(title: "Errors over guesses")
+When input is ambiguous, the compiler emits an error with a span and a
+code. It never silently picks a winner. There is no `--allow-warnings`
+flag.
+@end
+
+@feature(title: "Tokens are a first-class cost")
+Source-level brevity wins over visual symmetry where the two conflict.
+The LLM target is part of the compiler, not bolted on.
+@end
+
+@feature(title: "No inline HTML, ever")
+Extension goes through the shortcode system. The parser stays
+context-free; non-HTML targets get a real translation, not a
+passthrough.
+@end
+@end
+
+## What this means in practice
+
+A markup language whose extension story is "drop in arbitrary HTML"
+trades determinism for flexibility. Brief makes the opposite trade.
+Every shortcode is registered, every argument is typed, every output
+target gets its own template.
+
+A markup language whose error model is "warnings" trades correctness for
+convenience. Brief makes the opposite trade. Every diagnostic is an
+error; the compiler has two outcomes (success or failure); the formatter
+fixes most "warnings" automatically.
+
+A markup language whose AST is "whatever pulldown-cmark returned this
+release" trades stability for shipping speed. Brief makes the opposite
+trade. The grammar is small, the AST is published, and the compiler
+emits stable spans into both.
+
+## Compared to other strict languages
+
+Brief is closest in spirit to *gofmt*, *Black*, and *rustc*: there is one
+canonical form, and the compiler tells you when you've drifted. It is
+*not* close in spirit to LaTeX (heavy syntax, Turing-complete macros) or
+restructured text (rich grammar, multiple renderers).
+
+The shortcode system is the explicit acknowledgment that *some*
+extension is necessary. The constraint is that extensions are
+*registered*, *validated*, and have *templates per target*. Anything
+less and we are back to inline HTML.
+
+## What we lose
+
+Brief is more verbose than Markdown for some constructs (callouts,
+images). It refuses input that "obviously means" something a forgiving
+parser would render. It requires a `brief.toml` for cross-document
+references. It has a learning curve, where Markdown has none.
+
+These are trades, not bugs. If you measure "minutes to get a single
+short document rendered," Brief loses to Markdown. If you measure
+"minutes spent across the lifetime of a corpus understanding why two
+renderers disagree on the same source," Brief is the cheaper option.
+
+## What we gain
+
+@dl
+Determinism
+: The same source always produces the same output. Across renderers,
+  across compiler versions, across machines.
+A real diagnostic story
+: Errors with spans and codes that you can grep, file as bugs, and fix
+  systematically. `brief explain B0204` instead of "the rendering
+  looked wrong."
+Token economy
+: An LLM-mode rendering that is part of the compiler, not bolted on.
+  Real measurement, real budgeting.
+A small AST
+: Tooling that wants to operate on Brief documents has a stable,
+  published AST. No "but which Markdown dialect" question.
+@end
+
+## Status
+
+The grammar is stable. The compiler ships what is documented on this
+site; anything beyond that is unstable.

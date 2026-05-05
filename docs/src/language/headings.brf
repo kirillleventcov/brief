@@ -1,0 +1,69 @@
+# Headings
+
+@lede
+Six levels of `#`-prefixed headings. No setext form. No HTML escape hatch.
+@end
+
+## The six levels
+
+```brief
+# Heading level 1
+## Heading level 2
+### Heading level 3
+#### Heading level 4
+##### Heading level 5
+###### Heading level 6
+```
+
+Levels 1 through 6 are valid. Seven or more `#` characters is @ec[B0301]
+*"heading level exceeds maximum of 6"*. Missing the space after the
+`#` run is @ec[B0302].
+
+## The strict rules
+
+- Exactly one space between the `#` run and the heading text.
+- Setext-style headings (`===` and `---` underlines) are *not* supported.
+- Multiple spaces, zero spaces, or no text after the `#` run are all
+  errors.
+- Heading text is parsed as inline content — emphasis, inline code, and
+  inline shortcodes work inside it.
+
+@callout(kind: note)
+The "monotonic heading levels" rule is configurable. Set
+`compile.strict_heading_levels = true` in `brief.toml` to forbid skipping
+levels (e.g., going straight from `##` to `####`).
+@end
+
+## Heading anchors
+
+A heading line may end with an explicit anchor:
+
+```brief
+## My section {#my-anchor}
+```
+
+Rules:
+
+- The anchor is optional.
+- If present, it must be the last thing on the line.
+- The identifier matches `[a-z0-9-]+` and must be unique within the
+  document (duplicates are a compile error).
+- Exactly one space between the heading text and the `{`.
+
+Anchors are required by `@ref` for cross-document section links — see
+@ref[language/shortcodes.brf](Shortcodes) for the syntax.
+
+## Inline content inside headings
+
+```brief
+## The `printf` function and *why it matters*
+```
+
+Renders the same way it would in a paragraph: `printf` becomes inline code,
+"why it matters" becomes bold.
+
+## In LLM mode
+
+Heading sigils are preserved. LLMs use them as structural cues, and
+stripping them would lose hierarchy without saving useful tokens. Anchors
+are stripped — they are structural metadata, not content.

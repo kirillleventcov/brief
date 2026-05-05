@@ -1,0 +1,112 @@
+# LLM mode
+
+@lede
+A deterministic, token-minimized rendering of a Brief document, intended
+for inclusion in LLM prompts.
+@end
+
+## Why a separate target
+
+A document for human readers is not the same artifact as a document for
+an LLM consumer. Humans benefit from generous whitespace, decorative
+syntax, and stable formatting. LLMs pay for every token and benefit from
+density.
+
+Markdown's response is "render it the same way and let the LLM cope."
+Brief's response is to compile the same source twice, once for each
+audience, and to make the LLM-mode rendering the durable advantage.
+
+```bash
+brief compile doc.brf --target=llm
+brief compile doc.brf --target=llm --report-tokens
+brief compile doc.brf --target=llm -w        # writes doc.txt
+```
+
+## Transformation rules
+
+The reference compiler applies the following rules in `--target=llm`:
+
+@dl
+Comments
+: Stripped entirely. Both `//` and `/* */` forms.
+Blank lines
+: Collapsed to a single newline.
+Trailing whitespace
+: Stripped on every line.
+Indentation
+: Normalized to one space per nesting level (instead of the source's
+  two spaces).
+Heading sigils
+: Preserved. LLMs use them as structural cues.
+Emphasis markers
+: Preserved by default. `--strip-emphasis` removes them; text content
+  survives.
+Tables
+: Compact pipe form. Header row is followed by `|---|` *only* if
+  `--keep-table-rule` is passed.
+Code blocks
+: Verbatim, fences preserved — except for languages in the
+  minification allowlist. See @ref[llm-mode/code-minification.brf](Code-block minification).
+Shortcodes
+: Render via `template_llm` if defined, or to a compact built-in form.
+Backslash escapes
+: Resolved to their literal characters.
+Frontmatter
+: Stripped by default. `--keep-metadata` overrides.
+@end
+
+## Built-in shortcode renderings
+
+@t
+| Source | LLM-mode output
+| `@link[text](url)` | `[text](url)`
+| `@image(src, alt)` | `[image: alt]`
+| `@kbd[Ctrl+C]` | `Ctrl+C`
+| `@callout(kind: warning) ... @end` | `[!warning] ... [/!]`
+| `@math[x^2]` | `$x^2$`
+| `@footnote[body]` | `[^N]` inline, `[^N]: body` appended at end of doc
+| `@ref[path#anchor](text)` | `text` — the cross-document link is dropped
+| `@sub[2]` | `_2`
+| `@sup[2]` | `^2`
+
+## Determinism
+
+Same input → byte-identical output. The rules above are total: every
+construct has a deterministic LLM-mode rendering. There is no "best
+effort" path.
+
+This matters because it lets you:
+
+- Cache the rendered output and feed it to many model calls.
+- Compare token counts of two phrasings reliably.
+- Diff the rendered prompt across changes to see exactly what the LLM
+  will see differently.
+
+## What LLM mode is not
+
+LLM mode is *lossy by design*. There is no inverse transformation back to
+source. If you want a human-readable artifact, use `--target=html`. If
+you want a machine-readable representation, use `--target=json`.
+
+LLM mode is not stable surface. The compiler may improve token
+efficiency across releases. If you depend on exact byte sequences, pin
+a specific compiler version.
+
+## Reach for it when
+
+@dl
+Building agent prompts
+: A prompt that loads a document into context pays per token on every
+  call. LLM mode is the right rendering.
+Cost-budgeting documentation
+: `--report-tokens` plus a CI gate keeps the cl100k token count within a
+  budget you set for your prompt corpus.
+Round-tripping
+: You don't. LLM mode is one-way. Keep the `.brf` source and re-compile.
+@end
+
+## Avoid it when
+
+The audience is human. The HTML target is faster to read, and "minified"
+prose is hostile to people. LLM mode is *only* worth it when the consumer
+is a model.

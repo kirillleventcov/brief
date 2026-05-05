@@ -1,0 +1,148 @@
+# Brief
+
+@hero
+A strict markup language for documents
+written by humans and consumed by humans _and_ LLMs.
+
+@cta(href: "/getting-started/installation.html", kind: primary)[Get started] @cta(href: "https://github.com/kirillleventcov/brief", kind: secondary)[GitHub]
+@end
+
+@lede
+Brief refuses ambiguity. Every construct has one canonical spelling, every
+error has a code, and every document compiles to a deterministic,
+token-minimized form for LLM prompts.
+@end
+
+## What is Brief?
+
+Brief is a markup language designed to replace Markdown for documents that
+are written by humans and consumed by *both* humans and LLMs. It targets
+three goals that mainstream Markdown does not:
+
+@features
+@feature(title: "One way to do it")
+Every construct has a single canonical spelling. `*bold*`, not `**bold**`.
+`-` for bullets, never `*` or `+`. Two surface forms for the same AST is a
+compile error.
+@end
+
+@feature(title: "Compiler-time errors")
+Ambiguous input is a compile error with a source span and an error code, in
+the style of `rustc`. There are no warnings — just success or failure.
+@end
+
+@feature(title: "Token economy")
+`brief compile doc.brf --target=llm` produces a deterministic,
+token-minimized rendering for LLM prompts. JSON code blocks minify by
+default; more languages follow.
+@end
+
+@feature(title: "No inline HTML")
+The single extension point is registered shortcodes. They cover what inline
+HTML used to. Anything else means the document shouldn't be HTML in the
+first place.
+@end
+@end
+
+## A quick taste
+
+```brief
+# Release notes
+
+The 0.4 release ships *strict* lists, _italic_ that doesn't fight you,
+and a real compiler.
+
+- [x] ship v0.4
+- [ ] write release notes
+- plain bullet, not a task
+
+@callout(kind: tip)
+Press @kbd[Ctrl+C] to abort the long-running compile.
+@end
+
+Some claim Brief saves tokens.@footnote[Measured against Markdown
+on the project's own docs, roughly 25 percent on average.] The
+compiler can prove it.
+```
+
+That is the language. There are no surprises. The full grammar reference
+is on @ref[language/headings.brf](Headings) and the pages that follow.
+
+## Markdown vs. Brief
+
+Same content, two languages.
+
+@compare
+@col(label: "Markdown")
+```markdown
+# Title
+**bold**, *italic*, ~~strike~~
+- one
+* two
++ three
+```
+@end
+@col(label: "Brief")
+```brief
+# Title
+*bold*, _italic_, ~strike~
+- one
+- two
+- three
+```
+@end
+@end
+
+Brief refuses the second and third bullet markers. Pick one and use it.
+
+## Errors look like rustc
+
+Ambiguous input is a compile error, with a source span and an error code:
+
+@diagnostic
+```text
+error[B0204]: emphasis cannot nest with the same marker
+  --> doc.brf:14:23
+   |
+14 | This is *outer *inner* outer*.
+   |        ^^^^^^^ inner emphasis re-uses the `*` marker
+   |
+   = help: use a different emphasis marker for the inner span,
+           e.g. _outer *inner* outer_
+```
+@end
+
+Run `brief explain B0204` for the long-form explanation of any error code.
+
+## Browse by topic
+
+@cards
+@card(title: "Getting started", href: "/getting-started/installation.html")
+Install the compiler, write your first `.brf`, and compile to HTML or LLM.
+@end
+
+@card(title: "Language reference", href: "/language/headings.html")
+Every block and inline construct, page by page.
+@end
+
+@card(title: "Built-in shortcodes", href: "/reference/built-in-shortcodes.html")
+`@link`, `@callout`, `@kbd`, `@math`, `@ref`, and friends.
+@end
+
+@card(title: "LLM mode", href: "/llm-mode/overview.html")
+The token-minimized rendering for AI prompts. Why it exists, what it does.
+@end
+
+@card(title: "brief-web", href: "/tooling/brief-web.html")
+The static-site generator that built this very site.
+@end
+
+@card(title: "Error codes", href: "/reference/error-codes.html")
+Every diagnostic the compiler can emit, with the rule it enforces.
+@end
+@end
+
+## Status
+
+The grammar is stable. Expect rough edges around tooling — the language
+itself is the safe bet to build on.

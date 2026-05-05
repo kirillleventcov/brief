@@ -1,0 +1,88 @@
+# Compile targets
+
+@lede
+Three targets, three audiences. Same source.
+@end
+
+The `brief compile` command takes a `--target=` flag. The compiler runs
+the same lex / parse / validate pipeline regardless; only the emit phase
+differs.
+
+@t
+| Target | Flag | Audience | Output extension
+| HTML | `--target=html` | Humans, browsers, static sites | `.html`
+| LLM | `--target=llm` | Language models, prompts | `.txt`
+| JSON-AST | `--target=json` | Tooling, linters, transforms | `.json`
+
+The default target is `html` unless `compile.default_target` in
+`brief.toml` overrides it.
+
+## HTML target
+
+The bread-and-butter rendering for human readers and browsers. Emphasis
+becomes `<strong>`, `<em>`, `<u>`, `<s>`. Lists become `<ul>` / `<ol>`.
+Tables become semantic `<table>` markup. Custom shortcodes substitute
+their `template_html`.
+
+```bash
+brief compile doc.brf --target=html              # to stdout
+brief compile doc.brf --target=html -w           # writes doc.html
+brief compile doc.brf --target=html -o out.html  # explicit path
+```
+
+The HTML target is **lossless**. Every Brief construct round-trips into
+HTML; the formatter can reproduce the original source from the AST.
+
+## LLM target
+
+A deterministic, token-minimized rendering intended for inclusion in LLM
+prompts. The transformation rules are listed in @ref[llm-mode/overview.brf](LLM mode);
+the highlights:
+
+- Comments are stripped entirely.
+- Indentation collapses to one space per level.
+- Heading sigils are preserved.
+- Emphasis markers are preserved by default.
+- JSON code blocks minify by default. Other languages minify when their
+  language tag is in the configured allowlist.
+- Custom shortcodes use their `template_llm`.
+- Cross-page `@ref` collapses to its display text — the link target is
+  meaningless in a flattened LLM context.
+
+```bash
+brief compile doc.brf --target=llm -w
+brief compile doc.brf --target=llm --report-tokens
+```
+
+LLM mode is **lossy by design**. The compiler is deterministic — the same
+input always produces the same byte sequence — but you cannot run the
+transformation in reverse.
+
+## JSON-AST target
+
+The parsed document tree, serialized as JSON. Useful when you are writing
+tooling that wants to inspect Brief without re-implementing the parser.
+
+```bash
+brief compile doc.brf --target=json -w
+```
+
+The schema mirrors the AST in the
+@ref[language/headings.brf](language reference) — every block and inline
+node carries its source span (`byte_offset`, `length`) so a downstream tool
+can highlight regions, build cross-references, or check additional rules.
+
+## Token budgeting
+
+`--report-tokens` works on the LLM target only:
+
+```bash
+brief compile doc.brf --target=llm --report-tokens > /dev/null
+brief: doc.brf -> 1,247 chars, ~340 tokens (cl100k estimate)
+```
+
+The estimate is best-effort and not normative. If your downstream
+tokenizer differs from cl100k, treat the number as a relative gauge — it
+will still tell you whether one phrasing saves tokens against another.
+See @ref[llm-mode/token-budgeting.brf](Token budgeting) for measurement
+guidance.

@@ -1,0 +1,57 @@
+# Definition lists
+
+@lede
+Term-definition pairs, expressed as the `@dl` block shortcode.
+@end
+
+## The form
+
+```brief
+@dl
+Term 1
+: Definition of term 1.
+Term 2
+: Definition of term 2, which can
+  span multiple lines via continuation.
+@end
+```
+
+The `:` marker is exact: a colon followed by exactly one space. Two
+spaces, no space, or any other character after the colon is @ec[B0505].
+
+## Live example
+
+@dl
+brief compile
+: Compile a `.brf` file to HTML, LLM, or JSON-AST.
+brief convert
+: Convert a Markdown file to Brief.
+brief explain
+: Print the long-form explanation for an error code.
+brief-web
+: A separate binary — the static-site generator that built this site.
+@end
+
+## Continuation lines
+
+Definition continuations align to the *content column* of the `: ` marker
+— that is, the parent indent plus two spaces:
+
+```brief
+@dl
+Long term
+: First line of definition.
+  Second line, indented to match.
+@end
+```
+
+## What's not supported
+
+Multiple definitions per term. Two `:` lines under one term is @ec[B0505].
+If you need to express this, use a regular bulleted list under each term.
+
+## Why a shortcode, not a top-level block
+
+Definition lists are uncommon enough that adding a new top-level grammar
+construct for them isn't worth the parser complexity. The shortcode form
+keeps the language core small and lets `@dl` evolve independently.

@@ -1,0 +1,37 @@
+# Horizontal rule
+
+@lede
+Exactly three dashes on a line by themselves.
+@end
+
+## The form
+
+```brief
+---
+```
+
+A live example, between this paragraph and the next:
+
+---
+
+That is the entire surface. Two dashes is too few; four dashes is too
+many — both are @ec[B0304].
+
+## Why exactly three
+
+There are five surface forms in common Markdown that mean "horizontal
+rule": `---`, `***`, `___`, `* * *`, `- - -`. Brief picks one (`---`) and
+refuses the rest. The rule is consistent with Brief's broader stance: one
+canonical spelling per construct.
+
+## When to use it
+
+Sparingly. A horizontal rule means "the topic shifts here in a way that a
+heading would not capture." If the next thing is conceptually a new
+section, use a heading. If the content above and below is genuinely
+unrelated, consider whether they belong in the same document.
+
+## In LLM mode
+
+Emitted as a literal `---` line. LLMs read it as a topic break, the same
+way a human reader does.

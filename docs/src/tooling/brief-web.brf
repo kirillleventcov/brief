@@ -1,0 +1,174 @@
+# brief-web
+
+@lede
+The static-site generator for Brief. To Brief what `mdBook` is to
+Markdown — a separate executable, a separate crate, the same compiler.
+@end
+
+## What it is
+
+`brief-web` reads a directory of `.brf` files plus a `book.toml` and
+produces a navigable HTML site. Single-page mode renders one document.
+Multi-page mode renders a `SUMMARY.brf`-driven sidebar of pages.
+
+This site you are reading is built with `brief-web`.
+
+## The three commands
+
+```bash
+brief-web init [PATH]    # scaffold a new project (--multi for multi-page)
+brief-web build [PATH]   # one-shot build into dist/
+brief-web serve [PATH]   # build + live-reload dev server
+```
+
+`PATH` defaults to the current directory.
+
+## A quickstart
+
+```bash
+brief-web init my-site --multi
+cd my-site
+brief-web serve
+# open http://127.0.0.1:3000
+```
+
+The dev server watches `src/`, `book.toml`, and `theme/` (debounced to
+about 150 ms), rebuilds on change, and pushes a reload over a Server-
+Sent-Events stream. The default theme injects a tiny client that listens
+for the event.
+
+## Project layout
+
+```text
+my-site/
+├── book.toml          (site config)
+├── src/
+│   ├── SUMMARY.brf    (optional: presence = multi-page mode)
+│   ├── index.brf
+│   └── chapters/
+│       └── intro.brf
+├── theme/             (optional: overrides built-in theme)
+│   ├── page.html
+│   └── style.css
+└── dist/              (gitignored, build output)
+```
+
+Without `SUMMARY.brf`, `brief-web` runs in single-page mode and renders
+only `src/index.brf`.
+
+## `book.toml`
+
+```toml
+[book]
+title       = "My docs"
+description = "What this site is about."
+authors     = ["You"]
+
+[build]
+src = "src"
+out = "dist"
+
+[site]
+base_url = "/"
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+# Site-scoped shortcodes (extend, do not replace, brief.toml).
+# [shortcodes.tweet]
+# kind = "inline"
+# template_html = "..."
+```
+
+## `SUMMARY.brf`
+
+The file *is* the navigation tree. List items become pages; nested lists
+become nested navigation:
+
+```brief
+# Summary
+
+## Get started
+
+- @ref[introduction.brf](Introduction)
+- @ref[install.brf](Installation)
+
+## Reference
+
+- @ref[grammar.brf](Grammar)
+- @ref[shortcodes.brf](Shortcodes)
+```
+
+Headings at level 2 or higher become section dividers in the sidebar.
+The `# Summary` H1 is ignored.
+
+## Cross-page links: `@ref`
+
+`brief-web` uses Brief's built-in `@ref` shortcode for cross-page links:
+
+```brief
+See @ref[getting-started/install.brf](Installation) for the next step.
+See @ref[reference/grammar.brf#headings](Headings) for the heading rules.
+```
+
+The path is project-relative (rooted at `brief.toml` if present, or the
+build root otherwise). An `#anchor` suffix targets a heading anchor in
+the destination page; missing files or anchors are build errors. See
+@ref[reference/built-in-shortcodes.brf](Built-in shortcodes).
+
+## Themes
+
+`brief-web` ships an embedded default theme (light/dark via
+`prefers-color-scheme`, sticky sidebar, mobile collapse).
+
+To override, drop `theme/page.html` and/or `theme/style.css` into your
+project. The template is mustache-style with these placeholders:
+
+@t
+| Placeholder | Meaning
+| `{{ title }}` | Page title — H1, falling back to SUMMARY title
+| `{{ description }}` | First paragraph, used for `<meta description>`
+| `{{ site_title }}` | `[book].title` from `book.toml`
+| `{{ content }}` | Rendered HTML for the page body
+| `{{ sidebar }}` | Rendered HTML for the navigation sidebar
+| `{{ base_url }}` | `[site].base_url`
+| `{{ stylesheet }}` | URL of `style.css`
+| `{{ reload_script }}` | Live-reload `<script>`; empty during `build`
+
+No conditionals or loops. Logic that wants them belongs in a Brief
+shortcode, not in the template.
+
+## Live reload
+
+`brief-web serve` runs an initial build, starts an HTTP server, and
+watches the project for changes. On change:
+
+1. Rebuild the affected files (in v1 — the whole site).
+2. Push a reload event over the SSE stream at `/__brief_web_events`.
+3. The injected client refreshes the page.
+
+No WebSockets, no polling. Disable with `--no-watch` if you want a
+serve-only run.
+
+## What's not in here
+
+The following are out of scope:
+
+- Client-side search.
+- WASM playground.
+- Print view.
+- Multi-language / i18n.
+- RSS / Atom feeds.
+- Plugin / preprocessor protocol.
+
+Extension goes through Brief's standard shortcode mechanism, registered
+in `book.toml`. That is the extension surface.
+
+## Why a separate binary
+
+The compiler is a library. `brief-cli` and `brief-web` both depend on
+it. The split exists so a docs author who only wants to render a site
+doesn't have to think about the compiler's CLI; conversely, an LLM
+pipeline using `brief compile --target=llm` doesn't need a static-site
+generator's worth of code on disk.

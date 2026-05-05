@@ -1,0 +1,105 @@
+# Error code registry
+
+@lede
+Every diagnostic the reference compiler can emit. Codes are stable —
+additions only; removals never.
+@end
+
+Run `brief explain B<code>` for the long-form explanation of any code on
+this page.
+
+## B01xx — lexical
+
+@t
+| Code | Meaning
+| @ec[B0101] | invalid UTF-8 in source
+| @ec[B0102] | tab character is not allowed; use two spaces
+| @ec[B0103] | byte-order mark must only appear at start of file
+| @ec[B0104] | unexpected character
+
+## B02xx — inline parsing
+
+@t
+| Code | Meaning
+| @ec[B0204] | emphasis cannot nest with the same marker
+| @ec[B0205] | emphasis must open and close on the same line
+| @ec[B0206] | doubled emphasis markers are not valid; use a single marker
+| @ec[B0207] | unterminated emphasis
+| @ec[B0208] | unterminated inline code span
+
+## B03xx — block parsing
+
+@t
+| Code | Meaning
+| @ec[B0301] | heading level exceeds maximum of 6
+| @ec[B0302] | heading marker must be followed by exactly one space
+| @ec[B0303] | indentation must be in multiples of two spaces
+| @ec[B0304] | horizontal rule must be exactly three dashes
+| @ec[B0305] | unterminated code fence
+| @ec[B0306] | unterminated block shortcode
+| @ec[B0307] | block comments must start at the beginning of a line
+| @ec[B0308] | invalid list marker
+| @ec[B0309] | document is empty
+| @ec[B0310] | blockquote marker must be followed by a space
+| @ec[B0311] | `@end` without a matching block shortcode
+| @ec[B0312] | unexpected content after directive
+| @ec[B0313] | frontmatter `+++` block is never closed
+| @ec[B0314] | frontmatter is not valid TOML
+| @ec[B0315] | unknown code-fence attribute
+| @ec[B0316] | conflicting code-fence attributes
+| @ec[B0317] | invalid heading anchor
+
+## B04xx — shortcode resolution
+
+@t
+| Code | Meaning
+| @ec[B0401] | shortcode is not registered
+| @ec[B0402] | shortcode argument has wrong type
+| @ec[B0403] | missing required shortcode argument
+| @ec[B0404] | argument value is not in the allowed set
+| @ec[B0405] | shortcode used in the wrong form (block vs. inline)
+| @ec[B0406] | malformed shortcode argument syntax
+| @ec[B0407] | keyword argument given more than once
+| @ec[B0408] | callout kind is deprecated; use the GFM equivalent
+
+## B05xx — semantic / cross-cutting
+
+@t
+| Code | Meaning
+| @ec[B0501] | ordered list numbering must be sequential starting from 1
+| @ec[B0502] | table row column count does not match header
+| @ec[B0503] | heading levels must increase by at most one
+| @ec[B0504] | alignment array length must equal the column count
+| @ec[B0505] | malformed definition list
+| @ec[B0506] | heading anchor must be unique within a document
+
+## B06xx — cross-document references
+
+@t
+| Code | Meaning
+| @ec[B0601] | cross-document reference target file does not exist in project
+| @ec[B0602] | cross-document reference target anchor does not exist in target file
+| @ec[B0603] | malformed cross-document reference target
+| @ec[B0604] | `@ref` requires a `brief.toml`-rooted project; none found
+
+## B07xx — code-block minification (LLM mode)
+
+@t
+| Code | Severity | Meaning
+| @ec[B0702] | warning | minified code block was originally many lines; LLM consumers cannot reference specific lines
+| @ec[B0703] | warning | line comment converted to block-comment form for minification
+| @ec[B0704] | error | language uses significant whitespace and cannot be safely minified
+
+## Stability promise
+
+Codes in this registry are append-only. New codes are added at the end of
+each numeric range. Removing or renumbering a code is forbidden —
+`brief explain B0204` will continue to mean the same thing for the
+lifetime of the language.
+
+## What's not in this registry
+
+The compiler does not emit warnings as part of the strictness model. The
+two warning-level codes that exist (@ec[B0702] and @ec[B0703]) are tied to
+opt-in code-fence attributes — the user has explicitly invoked the
+behavior and the warning is informational, not a halfway diagnostic.

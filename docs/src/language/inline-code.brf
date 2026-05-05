@@ -1,0 +1,46 @@
+# Inline code
+
+@lede
+Single backticks for code spans. Double backticks if the content itself
+contains a backtick. That is the entire surface.
+@end
+
+## Single-backtick form
+
+```brief
+Use the `printf` function for that.
+```
+
+The content between the backticks is verbatim. No emphasis, no shortcodes,
+no escape sequences run inside an inline code span.
+
+## Including a literal backtick
+
+To include a literal backtick inside inline code, switch to the
+double-backtick form:
+
+```brief
+Run ``echo `whoami` `` to print the user.
+```
+
+The opening `` `` `` is followed by a leading space, the content (which may
+contain single backticks), a trailing space, and the closing `` `` ``. The
+leading and trailing spaces are stripped from the rendered output.
+
+@callout(kind: note)
+This is the *only* exception to Brief's "one canonical form" rule. It
+exists because escape sequences cannot run inside a verbatim region —
+there is no other way to embed a backtick.
+@end
+
+## What's *not* inline code
+
+Indented four-space prefixes are not inline code spans, and not block code
+either. Use a triple-backtick fence for blocks instead — the syntax is
+covered in @ref[language/code-blocks.brf](Code blocks).
+
+## In LLM mode
+
+Inline code is emitted verbatim, with the surrounding backticks preserved.
+A code span's content is never minified — minification rules apply only to
+fenced code blocks with a recognized language tag.

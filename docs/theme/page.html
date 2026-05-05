@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} — {{ site_title }}</title>
+  <meta name="description" content="{{ description }}">
+  <link rel="stylesheet" href="{{ stylesheet }}">
+</head>
+<body>
+  <header class="site-header">
+    <div class="site-header-inner">
+      <a class="site-wordmark" href="{{ base_url }}">
+        <span class="wordmark-glyph" aria-hidden="true">¶</span>
+        <span class="wordmark-text">Brief</span>
+      </a>
+      <nav class="site-nav" aria-label="primary">
+        <a href="{{ base_url }}getting-started/installation.html">Get started</a>
+        <a href="{{ base_url }}reference/built-in-shortcodes.html">Reference</a>
+        <a href="{{ base_url }}llm-mode/overview.html">LLM mode</a>
+        <a href="https://github.com/kirillleventcov/brief">GitHub</a>
+      </nav>
+      <button id="sidebar-toggle" type="button" aria-label="Toggle navigation">≡</button>
+      <button id="theme-toggle" type="button" aria-label="Toggle theme">◐</button>
+    </div>
+  </header>
+  <div class="layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-inner">{{ sidebar }}</div>
+    </aside>
+    <main class="content">
+      <article class="prose">
+        {{ content }}
+      </article>
+      <footer class="page-footer">
+        <p>This site is written in Brief and built with <code>brief-web</code>.</p>
+        <p class="footer-meta"><a href="https://github.com/kirillleventcov/brief">Source on GitHub</a> · MIT licensed</p>
+      </footer>
+    </main>
+  </div>
+  {{ reload_script }}
+  <script>
+    (function () {
+      var key = "brief-web-theme";
+      var btn = document.getElementById("theme-toggle");
+      var saved = localStorage.getItem(key);
+      if (saved) document.documentElement.dataset.theme = saved;
+      if (btn) btn.addEventListener("click", function () {
+        var cur = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = cur;
+        localStorage.setItem(key, cur);
+      });
+
+      var stoggle = document.getElementById("sidebar-toggle");
+      var sidebar = document.getElementById("sidebar");
+      if (stoggle && sidebar) stoggle.addEventListener("click", function () {
+        sidebar.classList.toggle("open");
+      });
+
+      // Highlight the current page's link in the sidebar.
+      var here = location.pathname.replace(/index\.html$/, "");
+      var links = document.querySelectorAll(".sidebar a");
+      for (var i = 0; i < links.length; i++) {
+        var p = links[i].pathname.replace(/index\.html$/, "");
+        if (p === here) links[i].setAttribute("aria-current", "page");
+      }
+    }());
+  </script>
+</body>
+</html>

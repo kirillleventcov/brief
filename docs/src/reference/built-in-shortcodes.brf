@@ -1,0 +1,196 @@
+# Built-in shortcodes
+
+@lede
+The shortcodes the reference compiler ships with. Implementations may not
+redefine these names.
+@end
+
+## At a glance
+
+@t
+| Name | Form | Purpose
+| `link` | inline | Hyperlink — `@link[text](url)`
+| `image` | inline | Image — `@image(src: "...", alt: "...")`
+| `kbd` | inline | Keyboard input — `@kbd[Ctrl+C]`
+| `sub` | inline | Subscript — `@sub[2]`
+| `sup` | inline | Superscript — `@sup[2]`
+| `details` | block | Collapsible block — `@details(summary: "...")`
+| `dl` | block | Definition list — `@dl ... @end`
+| `t` | block | Table (special-cased syntax)
+| `code` | block | Same as triple-backtick fence
+| `callout` | block | Boxed note — kind is one of `note`, `tip`, `important`, `warning`, `caution`
+| `math` | both | LaTeX math, inline or block
+| `footnote` | inline | Footnote — `@footnote[...]`
+| `ref` | inline | Cross-document reference — `@ref[path#anchor](title)`
+
+## `@link` — hyperlinks
+
+```brief
+See @link[the spec](https://example.com/brief) for details.
+```
+
+The body is the display text. The first positional argument is the URL
+(required). Optional keyword: `title:` for the `title` HTML attribute.
+
+```brief
+@link[Anthropic](https://anthropic.com, title: "Anthropic homepage")
+```
+
+## `@image` — images
+
+```brief
+@image(src: "diagram.png", alt: "architecture diagram")[]
+```
+
+Required keyword: `src`. Optional keyword: `alt`. The body must be empty
+brackets — images don't have inline children.
+
+In LLM mode the rendering is `[image: <alt>]`. URL is dropped unless
+`--keep-asset-urls` is passed.
+
+## `@kbd` — keyboard input
+
+```brief
+Press @kbd[Ctrl+C] to abort.
+```
+
+Renders as a styled `<kbd>` element (HTML) or its body verbatim (LLM).
+
+## `@sub` and `@sup` — sub/superscript
+
+```brief
+H@sub[2]O
+e = mc@sup[2]
+```
+
+Replacements for the inline `<sub>` / `<sup>` HTML tags. No arguments;
+the body is the text.
+
+## `@details` — collapsible blocks
+
+```brief
+@details(summary: "Click to expand")
+The body of the collapsed region.
+
+Multiple paragraphs and other blocks work here.
+@end
+```
+
+Required keyword: `summary`. The HTML rendering is
+`<details><summary>...</summary>...</details>`.
+
+## `@dl` — definition lists
+
+```brief
+@dl
+Term 1
+: Definition of term 1.
+Term 2
+: Definition of term 2.
+@end
+```
+
+The `:` marker is exact — colon plus exactly one space. See
+@ref[language/definition-lists.brf](Definition lists).
+
+## `@t` — tables
+
+Self-terminating block shortcode. Opens with `@t` (and optional
+`(align: [...])` argument), then one or more `|`-prefixed rows, then ends
+at the first non-`|` line. Full reference:
+@ref[language/tables.brf](Tables).
+
+## `@code` — code blocks
+
+Equivalent to a triple-backtick fence. The first positional argument is
+the language tag.
+
+```brief
+@code(rust)
+fn main() {
+    println!("hi");
+}
+@end
+```
+
+Use the fence form by default; `@code` exists for parity with the
+shortcode model.
+
+## `@callout` — boxed notes
+
+```brief
+@callout(kind: warning)
+Watch out for the @kbd[Shift+Delete] shortcut.
+@end
+```
+
+Required keyword: `kind`. Allowed values: `note`, `tip`, `important`,
+`warning`, `caution`. The first three plus the last two match GFM's
+alert kinds.
+
+In LLM mode the rendering is `[!<kind>] ... [/!]`.
+
+## `@math` — LaTeX math
+
+Inline:
+
+```brief
+The energy is @math[E = m c^2].
+```
+
+Block:
+
+```brief
+@math
+\sum_{i=1}^{n} i = \frac{n(n+1)}{2}
+@end
+```
+
+The body is verbatim LaTeX, passed through to the HTML target inside
+`<span class="math">` (inline) or `<div class="math math-display">`
+(block). LLM mode renders inline math as `$body$` and block math as
+`$$body$$`.
+
+Brief does not ship a LaTeX engine. Wire one up at the page-template
+layer (KaTeX, MathJax) for browser rendering.
+
+## `@footnote` — footnotes
+
+The footnote *body* lives next to the reference, not at the bottom of
+the file:
+
+```brief
+This claim is contested.@footnote[See Smith, 2025.]
+```
+
+The compiler auto-numbers footnotes in document order and emits a list at
+the end of the page. HTML rendering puts them in `<ol class="footnotes">`;
+LLM rendering uses `[^N]: ...` lines.
+
+This is the *only* form. No reference-style separated definitions —
+Brief is context-free, and a forward-declared footnote definition would
+require a multi-pass parser for one feature.
+
+## `@ref` — cross-document references
+
+```brief
+See @ref[guide.brf#install](installation) for the steps.
+```
+
+The body is the target — a project-relative `.brf` path, optionally with
+a `#anchor` suffix. The first positional argument is the display text.
+
+Validation:
+
+- Missing target file: @ec[B0601].
+- Missing anchor in target file: @ec[B0602].
+- Malformed target (leading `/`, `..` segments, backslashes): @ec[B0603].
+- No `brief.toml` walking up from the source: @ec[B0604].
+
+In LLM mode the link is dropped — only the display text remains.
+
+## What's not a built-in
+
+`@br` for hard breaks. Use a trailing `\` instead. `@hr` for horizontal
+rules. Use `---` instead. Both are explicit refusals — adding a second
+spelling would break the "one canonical form" rule.

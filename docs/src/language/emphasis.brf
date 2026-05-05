@@ -1,0 +1,78 @@
+# Emphasis
+
+@lede
+Four kinds. One marker per side. No exceptions.
+@end
+
+## The four markers
+
+@t
+| Construct | Source | Renders as
+| Bold | `*text*` | `<strong>`
+| Italic | `_text_` | `<em>`
+| Underline | `+text+` | `<u>`
+| Strikethrough | `~text~` | `<s>`
+
+Each marker is a single character on each side. Doubled markers
+(`**bold**`, `__italic__`) are *not* valid — they are @ec[B0206] errors.
+
+## Why singles only
+
+Markdown's `**bold**` versus `*italic*` distinction is the single largest
+source of "what does this Markdown actually mean" bugs. Brief sidesteps it
+by giving each emphasis kind its own dedicated marker. There is no
+"strength" hierarchy; bold is `*text*`, end of story.
+
+## Nesting rules
+
+Different kinds nest freely:
+
+```brief
+*bold with _italic inside_ and back to bold*
+```
+
+The same kind cannot nest:
+
+```brief
+*outer *inner* outer*    // B0204 — same marker re-used
+```
+
+Multi-line emphasis is also an error (@ec[B0205]). An emphasis run must
+open and close on the same source line.
+
+## Word-boundary rules
+
+A marker flanked by alphanumerics on *both* sides is treated as a literal
+character, not as emphasis:
+
+```brief
+snake_case_name              // literal — no italic
+file_with_underscores.txt    // literal
+3*4 = 12                     // literal asterisks
+```
+
+This is why everyday code identifiers don't accidentally become italic.
+
+## Escaping
+
+To force a marker to be literal in a position where it would otherwise be
+emphasis, escape it with a backslash:
+
+```brief
+This costs \*5\* dollars.
+```
+
+## In LLM mode
+
+Emphasis markers are preserved by default. The flag `--strip-emphasis`
+removes them entirely if you are tight on tokens and the LLM does not need
+the structural hint:
+
+```bash
+brief compile doc.brf --target=llm --strip-emphasis
+```
+
+## Inline code is not emphasis
+
+A backticked region (`` `like this` ``) is verbatim. Markers inside an
+inline code span are literal. See @ref[language/inline-code.brf](Inline code).

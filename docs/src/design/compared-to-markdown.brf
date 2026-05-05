@@ -1,0 +1,318 @@
+# Compared to Markdown
+
+@lede
+A construct-by-construct comparison. The differences are intentional;
+the rationales accumulate.
+@end
+
+## Headings
+
+@compare
+@col(label: "Markdown")
+```markdown
+# H1
+## H2
+
+H1 with setext
+==============
+
+H2 with setext
+--------------
+```
+@end
+@col(label: "Brief")
+```brief
+# H1
+## H2
+```
+@end
+@end
+
+Setext headings are *not* in Brief. The two surface forms (`#` and
+`===`/`---`) produce the same AST in Markdown; one form, by Brief's
+rule, is the legal one. The `#`-prefixed form wins because it scales to
+six levels.
+
+## Emphasis
+
+@compare
+@col(label: "Markdown")
+```markdown
+**bold**, *italic*, ***both***
+__bold__, _italic_, ___both___
+~~strikethrough~~
+```
+@end
+@col(label: "Brief")
+```brief
+*bold*, _italic_, *_both_*
+~strike~
+```
+@end
+@end
+
+Markdown spends both `*` and `_` on the bold/italic distinction; Brief
+spends one marker per emphasis kind. There is no `***both***` shortcut —
+nest two emphasis runs explicitly.
+
+## Lists
+
+@compare
+@col(label: "Markdown")
+```markdown
+- one
+* two
++ three
+
+1. one
+3. three
+```
+@end
+@col(label: "Brief")
+```brief
+- one
+- two
+- three
+
+1. one
+2. two
+```
+@end
+@end
+
+Brief refuses `*` and `+` as bullet markers. Out-of-order numbering is a
+compile error, not a "the renderer figures it out" affordance.
+
+## Tables
+
+@compare
+@col(label: "Markdown")
+```markdown
+| Name | Age |
+|------|-----|
+| Ada  | 30  |
+| Bob  | 25  |
+```
+@end
+@col(label: "Brief")
+```brief
+@t
+| Name | Age
+| Ada | 30
+| Bob | 25
+```
+@end
+@end
+
+Brief drops the separator row. The trailing `|` is optional. Column
+alignment moves to a directive argument: `@t(align: [left, right])`.
+
+## Links
+
+@compare
+@col(label: "Markdown")
+```markdown
+[GitHub](https://github.com/kirillleventcov/brief)
+
+[my reference][gh]
+[gh]: https://github.com/kirillleventcov/brief
+```
+@end
+@col(label: "Brief")
+```brief
+@link[GitHub](https://github.com/kirillleventcov/brief)
+```
+@end
+@end
+
+Inline links are a shortcode. There is no reference-style link form —
+Brief is context-free, and reference-style links require a multi-pass
+parser for one feature.
+
+## Images
+
+@compare
+@col(label: "Markdown")
+```markdown
+![architecture diagram](diagram.png)
+```
+@end
+@col(label: "Brief")
+```brief
+@image(src: "diagram.png", alt: "architecture diagram")[]
+```
+@end
+@end
+
+More verbose by token count. Worth the cost: the alt text is a *named
+argument*, not "everything between `![` and `]`."
+
+## Inline code and backticks
+
+@compare
+@col(label: "Markdown")
+```markdown
+Use the `printf` function.
+Run ``echo `whoami` `` for the user.
+```
+@end
+@col(label: "Brief")
+```brief
+Use the `printf` function.
+Run ``echo `whoami` `` for the user.
+```
+@end
+@end
+
+Identical. The double-backtick escape for embedded backticks is the only
+exception to Brief's "one canonical form" rule.
+
+## Code blocks
+
+@compare
+@col(label: "Markdown")
+```markdown
+    indented four spaces
+
+```fenced
+fenced code
+```
+
+~~~~
+or fenced with tildes
+~~~~
+```
+@end
+@col(label: "Brief")
+```brief
+```fenced
+fenced code
+```
+```
+@end
+@end
+
+Brief refuses the indented and tilde forms. The triple-backtick fence is
+the only legal form. Minification attributes (`@minify`, `@nominify`,
+`@minify-keep-comments`) extend the opening fence.
+
+## Callouts
+
+@compare
+@col(label: "Markdown — GFM")
+```markdown
+> [!WARNING]
+> Watch out for this.
+```
+@end
+@col(label: "Brief")
+```brief
+@callout(kind: warning)
+Watch out for this.
+@end
+```
+@end
+@end
+
+The Brief form is two extra characters per callout, but the `kind` is
+typed and validated against the enum — `note`, `tip`, `important`,
+`warning`, `caution`. A typo is @ec[B0404], not silent passthrough.
+
+## Inline HTML
+
+@compare
+@col(label: "Markdown")
+```markdown
+<sub>2</sub>, <sup>2</sup>, <kbd>Ctrl+C</kbd>
+<details>
+<summary>Click</summary>
+content
+</details>
+```
+@end
+@col(label: "Brief")
+```brief
+@sub[2], @sup[2], @kbd[Ctrl+C]
+@details(summary: "Click")
+content
+@end
+```
+@end
+@end
+
+The four most common inline HTML use cases are built-in shortcodes.
+Anything else means the document shouldn't be HTML in the first place;
+if you must, register a custom shortcode in `brief.toml`.
+
+## Frontmatter
+
+@compare
+@col(label: "Markdown — Jekyll")
+```markdown
+---
+title: My document
+date: 2026-04-29
+tags: [foo, bar]
+---
+
+# Document content
+```
+@end
+@col(label: "Brief")
+```brief
++++
+title = "My document"
+date = 2026-04-29
+tags = ["foo", "bar"]
++++
+
+# Document content
+```
+@end
+@end
+
+`+++` delimiters and TOML inside, not `---` and YAML. TOML matches
+`brief.toml`, has a single canonical parser per language, and produces
+clean error messages.
+
+## Task lists
+
+@compare
+@col(label: "Markdown — GFM")
+```markdown
+- [x] done
+- [ ] todo
+```
+@end
+@col(label: "Brief")
+```brief
+- [x] done
+- [ ] todo
+```
+@end
+@end
+
+Identical syntax. The marker is exact in Brief — `[X]`, `[  ]`, or
+`[x]` without the trailing space is plain text, not a typo'd task.
+
+## Errors
+
+@compare
+@col(label: "Markdown")
+```text
+(silent: renders as best as the parser can guess)
+```
+@end
+@col(label: "Brief")
+```text
+error[B0204]: emphasis cannot nest with the same marker
+  --> doc.brf:14:23
+   |
+14 | This is *outer *inner* outer*.
+   |        ^^^^^^^ inner emphasis re-uses the `*` marker
+```
+@end
+@end
+
+This is the durable difference. Markdown silences ambiguity; Brief
+points at it.

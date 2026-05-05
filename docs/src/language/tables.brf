@@ -1,0 +1,78 @@
+# Tables
+
+@lede
+Tables open with `@t`. The first `|` row is the header. There is no
+separator row.
+@end
+
+## The basic form
+
+@t
+| Name | Age | City
+| John | 30 | NYC
+| Jane | 25 | LA
+
+The source for that:
+
+```brief
+@t
+| Name | Age | City
+| John | 30 | NYC
+| Jane | 25 | LA
+```
+
+The trailing `|` is optional. Cells are trimmed of leading and trailing
+whitespace.
+
+## Strict rules
+
+- Every row must have the same number of cells as the header. A mismatch
+  is @ec[B0502].
+- The table ends at the first line that does not begin with `|`, or at
+  end of file.
+- Inline content inside a cell is parsed as inline — emphasis, inline
+  code, and inline shortcodes work.
+
+## Column alignment
+
+Alignment is set on the directive line as an array argument:
+
+@t(align: [left, right, center])
+| Name | Score | Status
+| Ada | 1024 | active
+| Bob | 42 | idle
+
+Source:
+
+```brief
+@t(align: [left, right, center])
+| Name | Score | Status
+| Ada | 1024 | active
+| Bob | 42 | idle
+```
+
+The alignment array length must match the column count. A mismatch is
+@ec[B0504] *"alignment array length must match column count"*.
+
+Allowed values: `left`, `right`, `center`.
+
+## Why no separator row
+
+Markdown's `| --- | :---: |` separator carries one piece of information —
+column alignment — but visually duplicates the header structure. Brief
+moves alignment to the directive (`align: [...]`), drops the separator
+row entirely, and saves both source tokens and LLM-mode tokens.
+
+## In LLM mode
+
+Tables are emitted in compact pipe form with one space of padding around
+each cell. The header row is followed by a single line `|---|` *only* if
+`--keep-table-rule` is passed; otherwise no separator is emitted.
+
+## What `@t` is not
+
+`@t` is a special-cased self-terminating block shortcode — the same form
+as the triple-backtick code fence. No other shortcode (built-in or
+user-defined) is permitted to be self-terminating. The grammar exception
+exists for tables and code blocks alone, on the basis of source-level
+brevity.

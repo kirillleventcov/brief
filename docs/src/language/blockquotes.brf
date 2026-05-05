@@ -1,0 +1,55 @@
+# Blockquotes
+
+@lede
+A `>` followed by exactly one space. Subsequent matching lines continue
+the quote. A blank line ends it.
+@end
+
+## The basic form
+
+```brief
+> An outer quote that spans
+> two source lines.
+```
+
+Lines beginning with `> ` continue the same blockquote. The space after
+`>` is required — `>text` is not a quote.
+
+A live example:
+
+> An outer quote that spans
+> two source lines.
+
+## Nesting
+
+Nested blockquotes use additional `>` markers:
+
+```brief
+> An outer quote.
+>> A nested quote inside.
+> Back to the outer.
+```
+
+Live:
+
+> An outer quote.
+>> A nested quote inside.
+> Back to the outer.
+
+## Inline content
+
+Inline emphasis, code spans, and shortcodes work inside a quote:
+
+> A quote with *bold*, `code`, and @kbd[Ctrl+C] inside.
+
+## When to reach for `@callout` instead
+
+Blockquotes carry no semantic kind. If the content is a note, a tip, a
+warning, or a caution — something the reader should treat with a specific
+disposition — use `@callout` (with `kind: note | tip | important | warning |
+caution`). See @ref[language/shortcodes.brf](Shortcodes).
+
+## What ends a blockquote
+
+A blank line, or any non-`>`-prefixed non-blank line. There is no
+"continue with a leading space" rule the way some Markdown dialects allow.

@@ -1,0 +1,75 @@
+# Paragraphs and line breaks
+
+@lede
+Lines that don't begin with a block sigil are paragraph text. Blank lines
+separate paragraphs. A trailing backslash forces a line break.
+@end
+
+## What counts as a paragraph
+
+A paragraph is one or more consecutive non-blank lines that do not begin
+with a block sigil — a `#` heading, a `-` list item, a `>` blockquote, a
+`|` table row, an `@` shortcode, a digit-then-`.`-then-space ordered
+list, a triple-backtick code fence, a `//` line comment, a `/*` block
+comment, or a `---` horizontal rule.
+
+```brief
+This is one paragraph
+that spans two source lines.
+
+This is the next paragraph.
+```
+
+Lines inside a paragraph are joined with a single space when rendered.
+Source-level wrapping has no effect on output.
+
+## Hard line breaks
+
+A backslash at the very end of a line is the hard-break marker:
+
+```brief
+First line.\
+Second line in the same paragraph.
+```
+
+Renders as a paragraph with a `<br>` between the two lines (HTML target),
+or with a literal newline in LLM mode.
+
+@callout(kind: note)
+There is no `@br` shortcode. The trailing backslash is the only canonical
+hard-break form — adding a second spelling would break the "one way to
+do it" rule.
+@end
+
+## Blank lines
+
+Multiple blank lines collapse to a single paragraph break. There is no
+"force two paragraph breaks" syntax — a paragraph is a paragraph.
+
+## Paragraphs and other blocks
+
+Paragraphs are interrupted by any block sigil. The compiler does not
+require a blank line between a paragraph and the next block, but the
+formatter inserts one.
+
+```brief
+A paragraph.
+- list item
+- another list item
+A paragraph again.
+```
+
+That parses as paragraph → list → paragraph. The list ends as soon as a
+non-list line follows.
+
+## Inline content
+
+Inside a paragraph, all inline constructs are valid:
+
+- Emphasis: `*bold*`, `_italic_`, `+underline+`, `~strike~`.
+- Inline code: `` `printf` ``.
+- Inline shortcodes: `@kbd[Ctrl+C]`, `@math[E = m c^2]`, `@link[text](url)`.
+- Escapes: `\*not bold\*`.
+
+See @ref[language/emphasis.brf](Emphasis) and
+@ref[language/shortcodes.brf](Shortcodes) for the inline catalog.

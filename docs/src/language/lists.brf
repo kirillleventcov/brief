@@ -1,0 +1,112 @@
+# Lists
+
+@lede
+Two kinds — unordered and ordered. They do not mix at the same level.
+Sequential numbering for ordered. Two-space indent for nesting.
+@end
+
+## Unordered lists
+
+The marker is `-` followed by exactly one space. `*` and `+` are *not*
+valid markers.
+
+```brief
+- first item
+- second item
+- third item
+```
+
+That is the only canonical form. Mixing markers, leading spaces, or no
+space after the `-` are all errors.
+
+## Ordered lists
+
+The marker is one or more digits, then `.`, then exactly one space.
+
+```brief
+1. step one
+2. step two
+3. step three
+```
+
+Numbering must be sequential starting from 1. Out-of-order is @ec[B0501] —
+the renderer does *not* silently renumber for you.
+
+```brief
+1. one
+3. three        // B0501: ordered list numbering must be sequential
+```
+
+## Nesting
+
+Nested lists use exactly *two spaces* of indentation per level. One space,
+three spaces, or tabs are all errors.
+
+```brief
+- top level
+  - nested
+    - deeper still
+  - back to nested
+- another top
+```
+
+## Mixing kinds across levels
+
+You can switch between ordered and unordered when nesting:
+
+```brief
+1. ordered top
+  - bullet inside
+  - another bullet
+2. ordered top again
+```
+
+You cannot switch *at the same level*. Switching ends the previous list
+and starts a new one.
+
+## Continuation lines
+
+A list item can have continuation lines, indented to match the content
+column of the marker (the marker plus its space):
+
+```brief
+- this item has
+  a continuation line
+- next item
+```
+
+For ordered items the indent is the digit-width plus the dot plus the
+space — usually four spaces for `10.` items, three for `1.` items. The
+formatter handles this for you.
+
+## Task lists
+
+Unordered list items can carry a task-state marker as their first content:
+
+```brief
+- [x] ship v0.4
+- [ ] write release notes
+- plain bullet, not a task
+```
+
+Rules:
+
+- The marker is exactly `[x] ` (done) or `[ ] ` (todo).
+- Lowercase `x`. A single space inside the brackets. A single space after
+  the closing bracket.
+- Anything else (`[X]`, `[  ]`, `[x]` without the trailing space) is plain
+  text.
+- Task markers are *not* supported on ordered list items. `1. [x] foo` is
+  just text.
+
+@callout(kind: note)
+HTML emit renders these as `<input type="checkbox" disabled>` inside
+`<li class="task-list-item">`. The parent `<ul>` carries
+`class="contains-task-list"` if any item is a task. LLM emit preserves
+the `[x]` / `[ ]` marker verbatim.
+@end
+
+## In LLM mode
+
+Indentation drops to one space per nesting level (instead of the source's
+two spaces). Markers, numbering, and task states are preserved.

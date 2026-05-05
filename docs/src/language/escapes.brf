@@ -1,0 +1,63 @@
+# Escapes
+
+@lede
+A backslash escapes the next character, treating it as a literal. `\\`
+produces a literal backslash.
+@end
+
+## The mechanism
+
+```brief
+This costs \*5\* dollars.
+```
+
+Renders as: This costs *5* dollars. The backslashes are stripped; the
+asterisks are literal.
+
+## Where escapes work
+
+Everywhere except inside code spans and code blocks, which are verbatim by
+definition. Inside a backtick span the source `\*` is the two literal
+characters `\` and `*`.
+
+## What's worth escaping
+
+@dl
+Reserved inline sigils
+: `*`, `_`, `+`, `~`, `` ` ``, `@`, `\`, `[`, `]`. Escape these when you
+  want them to be literal in a position where they would otherwise be
+  interpreted.
+Reserved line-leading sigils
+: `#`, `-`, `>`, `|`, `@`, `/`, `` ` ``, and the digit-then-`.`-then-space
+  prefix. Escape the first character if a line starts with one and you do
+  *not* want to open a block.
+@end
+
+## When you don't need to escape
+
+Most characters do not need escaping most of the time. The word-boundary
+rule for emphasis (markers between alphanumerics on both sides are
+literal) means `snake_case` and `3*4` already work without escapes.
+
+A backslash that does *not* precede a sigil is a literal backslash —
+`a\b` is the three characters `a`, `\`, `b`. The compiler does not error
+on "unnecessary" escapes; if the next character could be a sigil, the
+escape suppresses interpretation, otherwise it is kept verbatim.
+
+## In code spans
+
+Inside `` `...` ``, no escapes apply. To embed a literal backtick, use
+the double-backtick form:
+
+```brief
+Run ``echo `whoami` `` to print the user.
+```
+
+This is the only verbatim region in the language with a workaround for
+"impossible" content. See @ref[language/inline-code.brf](Inline code).
+
+## In LLM mode
+
+Backslash escapes are *resolved* — the rendered output contains the
+literal characters the escapes produced, not the escape sequences
+themselves.

@@ -1,0 +1,113 @@
+# Token budgeting
+
+@lede
+Measure once, optimize where it matters. The compiler ships a
+character-and-token estimator; the rest is pipeline plumbing.
+@end
+
+## The estimator
+
+Add `--report-tokens` to any LLM-mode compile. The compiler prints a
+stderr line:
+
+```text
+brief: doc.brf -> 1,247 chars, ~340 tokens (cl100k estimate)
+```
+
+The estimate uses cl100k_base — OpenAI's tokenizer for GPT-3.5 / GPT-4.
+It is best-effort and *not* normative. Other tokenizers will produce
+different counts; treat the number as a relative gauge.
+
+```bash
+brief compile prompt.brf --target=llm --report-tokens > /dev/null
+```
+
+## A measurement loop
+
+Compare two phrasings with one command apiece:
+
+```bash
+brief compile original.brf --target=llm --report-tokens > /dev/null
+brief compile rewritten.brf --target=llm --report-tokens > /dev/null
+```
+
+The deltas tell you whether a rewrite saved tokens, where, and how much.
+If the delta is small (< 5 percent), it's noise — the rewrite was probably
+neutral. If it's large, you found a real win.
+
+## What costs the most tokens
+
+In rough order, on real-world documents:
+
+@dl
+Verbatim JSON code blocks
+: A 30-line pretty-printed config can be 300+ tokens. Single-line
+  minified is the same data in 60 tokens. JSON minification is on by
+  default and is the single largest LLM-mode win.
+Tables with separator rows
+: Markdown's `| --- |` separator costs roughly 5 tokens per column.
+  Brief drops it by default in LLM mode.
+Decorative formatting
+: Extra blank lines, hard-break backslashes, indentation beyond what the
+  parser requires. Compile to LLM and re-read what your prompt actually
+  contains.
+Long-form prose
+: The bulk of most prompts is the prose. There is no compiler trick for
+  this — write less.
+@end
+
+## What costs little
+
+Headings. Emphasis markers. Inline code spans. Lists. The structural
+cues these provide help the LLM parse the document, and the per-token
+cost is negligible compared to the comprehension benefit.
+
+You can drop emphasis with `--strip-emphasis` if you measure a specific
+prompt and it makes no difference, but the default is to keep them.
+
+## A CI gate
+
+Set a budget. Fail the build if the rendered prompt exceeds it.
+
+```bash
+brief compile prompt.brf --target=llm --report-tokens 2>&1 1>/dev/null \
+  | awk -F'~' '/tokens/ { gsub(/[^0-9].*/, "", $2); if ($2+0 > 2000) exit 1 }'
+```
+
+The same idea works in any CI runner. The estimator output is stable
+enough across runs that a simple threshold catches regressions.
+
+## Why a CI gate matters
+
+Prompt sprawl is the LLM equivalent of "we'll fix the dependency tree
+later." Token budgets are easy to bust by accident — a single example
+table, a few extra paragraphs, an inline JSON config — and the cost
+shows up only on the next billing cycle. A CI gate makes the cost visible
+at PR time.
+
+## Don't over-optimize
+
+The `--strip-emphasis` flag, dropping `preserve_code_fences`, and dropping
+`--keep-table-rule` are all cost-saving levers. None of them are
+free — each one removes a structural cue the model uses to parse.
+
+Measure the *quality* of the LLM's output, not just the token count. A
+50-token saving that drops accuracy by 10 percent is a bad trade. The
+estimator can't tell you that; only your eval can.
+
+## Where the cl100k assumption breaks
+
+Different downstream tokenizers diverge from cl100k for specific token
+classes:
+
+- Anthropic's tokenizer for Claude treats whitespace and punctuation
+  differently in places.
+- Open-weight models (Llama, Mistral) use SentencePiece variants with
+  their own quirks.
+- Multilingual content costs more in cl100k than in BPE-trained
+  tokenizers tuned for the target language.
+
+The compiler's number is still useful for *relative* measurement on the
+same source — but if you depend on exact tokenization for a specific
+provider, run the provider's tokenizer over the rendered output. The
+compiler doesn't pretend to.

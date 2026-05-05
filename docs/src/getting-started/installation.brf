@@ -1,0 +1,68 @@
+# Installation
+
+@lede
+The reference compiler is a single Rust binary. Build it from source.
+@end
+
+## Requirements
+
+- Rust 1.85 or later (workspace uses edition 2024).
+- A POSIX-y shell, or PowerShell on Windows.
+- Roughly 200 MB of disk for the build cache.
+
+That is the entire dependency footprint. There is no Node, no Python, no
+Docker, no system package manager step. The compiler is one binary; the
+docs tooling is one more.
+
+## Build from source
+
+```bash
+git clone https://github.com/kirillleventcov/brief
+cd brief
+cargo build --release
+```
+
+The release build produces two binaries under `target/release/`:
+
+@t
+| Binary | Crate | Purpose
+| `brief` | `crates/brief-cli` | The compiler. Compile, convert, explain.
+| `brief-web` | `crates/brief-web` | The static-site generator that built this site.
+
+Add `target/release/` to your `PATH` or symlink the binaries somewhere
+already on it.
+
+## Verify
+
+```bash
+brief --help
+brief compile --help
+brief-web --help
+```
+
+If `brief --help` prints a usage banner, you are done. If it does not, the
+build did not finish or `target/release/` is not on your `PATH`. Re-run
+`cargo build --release` and re-check the output path.
+
+## What you just installed
+
+@dl
+brief
+: The reference compiler. Lex, parse, validate, and emit HTML, LLM, or
+  JSON-AST. Also explains error codes and converts Markdown.
+brief-web
+: The static-site generator. Reads a directory of `.brf` files plus a
+  `book.toml` and produces a navigable HTML site, with a dev server that
+  live-reloads on edit.
+@end
+
+## Next
+
+@cards
+@card(title: "Your first document", href: "/getting-started/first-document.html")
+Write a `.brf` file and compile it to HTML.
+@end
+@card(title: "Compile targets", href: "/getting-started/compile-targets.html")
+HTML for humans, LLM for prompts, JSON-AST for tools.
+@end
+@end

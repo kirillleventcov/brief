@@ -1,0 +1,100 @@
+# Code blocks
+
+@lede
+Triple-backtick fences. Optional language tag. Optional minification
+attribute. Verbatim content.
+@end
+
+## The fence
+
+```rust
+fn main() {
+    println!("hi");
+}
+```
+
+The opening line is exactly three backticks, optionally followed by a
+language tag and attributes. The closing line is exactly three backticks
+on a line by themselves.
+
+## Rules
+
+- Opening and closing fences are exactly three backticks. Tilde fences
+  (`~~~`) are *not* supported.
+- The language tag is one ASCII identifier. It informs HTML class names
+  (`<code class="language-rust">`) and LLM-mode minification.
+- Content between the fences is verbatim — no escapes, no inline parsing.
+- An unterminated fence is @ec[B0305] at end of file.
+- Indented (four-space-prefix) code blocks are *not* supported.
+
+## Showing source without a real fence
+
+Because the closing fence is just three backticks, you cannot literally
+nest one fence inside another. To document the syntax of a code fence
+without rendering it as a real block, describe it in prose or use the
+`@code` block shortcode form, which produces the same output as a fence.
+
+## Minification attributes
+
+Two attributes extend the opening fence:
+
+@dl
+`@nominify`
+: Force the block to be emitted verbatim in LLM mode, even when its
+  language is in the `minify_languages` allowlist. Useful when the
+  formatting itself is the lesson.
+`@minify-keep-comments`
+: Strip whitespace but preserve comments. The compiler converts `//` to
+  `/* */` where safe and emits a `B0703` warning per conversion.
+@end
+
+A `python` / `py` / `yaml` / `yml` / `makefile` block forced to minify is
+@ec[B0704] *"language uses significant whitespace and cannot be safely
+minified"* — these languages are permanently refused.
+
+## In LLM mode
+
+Each fenced block is processed independently:
+
+@t
+| Language | Default behavior in `--target=llm`
+| `json` / `jsonl` | Minified to a single line
+| `js`, `ts`, `rust`, `c`, `cpp`, `java`, `go`, `sql` | Minified
+| `python`, `yaml`, `makefile` | Refused, emitted verbatim, `B0704`
+| Untagged | Verbatim — without a tag the compiler can't safely process
+
+JS / TS and Go preserve newlines (their automatic semicolon insertion
+makes whitespace-stripping ambiguous without a real parser). C / C++
+preserve newlines around `#`-preprocessor lines. Other languages collapse
+to a single line.
+
+## A tour of the three states
+
+State 1 — full minification (default for known languages):
+
+```rust
+fn add(a: i32, b: i32) -> i32 {
+    // Adds two numbers.
+    a + b
+}
+```
+
+In LLM mode this becomes `fn add(a:i32,b:i32)->i32{a+b}`.
+
+State 2 — verbatim. Add `@nominify` after the language tag in the opening
+fence to keep the block exactly as written.
+
+State 3 — strip whitespace, keep comments. Add `@minify-keep-comments`
+after the language tag. Each `//` line comment converts to `/* */` form
+with a `B0703` warning.
+
+See @ref[llm-mode/code-minification.brf](Code-block minification) for the
+full breakdown.
+
+## Why JSON is the cleanest case
+
+A 30-line pretty-printed JSON object is identical in meaning to its
+single-line form. An LLM consumes both equally well. Token bills are paid
+in the present, and JSON-heavy documents see >50 percent reduction in LLM
+mode. That is the durable advantage Markdown can't ship without breaking
+changes.
