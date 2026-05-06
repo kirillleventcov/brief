@@ -64,6 +64,12 @@ enum Cmd {
         /// Overwrite existing destination files.
         #[arg(long)]
         force: bool,
+        /// Disable the post-convert self-test. By default, `brief convert`
+        /// pipes its output through the Brief compiler and refuses to write
+        /// the `.brf` if the output does not compile. Pass `--no-strict` to
+        /// write the (possibly broken) output regardless.
+        #[arg(long)]
+        no_strict: bool,
     },
     /// Reformat Brief source(s) according to the canonical style.
     /// gofmt-doctrine: no config beyond an explicit opt-in for the
@@ -141,7 +147,8 @@ fn main() -> ExitCode {
             output,
             stdout,
             force,
-        } => run_convert(inputs, output, stdout, force),
+            no_strict,
+        } => run_convert(inputs, output, stdout, force, no_strict),
         Cmd::Fmt {
             inputs,
             check,
@@ -518,6 +525,7 @@ fn run_convert(
     output: Option<PathBuf>,
     use_stdout: bool,
     force: bool,
+    no_strict: bool,
 ) -> ExitCode {
     if inputs.is_empty() {
         eprintln!("brief: convert requires at least one input file");
@@ -554,6 +562,24 @@ fn run_convert(
             }
         };
         let result = brief::convert::convert(&src, &input.to_string_lossy());
+
+        // Strict-by-default: pipe through the lex + parse self-test.
+        // Skipped on --no-strict.
+        if !no_strict {
+            if let Err(rendered) = strict_self_test(&result.brief_source, &input.to_string_lossy())
+            {
+                eprintln!(
+                    "brief: {} → FAILED: --strict self-test rejected the converted output:",
+                    input.display()
+                );
+                eprint!("{}", rendered);
+                eprintln!(
+                    "brief: pass --no-strict to write the broken output anyway, or fix the converter."
+                );
+                failed += 1;
+                continue;
+            }
+        }
 
         let dest = if use_stdout {
             None
@@ -726,5 +752,44 @@ fn default_output_path(input: &std::path::Path) -> PathBuf {
         name.push(".brf");
         p.set_file_name(name);
         p
+    }
+}
+
+/// Result of running the strict self-test against converted Brief.
+/// `Ok(())` if the source compiles cleanly under the lex+parse pipeline;
+/// `Err(rendered_diagnostics)` otherwise.
+fn strict_self_test(brief_source: &str, name: &str) -> Result<(), String> {
+    let src = SourceMap::new(name.to_string(), brief_source.to_string());
+    let diags = match lexer::lex(&src) {
+        Ok(toks) => parser::parse(toks, &src).1,
+        Err(d) => d,
+    };
+    let any_error = diags.iter().any(|d| d.severity == Severity::Error);
+    if any_error {
+        Err(render_all(&diags, &src))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod strict_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_brief_that_does_not_compile() {
+        // A header row with three cells and a data row with one — Brief
+        // emits `B0502 TableColumnMismatch`. Hand-crafting the broken
+        // Brief sidesteps the entire converter so the test only measures
+        // the self-test contract.
+        let broken = "@t\n| A | B | C\n| only one\n";
+        let err = strict_self_test(broken, "t.brf").expect_err("must reject");
+        assert!(err.contains("B0502"), "{}", err);
+    }
+
+    #[test]
+    fn accepts_clean_brief() {
+        let clean = "# Title\n\nA paragraph.\n";
+        strict_self_test(clean, "t.brf").expect("must accept");
     }
 }

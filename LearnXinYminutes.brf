@@ -256,6 +256,10 @@ The trailing `|` is optional. Cells are trimmed of leading and trailing
 whitespace. Every row must have the same number of cells as the header
 — mismatches are an error (B0502).
 
+A `|` inside a `` ` ``-delimited or ``` `` ```-delimited inline code span
+is not a cell separator. To put a literal `|` outside a code span into a
+cell, escape it as `\|`.
+
 Column alignment is set on the directive:
 
 @t(align: [left, right, center])

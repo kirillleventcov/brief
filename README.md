@@ -135,6 +135,11 @@ Hole markers are also injected into the output as `// TODO[B-hole:...]`
 comments where applicable (inline HTML, HTML blocks, frontmatter), so they
 remain greppable in the converted corpus.
 
+By default, `brief convert` runs the converted Brief through the
+compiler before writing and refuses to write any file that does not
+compile (the "strict" self-test). Pass `--no-strict` to disable the
+self-test and write whatever the converter produced.
+
 ## Fuzzing
 
 The parser is fuzzed with [cargo-fuzz][]. Four targets cover the lex/parse

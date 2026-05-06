@@ -659,7 +659,27 @@ impl<'a> Parser<'a> {
             if !trimmed.starts_with('|') {
                 break;
             }
-            let cells = split_cells(trimmed);
+            let split = split_cells(trimmed);
+            if let Some(rel) = split.unclosed_backtick_at {
+                // `rel` is relative to `trimmed`. The token spans `row_line`, which
+                // includes leading whitespace; account for that when computing the
+                // absolute offset into the SourceMap.
+                let leading_ws = row_line.len() - trimmed.len();
+                debug_assert!(
+                    rel < trimmed.len(),
+                    "unclosed_backtick_at {} out of bounds for trimmed (len {})",
+                    rel,
+                    trimmed.len()
+                );
+                let abs = tok.span.start as usize + leading_ws + rel;
+                self.diags.push(
+                    Diagnostic::new(Code::UnterminatedCode, Span::new(abs, 1))
+                        .label("inline code span never closed inside a table row"),
+                );
+                self.pos += 1;
+                continue;
+            }
+            let cells = split.cells;
             let mut parsed_cells: Vec<Vec<Inline>> = Vec::new();
             for c in cells {
                 let (inl, d) = parse_inline(c.trim(), tok.span.start);
@@ -1265,14 +1285,102 @@ fn leading_ordered_marker(s: &str) -> Option<(u32, usize)> {
     Some((n, i + 2))
 }
 
-fn split_cells(line: &str) -> Vec<&str> {
-    let trimmed = line.trim_end_matches('|');
-    let body = if trimmed.starts_with('|') {
-        &trimmed[1..]
-    } else {
-        trimmed
-    };
-    body.split('|').map(|s| s.trim()).collect()
+/// Outcome of splitting a table row.
+///
+/// `cells` borrow from the slice that was passed in (the `line` argument
+/// to `split_cells`). The caller is responsible for providing the line
+/// in whatever frame it wants `unclosed_backtick_at` to be relative to —
+/// see the doc comment on that field.
+#[derive(Debug)]
+struct RowSplit<'a> {
+    cells: Vec<&'a str>,
+    /// `Some(byte_offset)` if a backtick code span opened in this row
+    /// and never closed. The offset is relative to **the input slice
+    /// passed to `split_cells`** (i.e. the same `&str` whose address
+    /// the cell slices are also relative to). Callers that need an
+    /// absolute span into the source must add the offset of `line` from
+    /// the source start themselves.
+    unclosed_backtick_at: Option<usize>,
+}
+
+fn split_cells(line: &str) -> RowSplit<'_> {
+    let bytes = line.as_bytes();
+    // The leading `|` is the row-opener, not a cell separator.
+    let body_start = if bytes.first() == Some(&b'|') { 1 } else { 0 };
+    let body = &line[body_start..];
+    let body_bytes = body.as_bytes();
+    let mut cells: Vec<&str> = Vec::new();
+    let mut cell_start = 0usize;
+    let mut i = 0usize;
+    // Offset is relative to `line` (the parameter) — not to `body` —
+    // so callers can add `tok.span.start + leading_ws` and get an
+    // absolute byte offset into the source map.
+    let mut unclosed: Option<usize> = None;
+    while i < body_bytes.len() {
+        let b = body_bytes[i];
+        if b == b'\\' {
+            // Escape: skip the backslash and one following byte. The
+            // body is later passed to parse_inline which handles UTF-8;
+            // here we just need to *not* re-trigger on the escaped byte.
+            i += 1;
+            if i < body_bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'`' {
+            // Span length: 1 or 2 backticks. Matches the inline parser
+            // (see `inline.rs::parse_code`).
+            let ticks = if body_bytes.get(i + 1) == Some(&b'`') {
+                2
+            } else {
+                1
+            };
+            let span_open = i;
+            let needle: &[u8] = if ticks == 2 { b"``" } else { b"`" };
+            let mut j = i + ticks;
+            let mut closed = false;
+            while j + ticks <= body_bytes.len() {
+                if &body_bytes[j..j + ticks] == needle {
+                    j += ticks;
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            if !closed {
+                // Record the unclosed-backtick offset *relative to
+                // `line`* (so we add `body_start`, since `span_open` is
+                // relative to `body`). Stop splitting; the caller will
+                // emit a single Code::UnterminatedCode diagnostic.
+                unclosed = Some(body_start + span_open);
+                break;
+            }
+            i = j;
+            continue;
+        }
+        if b == b'|' {
+            cells.push(&body[cell_start..i]);
+            cell_start = i + 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    if unclosed.is_none() {
+        // Push the final cell. Strip a trailing empty cell only when the
+        // *source* used a `|` as a row-closer (cell_start lands right
+        // after the trailing `|`, leaving an empty slice).
+        let last = &body[cell_start..];
+        if !(last.is_empty() && cell_start > 0 && body_bytes[cell_start - 1] == b'|') {
+            cells.push(last);
+        }
+    }
+    let trimmed: Vec<&str> = cells.into_iter().map(str::trim).collect();
+    RowSplit {
+        cells: trimmed,
+        unclosed_backtick_at: unclosed,
+    }
 }
 
 #[cfg(test)]
@@ -1441,6 +1549,60 @@ mod tests {
     fn table_column_mismatch() {
         let (_, d) = p("@t\n| A | B | C\n| 1 | 2\n");
         assert!(d.iter().any(|x| x.code == Code::TableColumnMismatch));
+    }
+
+    #[test]
+    fn table_pipe_inside_inline_code_span_is_not_a_separator() {
+        // Production report issue #2: documenting `|>` should not blow up
+        // the row's column count.
+        let (doc, d) = p("@t\n| Op | Meaning\n| `|>` | pipeline\n");
+        assert!(d.is_empty(), "{:?}", d);
+        if let crate::ast::Block::Table { rows, .. } = &doc.blocks[0] {
+            assert_eq!(rows.len(), 1, "{:?}", rows);
+            assert_eq!(rows[0].cells.len(), 2);
+        } else {
+            panic!("expected table");
+        }
+    }
+
+    #[test]
+    fn table_pipe_inside_double_backtick_span_is_not_a_separator() {
+        let (doc, d) = p("@t\n| A | B\n| ``a ` b | c`` | d\n");
+        assert!(d.is_empty(), "{:?}", d);
+        if let crate::ast::Block::Table { rows, .. } = &doc.blocks[0] {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].cells.len(), 2);
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn table_unclosed_backtick_in_row_reports_unterminated_code_not_column_mismatch() {
+        let (_doc, d) = p("@t\n| A | B\n| `oops | c\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::UnterminatedCode),
+            "{:?}",
+            d
+        );
+        assert!(
+            !d.iter().any(|x| x.code == Code::TableColumnMismatch),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn table_unclosed_backtick_with_indented_row_diagnostic_anchors_correctly() {
+        // Two-space-indented `@t` (legal — tables can appear inside
+        // indented contexts). Diagnostic offset must include the leading
+        // whitespace, not just the post-trim column.
+        let (_doc, d) = p("  @t\n  | A | B\n  | `oops | c\n");
+        let unterm: Vec<_> = d
+            .iter()
+            .filter(|x| x.code == Code::UnterminatedCode)
+            .collect();
+        assert_eq!(unterm.len(), 1, "{:?}", d);
     }
 
     #[test]

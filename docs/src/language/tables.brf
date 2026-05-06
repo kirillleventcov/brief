@@ -33,6 +33,23 @@ whitespace.
 - Inline content inside a cell is parsed as inline — emphasis, inline
   code, and inline shortcodes work.
 
+## Cell content and `|`
+
+Cells split on `|` *outside* inline code spans. A backtick-delimited code
+span is opaque to the row splitter, so pipe operators, regex alternation,
+and similar `|`-using snippets can live inside a cell without escaping:
+
+@t
+| Op | Meaning
+| `|>` | pipeline
+| `a | b` | alternation
+
+Outside code spans, escape a literal `|` as `\|`.
+
+If a backtick is opened in a row but never closed, the compiler reports
+@ec[B0208] (`unterminated inline code span`) anchored at the open
+backtick — the row is not also flagged for a column mismatch.
+
 ## Column alignment
 
 Alignment is set on the directive line as an array argument:

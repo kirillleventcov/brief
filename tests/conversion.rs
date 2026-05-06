@@ -43,14 +43,20 @@ fn atx_heading_h6() {
 #[test]
 fn setext_h1_rewritten_to_atx() {
     let (out, holes) = run("Title\n=====\n");
-    assert_eq!(out, "# Title\n");
+    assert_eq!(
+        out,
+        "# Title\n// TODO[B-hole:setext-heading]: rewritten to `# ...`\n"
+    );
     assert_eq!(holes, vec![Hole::SetextHeading]);
 }
 
 #[test]
 fn setext_h2_rewritten_to_atx() {
     let (out, holes) = run("Title\n-----\n");
-    assert_eq!(out, "## Title\n");
+    assert_eq!(
+        out,
+        "## Title\n// TODO[B-hole:setext-heading]: rewritten to `## ...`\n"
+    );
     assert_eq!(holes, vec![Hole::SetextHeading]);
 }
 
@@ -64,28 +70,40 @@ fn underscore_italic_clean() {
 #[test]
 fn asterisk_italic_rewritten() {
     let (out, holes) = run("a *italic* b\n");
-    assert_eq!(out, "a _italic_ b\n");
+    assert_eq!(
+        out,
+        "a _italic_ b\n\n// TODO[B-hole:asterisk-emphasis]: Markdown `*italic*` rewritten to Brief `_italic_`\n"
+    );
     assert_eq!(holes, vec![Hole::AsteriskEmphasis]);
 }
 
 #[test]
 fn double_asterisk_strong() {
     let (out, holes) = run("a **bold** b\n");
-    assert_eq!(out, "a *bold* b\n");
+    assert_eq!(
+        out,
+        "a *bold* b\n\n// TODO[B-hole:double-emphasis]: doubled emphasis marker rewritten to single `*`\n"
+    );
     assert_eq!(holes, vec![Hole::DoubleEmphasis]);
 }
 
 #[test]
 fn double_underscore_strong() {
     let (out, holes) = run("a __bold__ b\n");
-    assert_eq!(out, "a *bold* b\n");
+    assert_eq!(
+        out,
+        "a *bold* b\n\n// TODO[B-hole:double-emphasis]: doubled emphasis marker rewritten to single `*`\n"
+    );
     assert_eq!(holes, vec![Hole::DoubleEmphasis]);
 }
 
 #[test]
 fn strikethrough() {
     let (out, holes) = run("a ~~strike~~ b\n");
-    assert_eq!(out, "a ~strike~ b\n");
+    assert_eq!(
+        out,
+        "a ~strike~ b\n\n// TODO[B-hole:double-emphasis]: doubled strikethrough rewritten to single `~`\n"
+    );
     assert_eq!(holes, vec![Hole::DoubleEmphasis]);
 }
 
@@ -124,14 +142,20 @@ fn fenced_code_no_lang() {
 #[test]
 fn tilde_fence_rewritten() {
     let (out, holes) = run("~~~rust\nfn x() {}\n~~~\n");
-    assert_eq!(out, "```rust\nfn x() {}\n```\n");
+    assert_eq!(
+        out,
+        "```rust\nfn x() {}\n```\n// TODO[B-hole:tilde-fence]: `~~~` fence rewritten to ```` ``` ```` fence\n"
+    );
     assert_eq!(holes, vec![Hole::TildeFence]);
 }
 
 #[test]
 fn indented_code_block_rewritten() {
     let (out, holes) = run("    let x = 1;\n    let y = 2;\n");
-    assert_eq!(out, "```\nlet x = 1;\nlet y = 2;\n```\n");
+    assert_eq!(
+        out,
+        "```\nlet x = 1;\nlet y = 2;\n```\n// TODO[B-hole:indented-code-block]: indented code block rewritten to fenced block\n"
+    );
     assert_eq!(holes, vec![Hole::IndentedCodeBlock]);
 }
 
@@ -159,14 +183,20 @@ fn dash_bullet_clean() {
 #[test]
 fn star_bullet_rewritten() {
     let (out, holes) = run("* a\n* b\n");
-    assert_eq!(out, "- a\n- b\n");
+    assert_eq!(
+        out,
+        "- a\n- b\n// TODO[B-hole:alt-bullet]: `*` bullet rewritten to `-`\n// TODO[B-hole:alt-bullet]: `*` bullet rewritten to `-`\n"
+    );
     assert_eq!(holes, vec![Hole::AltBullet, Hole::AltBullet]);
 }
 
 #[test]
 fn plus_bullet_rewritten() {
     let (out, holes) = run("+ a\n+ b\n");
-    assert_eq!(out, "- a\n- b\n");
+    assert_eq!(
+        out,
+        "- a\n- b\n// TODO[B-hole:alt-bullet]: `+` bullet rewritten to `-`\n// TODO[B-hole:alt-bullet]: `+` bullet rewritten to `-`\n"
+    );
     assert_eq!(holes, vec![Hole::AltBullet, Hole::AltBullet]);
 }
 
@@ -180,7 +210,10 @@ fn ordered_list_clean() {
 #[test]
 fn ordered_list_starting_at_5() {
     let (out, holes) = run("5. one\n6. two\n");
-    assert_eq!(out, "1. one\n2. two\n");
+    assert_eq!(
+        out,
+        "1. one\n2. two\n// TODO[B-hole:ordered-renumber]: ordered list started at 5; renumbered from 1\n"
+    );
     assert_eq!(holes, vec![Hole::OrderedRenumber]);
 }
 
@@ -234,22 +267,36 @@ fn nested_blockquote() {
     // structural blank line between "outer" and the inner quote, both of which
     // we have no way to suppress. Switch to a deliberately separated nested
     // form whose semantics are stable across CM/GFM parsers.
+    //
+    // The blank `>` line in the input causes pulldown-cmark to emit a structural
+    // paragraph break between "outer" and the nested blockquote. The converter
+    // rewrites this as two adjacent Brief blockquotes (separated by a blank line)
+    // and flags BlockquoteParagraphSplit.
     let (out, holes) = run("> outer\n>\n> > nested\n");
-    assert_eq!(out, "> outer\n>\n> > nested\n");
-    assert!(holes.is_empty(), "{:?}", holes);
+    assert_eq!(
+        out,
+        "> outer\n\n> > nested\n// TODO[B-hole:blockquote-paragraph-split]: in-quote paragraph break rewritten to adjacent blockquotes\n"
+    );
+    assert_eq!(holes, vec![Hole::BlockquoteParagraphSplit]);
 }
 
 #[test]
 fn gfm_alert_note() {
     let (out, holes) = run("> [!NOTE]\n> body\n");
-    assert_eq!(out, "@callout(kind: note)\nbody\n@end\n");
+    assert_eq!(
+        out,
+        "@callout(kind: note)\n// TODO[B-hole:gfm-alert]: GFM alert mapped to `@callout(kind: note)`\nbody\n@end\n"
+    );
     assert_eq!(holes, vec![Hole::GfmAlert]);
 }
 
 #[test]
 fn gfm_alert_warning() {
     let (out, holes) = run("> [!WARNING]\n> careful\n");
-    assert_eq!(out, "@callout(kind: warning)\ncareful\n@end\n");
+    assert_eq!(
+        out,
+        "@callout(kind: warning)\n// TODO[B-hole:gfm-alert]: GFM alert mapped to `@callout(kind: warning)`\ncareful\n@end\n"
+    );
     assert_eq!(holes, vec![Hole::GfmAlert]);
 }
 
@@ -263,21 +310,30 @@ fn hr_clean() {
 #[test]
 fn hr_asterisks_rewritten() {
     let (out, holes) = run("***\n");
-    assert_eq!(out, "---\n");
+    assert_eq!(
+        out,
+        "---\n// TODO[B-hole:alt-horizontal-rule]: `***` rewritten to `---`\n"
+    );
     assert_eq!(holes, vec![Hole::AltHorizontalRule]);
 }
 
 #[test]
 fn hr_underscores_rewritten() {
     let (out, holes) = run("___\n");
-    assert_eq!(out, "---\n");
+    assert_eq!(
+        out,
+        "---\n// TODO[B-hole:alt-horizontal-rule]: `___` rewritten to `---`\n"
+    );
     assert_eq!(holes, vec![Hole::AltHorizontalRule]);
 }
 
 #[test]
 fn hr_spaced_dashes_rewritten() {
     let (out, holes) = run("- - -\n");
-    assert_eq!(out, "---\n");
+    assert_eq!(
+        out,
+        "---\n// TODO[B-hole:alt-horizontal-rule]: `- - -` rewritten to `---`\n"
+    );
     assert_eq!(holes, vec![Hole::AltHorizontalRule]);
 }
 
@@ -552,7 +608,10 @@ fn converted_details_round_trips_through_compiler() {
 fn heading_anchor_slugified_when_invalid() {
     let md = "## Title {#Some_ID}\n";
     let (out, holes) = run(md);
-    assert_eq!(out, "## Title {#some-id}\n");
+    assert_eq!(
+        out,
+        "## Title {#some-id}\n// TODO[B-hole:heading-anchor-slugged]: anchor `Some_ID` rewritten to `some-id`\n"
+    );
     assert_eq!(holes, vec![Hole::HeadingAnchorSlugged]);
 }
 
@@ -716,35 +775,50 @@ fn link_with_title_roundtrips_through_compiler() {
 #[test]
 fn gfm_alert_tip() {
     let (out, holes) = run("> [!TIP]\n> body\n");
-    assert_eq!(out, "@callout(kind: tip)\nbody\n@end\n");
+    assert_eq!(
+        out,
+        "@callout(kind: tip)\n// TODO[B-hole:gfm-alert]: GFM alert mapped to `@callout(kind: tip)`\nbody\n@end\n"
+    );
     assert_eq!(holes, vec![Hole::GfmAlert]);
 }
 
 #[test]
 fn gfm_alert_important() {
     let (out, holes) = run("> [!IMPORTANT]\n> body\n");
-    assert_eq!(out, "@callout(kind: important)\nbody\n@end\n");
+    assert_eq!(
+        out,
+        "@callout(kind: important)\n// TODO[B-hole:gfm-alert]: GFM alert mapped to `@callout(kind: important)`\nbody\n@end\n"
+    );
     assert_eq!(holes, vec![Hole::GfmAlert]);
 }
 
 #[test]
 fn gfm_alert_caution() {
     let (out, holes) = run("> [!CAUTION]\n> body\n");
-    assert_eq!(out, "@callout(kind: caution)\nbody\n@end\n");
+    assert_eq!(
+        out,
+        "@callout(kind: caution)\n// TODO[B-hole:gfm-alert]: GFM alert mapped to `@callout(kind: caution)`\nbody\n@end\n"
+    );
     assert_eq!(holes, vec![Hole::GfmAlert]);
 }
 
 #[test]
 fn gfm_alert_warning_maps_to_warning() {
     let (out, holes) = run("> [!WARNING]\n> careful\n");
-    assert_eq!(out, "@callout(kind: warning)\ncareful\n@end\n");
+    assert_eq!(
+        out,
+        "@callout(kind: warning)\n// TODO[B-hole:gfm-alert]: GFM alert mapped to `@callout(kind: warning)`\ncareful\n@end\n"
+    );
     assert_eq!(holes, vec![Hole::GfmAlert]);
 }
 
 #[test]
 fn gfm_alert_note_maps_to_note() {
     let (out, holes) = run("> [!NOTE]\n> content\n");
-    assert_eq!(out, "@callout(kind: note)\ncontent\n@end\n");
+    assert_eq!(
+        out,
+        "@callout(kind: note)\n// TODO[B-hole:gfm-alert]: GFM alert mapped to `@callout(kind: note)`\ncontent\n@end\n"
+    );
     assert_eq!(holes, vec![Hole::GfmAlert]);
 }
 

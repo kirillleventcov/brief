@@ -23,7 +23,8 @@ pub struct Diag {
 pub enum Hole {
     SetextHeading,
     DefinitionListMultipleDefs,
-    DoubleEmphasis,   // **x**, __x__, ~~x~~
+    DoubleEmphasis, // **x**, __x__, ~~x~~
+    EscapedSigil,
     AsteriskEmphasis, // *em* (Markdown italic)
     AltBullet,        // * or + bullet
     OrderedRenumber,
@@ -40,6 +41,9 @@ pub enum Hole {
     Frontmatter,
     HtmlEntity,
     HeadingAnchorSlugged,
+    BlockquoteParagraphSplit,
+    TableCellPipeEscape,
+    EmptyTableCell,
 }
 
 impl Hole {
@@ -49,6 +53,7 @@ impl Hole {
             Hole::SetextHeading => "setext-heading",
             Hole::DefinitionListMultipleDefs => "definition-list-multiple-defs",
             Hole::DoubleEmphasis => "double-emphasis",
+            Hole::EscapedSigil => "escaped-sigil",
             Hole::AsteriskEmphasis => "asterisk-emphasis",
             Hole::AltBullet => "alt-bullet",
             Hole::OrderedRenumber => "ordered-renumber",
@@ -65,6 +70,9 @@ impl Hole {
             Hole::Frontmatter => "frontmatter",
             Hole::HtmlEntity => "html-entity",
             Hole::HeadingAnchorSlugged => "heading-anchor-slugged",
+            Hole::BlockquoteParagraphSplit => "blockquote-paragraph-split",
+            Hole::TableCellPipeEscape => "table-cell-pipe-escape",
+            Hole::EmptyTableCell => "empty-table-cell",
         }
     }
 
@@ -76,6 +84,9 @@ impl Hole {
                 "definition list term repeated for each of multiple Markdown definitions (Brief v0.3 limitation)"
             }
             Hole::DoubleEmphasis => "doubled emphasis marker rewritten to single",
+            Hole::EscapedSigil => {
+                "literal `*`/`_`/`+`/`~` in text escaped to keep Brief from opening an emphasis span"
+            }
             Hole::AsteriskEmphasis => "Markdown `*italic*` rewritten to Brief `_italic_`",
             Hole::AltBullet => "`*`/`+` bullet rewritten to `-`",
             Hole::OrderedRenumber => "ordered list renumbered to sequential 1,2,3,...",
@@ -92,6 +103,11 @@ impl Hole {
             Hole::Frontmatter => "frontmatter dropped, replaced with TODO comment",
             Hole::HtmlEntity => "HTML entity decoded to literal character",
             Hole::HeadingAnchorSlugged => "heading anchor id rewritten to `[a-z0-9-]+` slug",
+            Hole::BlockquoteParagraphSplit => {
+                "Markdown in-quote paragraph break rewritten to two adjacent Brief blockquotes"
+            }
+            Hole::TableCellPipeEscape => "`|` inside table cell escaped to `\\|`",
+            Hole::EmptyTableCell => "empty Markdown table cell padded with em-dash",
         }
     }
 }
@@ -207,8 +223,8 @@ struct Walker<'a> {
     link_stack: Vec<(String, Option<(Hole, String)>)>,
     /// Footnote labels → body text (rendered as a flat string).
     footnote_defs: std::collections::BTreeMap<String, String>,
-    /// HTML-derived comment lines pending insertion before the next paragraph.
-    pending_html_comments: Vec<String>,
+    /// Hole TODO comment lines pending insertion before the next block.
+    pending_hole_comments: Vec<String>,
     in_metadata: bool,
     metadata_buf: String,
     metadata_kind: Option<pulldown_cmark::MetadataBlockKind>,
@@ -373,7 +389,7 @@ impl<'a> Walker<'a> {
             dl: None,
             link_stack: Vec::new(),
             footnote_defs: std::collections::BTreeMap::new(),
-            pending_html_comments: Vec::new(),
+            pending_hole_comments: Vec::new(),
             in_metadata: false,
             metadata_buf: String::new(),
             metadata_kind: None,
@@ -385,6 +401,7 @@ impl<'a> Walker<'a> {
     fn visit(&mut self, event: Event<'_>, range: std::ops::Range<usize>) {
         match event {
             Event::Start(Tag::List(start)) => {
+                self.flush_pending_hole_comments();
                 let ordered = start.is_some();
                 if let Some(n) = start {
                     if n != 1 {
@@ -487,9 +504,10 @@ impl<'a> Walker<'a> {
                 }
             }
             Event::Start(Tag::Paragraph) => {
+                self.flush_pending_hole_comments();
                 self.in_paragraph = true;
                 // Defer paragraph content into a buffer so we can prepend any
-                // HTML-comment lines collected from inline-HTML events before
+                // hole-comment lines collected from inline events before
                 // emitting the paragraph itself.
                 self.out_stack.push(String::new());
                 self.container_stack.push(Container::Paragraph);
@@ -498,10 +516,6 @@ impl<'a> Walker<'a> {
                 self.in_paragraph = false;
                 let body = self.out_stack.pop().expect("paragraph buffer");
                 let _ = self.container_stack.pop();
-                for c in std::mem::take(&mut self.pending_html_comments) {
-                    self.write(&c);
-                    self.write_char('\n');
-                }
                 self.write(&body);
                 if self.list_stack.is_empty() {
                     self.write_char('\n');
@@ -512,6 +526,7 @@ impl<'a> Walker<'a> {
                 }
             }
             Event::Start(Tag::Heading { level, id, .. }) => {
+                self.flush_pending_hole_comments();
                 let n = match level {
                     pulldown_cmark::HeadingLevel::H1 => 1,
                     pulldown_cmark::HeadingLevel::H2 => 2,
@@ -616,6 +631,7 @@ impl<'a> Walker<'a> {
                 }
             }
             Event::Start(Tag::CodeBlock(kind)) => {
+                self.flush_pending_hole_comments();
                 use pulldown_cmark::CodeBlockKind;
                 self.in_code_block = true;
                 match kind {
@@ -662,7 +678,21 @@ impl<'a> Walker<'a> {
                 if self.in_code_block {
                     self.write(&t);
                 } else {
-                    self.write(&t);
+                    let escaped = escape_brief_inline_text(&t);
+                    if escaped != *t {
+                        // Any sigil that needed escaping is a hole — flag it so the
+                        // user can spot-check whether Brief renders the literal
+                        // intent.
+                        self.push_diag(
+                            Hole::EscapedSigil,
+                            range.clone(),
+                            format!(
+                                "escaped emphasis sigil(s) in literal text: {:?}",
+                                t.chars().take(40).collect::<String>()
+                            ),
+                        );
+                    }
+                    self.write(&escaped);
                 }
             }
             Event::TaskListMarker(checked) => {
@@ -672,6 +702,7 @@ impl<'a> Walker<'a> {
                 self.write(if checked { "[x] " } else { "[ ] " });
             }
             Event::Start(Tag::BlockQuote(kind)) => {
+                self.flush_pending_hole_comments();
                 use pulldown_cmark::BlockQuoteKind;
                 let container = match kind {
                     None => Container::Quote,
@@ -728,14 +759,51 @@ impl<'a> Walker<'a> {
                 let trimmed = inner.trim_end_matches('\n');
                 match container {
                     Container::Quote => {
+                        // Accumulate groups of consecutive non-empty lines. A blank line
+                        // ends the current group; multiple blanks collapse to one
+                        // separator. Brief's paragraph break inside a blockquote does not
+                        // exist as a feature — it's modeled by ending the `>`-block with a
+                        // blank line and starting a new one on the next non-empty line.
+                        let mut groups: Vec<Vec<&str>> = Vec::new();
+                        let mut cur: Vec<&str> = Vec::new();
                         for line in trimmed.split('\n') {
                             if line.is_empty() {
-                                self.write_char('>');
-                            } else {
+                                if !cur.is_empty() {
+                                    groups.push(std::mem::take(&mut cur));
+                                }
+                                // Consecutive blanks: drop, no-op (only one separator
+                                // matters between two non-empty groups).
+                                continue;
+                            }
+                            cur.push(line);
+                        }
+                        if !cur.is_empty() {
+                            groups.push(cur);
+                        }
+                        let saw_blank = groups.len() > 1;
+                        for (gi, group) in groups.iter().enumerate() {
+                            if gi > 0 {
+                                // Empty source line — terminates the previous Brief
+                                // blockquote and starts the next one. This is the line
+                                // whose absence produced the original bug.
+                                self.write_char('\n');
+                            }
+                            for line in group {
                                 self.write("> ");
                                 self.write(line);
+                                self.write_char('\n');
                             }
-                            self.write_char('\n');
+                        }
+                        if saw_blank {
+                            // `range` is the End(TagEnd::BlockQuote(_)) event's range — the
+                            // surrounding match arm parameter. It points at the close of the
+                            // Markdown blockquote, which is the best signal we have for
+                            // where the break originated.
+                            self.push_diag(
+                                Hole::BlockquoteParagraphSplit,
+                                range.clone(),
+                                "in-quote paragraph break rewritten to adjacent blockquotes".into(),
+                            );
                         }
                     }
                     Container::Alert(_, kind) => {
@@ -760,6 +828,7 @@ impl<'a> Walker<'a> {
                 }
             }
             Event::Rule => {
+                self.flush_pending_hole_comments();
                 let snippet = self.src.get(range.clone()).unwrap_or("").trim();
                 let is_clean_dashes = snippet == "---";
                 if !is_clean_dashes {
@@ -893,6 +962,7 @@ impl<'a> Walker<'a> {
                 self.write("\")[]");
             }
             Event::Start(Tag::Table(aligns)) => {
+                self.flush_pending_hole_comments();
                 self.table = Some(TableState {
                     aligns,
                     rows: Vec::new(),
@@ -931,6 +1001,7 @@ impl<'a> Walker<'a> {
                 }
             }
             Event::Start(Tag::DefinitionList) => {
+                self.flush_pending_hole_comments();
                 // Ensure preceding blank line, same convention as paragraphs
                 // and lists.
                 if !self.out.is_empty() && !self.out.ends_with("\n\n") {
@@ -1029,11 +1100,9 @@ impl<'a> Walker<'a> {
                             range.clone(),
                             "frontmatter dropped, replaced with TODO comment".into(),
                         );
-                        let summary: String =
-                            body.chars().take(60).collect::<String>().replace('\n', " ");
-                        self.write("// TODO[B-hole:frontmatter]: ");
-                        self.write(&summary);
-                        self.write_char('\n');
+                        // Flush the pending hole comment (just pushed by push_diag)
+                        // so it appears immediately at the frontmatter site.
+                        self.flush_pending_hole_comments();
                     }
                 }
             }
@@ -1130,8 +1199,8 @@ impl<'a> Walker<'a> {
                     range.clone(),
                     format!("`{}` preserved as TODO comment", snippet.trim()),
                 );
-                self.pending_html_comments
-                    .push(format!("// TODO[B-hole:inline-html]: {}", snippet.trim()));
+                // push_diag already queued a pending_hole_comments entry;
+                // it will be flushed before the next block-level event.
             }
             Event::FootnoteReference(label) => {
                 let body = self
@@ -1169,6 +1238,9 @@ impl<'a> Walker<'a> {
     }
 
     fn finish(mut self) -> ConvertResult {
+        // Drain any TODO comments queued by the last block — there's no
+        // subsequent Start event to flush them.
+        self.flush_pending_hole_comments();
         // Trim trailing blank lines down to a single newline.
         while self.out.ends_with("\n\n") {
             self.out.pop();
@@ -1209,8 +1281,25 @@ impl<'a> Walker<'a> {
             line,
             col,
             original,
-            note,
+            note: note.clone(),
         });
+        // Surface every hole as a `// TODO[B-hole:slug]:` line so a reviewer
+        // can grep the converted corpus. Flushed before the next block.
+        self.pending_hole_comments
+            .push(format!("// TODO[B-hole:{}]: {}", hole.slug(), note));
+    }
+
+    fn flush_pending_hole_comments(&mut self) {
+        for c in std::mem::take(&mut self.pending_hole_comments) {
+            // Write to top buffer (or `out`).
+            if let Some(buf) = self.out_stack.last_mut() {
+                buf.push_str(&c);
+                buf.push('\n');
+            } else {
+                self.out.push_str(&c);
+                self.out.push('\n');
+            }
+        }
     }
 
     /// Emit a buffered HTML block as the existing TODO + `/* */` comment
@@ -1221,7 +1310,9 @@ impl<'a> Walker<'a> {
             range,
             "HTML block preserved inside Brief block comment".into(),
         );
-        self.write("// TODO[B-hole:html-block]\n");
+        // Flush the pending hole comment (just pushed by push_diag) so it
+        // appears immediately before the block comment, not deferred.
+        self.flush_pending_hole_comments();
         self.write("/*\n");
         // Brief block comments don't nest; sanitize any embedded `*/` so
         // the comment terminates only where we want it to.
@@ -1252,16 +1343,42 @@ impl<'a> Walker<'a> {
         } else {
             self.write("@t\n");
         }
+        let mut saw_pipe_escape = false;
         for row in &state.rows {
             self.write("|");
             for (i, cell) in row.iter().enumerate() {
                 self.write(" ");
-                self.write(cell.trim());
+                let trimmed = cell.trim();
+                let (escaped, escaped_pipe) = if trimmed.is_empty() {
+                    self.diags.push(Diag {
+                        hole: Hole::EmptyTableCell,
+                        line: 0,
+                        col: 0,
+                        original: String::new(),
+                        note: "empty Markdown table cell padded with `—`".into(),
+                    });
+                    ("—".to_string(), false)
+                } else {
+                    escape_table_cell(trimmed)
+                };
+                if escaped_pipe {
+                    saw_pipe_escape = true;
+                }
+                self.write(&escaped);
                 if i + 1 < row.len() {
                     self.write(" |");
                 }
             }
             self.write("\n");
+        }
+        if saw_pipe_escape {
+            self.diags.push(Diag {
+                hole: Hole::TableCellPipeEscape,
+                line: 0,
+                col: 0,
+                original: String::new(),
+                note: "`|` inside table cell escaped to `\\|`".into(),
+            });
         }
     }
 }
@@ -1318,6 +1435,32 @@ fn classify_inline_html_close(s: &str) -> Option<HtmlInlineKind> {
 fn is_inline_br(s: &str) -> bool {
     let t = s.trim().to_ascii_lowercase();
     matches!(t.as_str(), "<br>" | "<br/>" | "<br />")
+}
+
+/// Escape unescaped `|` characters in cell content so Brief's row
+/// splitter sees one cell. Returns `(escaped_string, did_any_escape)`.
+///
+/// We deliberately do NOT track whether we are inside a backtick code
+/// span here. After Phase B (parser backtick-aware split), `|` inside a
+/// backtick span is already opaque to the row splitter, but `\|` outside
+/// a code span is still the canonical Brief escape for a literal `|`.
+/// Always escaping is simpler and never wrong.
+fn escape_table_cell(s: &str) -> (String, bool) {
+    let mut out = String::with_capacity(s.len());
+    let mut escaped = false;
+    let mut prev_backslash = false;
+    for ch in s.chars() {
+        if ch == '|' && !prev_backslash {
+            out.push('\\');
+            out.push('|');
+            escaped = true;
+            prev_backslash = false;
+            continue;
+        }
+        prev_backslash = ch == '\\' && !prev_backslash;
+        out.push(ch);
+    }
+    (out, escaped)
 }
 
 /// Escape a summary string for use inside `@details(summary: "...")`.
@@ -1436,6 +1579,66 @@ fn strip_tags(s: &str) -> String {
     out
 }
 
+/// Walk `s` and prepend `\` before every `*`/`_`/`+`/`~` for which
+/// Brief's `is_open_marker_at` predicate fires — those would otherwise
+/// open an emphasis span in the converted Brief output. Markdown's
+/// parser already paired any *real* emphasis as `Start/End(Emphasis)`,
+/// so any sigil reaching us inside `Event::Text` was a literal in the
+/// source.
+///
+/// Pulldown-cmark may split text around strikethrough/emphasis candidates
+/// (e.g. `~10` becomes two events: `"~"` and `"10..."`). A sigil at the
+/// *end* of the text string has no visible next-char in this fragment, but
+/// when the Brief output is assembled the next event's first char follows
+/// immediately — making the sigil a valid opener in Brief. We therefore
+/// also escape sigils that have valid left-context and sit at the end of
+/// the string (conservatively treating the boundary as "next char unknown").
+fn escape_brief_inline_text(s: &str) -> String {
+    use crate::inline::{is_inline_sigil, is_open_marker_at, is_punct};
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if matches!(b, b'*' | b'_' | b'+' | b'~') {
+            // Check the shared predicate first (handles mid-string case).
+            let should_escape = is_open_marker_at(bytes, i) || {
+                // Also escape a sigil at the end of the text fragment if it
+                // has valid left-context: the next text event may start with
+                // a non-space char, making this a valid emphasis opener in
+                // the concatenated Brief output.
+                let is_last = i + 1 == bytes.len();
+                if is_last {
+                    let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
+                    let prev_ok = match prev {
+                        None => true,
+                        Some(b' ') => true,
+                        Some(pb) if is_inline_sigil(pb) => true,
+                        Some(pb) if is_punct(pb) => true,
+                        _ => false,
+                    };
+                    // prev must not be the same marker (doubled-marker rule)
+                    let not_doubled = prev != Some(b);
+                    prev_ok && not_doubled
+                } else {
+                    false
+                }
+            };
+            if should_escape {
+                out.push('\\');
+                out.push(b as char);
+                let w = s[i..].chars().next().map_or(1, |c| c.len_utf8());
+                i += w;
+                continue;
+            }
+        }
+        let w = s[i..].chars().next().map_or(1, |c| c.len_utf8());
+        out.push_str(&s[i..i + w]);
+        i += w;
+    }
+    out
+}
+
 fn compute_line_offsets(s: &str) -> Vec<usize> {
     let mut v = vec![0usize];
     for (i, b) in s.bytes().enumerate() {
@@ -1495,5 +1698,167 @@ mod tests {
         let (doc, diags) = crate::parser::parse(toks, &src);
         assert!(diags.is_empty(), "{:?}\n---\n{}", diags, res.brief_source);
         assert!(doc.metadata.is_some());
+    }
+
+    #[test]
+    fn tilde_before_digit_inside_emphasis_round_trips() {
+        // Production report pattern #1: `*…patch exceeds ~10 ops, any value
+        // exceeds ~50 lines…*` opens a strikethrough on `~10` that never
+        // closes, producing B0204 + B0207 in Brief.
+        let md = "*patch exceeds ~10 ops, any value exceeds ~50 lines*\n";
+        let res = convert(md, "in.md");
+        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = crate::lexer::lex(&src).expect("lex ok");
+        let (_doc, diags) = crate::parser::parse(toks, &src);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == crate::diag::Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "converter output failed to compile: {:?}\nbrief: {}",
+            errors,
+            res.brief_source
+        );
+    }
+
+    #[test]
+    fn asterisk_in_heading_text_round_trips() {
+        // Production report pattern #2: `### 8.6 Set an attribute (href, aria-*, …)`.
+        let md = "### 8.6 Set an attribute (href, aria-*, …)\n";
+        let res = convert(md, "in.md");
+        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = crate::lexer::lex(&src).expect("lex ok");
+        let (_doc, diags) = crate::parser::parse(toks, &src);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == crate::diag::Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{:?}\nbrief: {}",
+            errors,
+            res.brief_source
+        );
+        assert!(
+            res.brief_source.contains(r"aria-\*"),
+            "brief: {}",
+            res.brief_source
+        );
+    }
+
+    #[test]
+    fn empty_blockquote_line_splits_into_adjacent_quotes() {
+        let md = "> first paragraph\n> still first\n>\n> second paragraph\n";
+        let res = convert(md, "in.md");
+        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = crate::lexer::lex(&src).expect("lex ok");
+        let (doc, diags) = crate::parser::parse(toks, &src);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == crate::diag::Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{:?}\nbrief: {}",
+            errors,
+            res.brief_source
+        );
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.hole == Hole::BlockquoteParagraphSplit),
+            "{:?}",
+            res.diagnostics
+        );
+        let blockquote_count = doc
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, crate::ast::Block::Blockquote { .. }))
+            .count();
+        assert_eq!(
+            blockquote_count, 2,
+            "expected two adjacent blockquotes; got blocks {:?}\nbrief: {}",
+            doc.blocks, res.brief_source
+        );
+    }
+
+    #[test]
+    fn pipe_in_cell_is_escaped() {
+        // Production report pattern #4.
+        let md = "| Kind | Example |\n| --- | --- |\n| separator | \"semantic\"\\|\"utility\" |\n";
+        let res = convert(md, "in.md");
+        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = crate::lexer::lex(&src).expect("lex ok");
+        let (_doc, diags) = crate::parser::parse(toks, &src);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == crate::diag::Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{:?}\nbrief: {}",
+            errors,
+            res.brief_source
+        );
+        assert!(
+            res.brief_source.contains(r#""semantic"\|"utility""#),
+            "brief: {}",
+            res.brief_source
+        );
+    }
+
+    #[test]
+    fn empty_trailing_cell_is_padded() {
+        // Production report pattern #5.
+        let md = "| Value | Type | Note |\n| --- | --- | --- |\n| true/false | Boolean |  |\n";
+        let res = convert(md, "in.md");
+        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = crate::lexer::lex(&src).expect("lex ok");
+        let (_doc, diags) = crate::parser::parse(toks, &src);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == crate::diag::Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{:?}\nbrief: {}",
+            errors,
+            res.brief_source
+        );
+        assert!(
+            res.brief_source.contains("—"),
+            "brief: {}",
+            res.brief_source
+        );
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.hole == Hole::EmptyTableCell),
+            "{:?}",
+            res.diagnostics
+        );
+    }
+
+    #[test]
+    fn double_emphasis_emits_inline_todo_comment() {
+        let md = "**bold text** in a paragraph\n";
+        let res = convert(md, "in.md");
+        assert!(
+            res.brief_source.contains("// TODO[B-hole:double-emphasis]"),
+            "brief: {}",
+            res.brief_source
+        );
+    }
+
+    #[test]
+    fn last_block_hole_flushes_at_eof() {
+        let md = "trailing **bold** at the end of doc\n";
+        let res = convert(md, "in.md");
+        assert!(
+            res.brief_source.contains("// TODO[B-hole:double-emphasis]"),
+            "EOF flush dropped the trailing hole's comment\nbrief: {}",
+            res.brief_source
+        );
     }
 }

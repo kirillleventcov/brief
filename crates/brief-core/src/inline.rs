@@ -103,29 +103,7 @@ impl<'a> Parser<'a> {
     }
 
     fn is_open_marker(&self) -> bool {
-        let bytes = self.src.as_bytes();
-        let pos = self.pos;
-        let marker = bytes[pos];
-        let prev = if pos == 0 { None } else { Some(bytes[pos - 1]) };
-        let next = bytes.get(pos + 1).copied();
-        if next == Some(marker) {
-            return false;
-        }
-        // A marker preceded by the same marker is part of a doubled-marker
-        // sequence (e.g. `**bold**` -> the second `*` would otherwise look
-        // like a valid opener). Doubled markers are forbidden, so refuse.
-        if prev == Some(marker) {
-            return false;
-        }
-        let prev_ok = match prev {
-            None => true,
-            Some(b' ') => true,
-            Some(b) if is_inline_sigil(b) => true,
-            Some(b) if is_punct(b) => true,
-            _ => false,
-        };
-        let next_ok = matches!(next, Some(b) if b != b' ' && b != marker);
-        prev_ok && next_ok
+        is_open_marker_at(self.src.as_bytes(), self.pos)
     }
 
     fn is_close_marker(&self, marker: u8) -> bool {
@@ -377,15 +355,40 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn is_inline_sigil(b: u8) -> bool {
+pub(crate) fn is_inline_sigil(b: u8) -> bool {
     matches!(b, b'*' | b'_' | b'+' | b'~' | b'`' | b'@' | b'[' | b']')
 }
 
-fn is_punct(b: u8) -> bool {
+pub(crate) fn is_punct(b: u8) -> bool {
     matches!(
         b,
         b'.' | b',' | b';' | b':' | b'!' | b'?' | b')' | b'(' | b'"' | b'\'' | b'-' | b'/'
     )
+}
+
+/// `true` if `bytes[pos]` (which must be one of `*`/`_`/`+`/`~`) would
+/// open an emphasis span at this position under Brief's flanking rules.
+/// Shared between the inline parser and the Markdown→Brief converter so
+/// the two cannot drift.
+pub(crate) fn is_open_marker_at(bytes: &[u8], pos: usize) -> bool {
+    let marker = match bytes.get(pos) {
+        Some(&b @ (b'*' | b'_' | b'+' | b'~')) => b,
+        _ => return false,
+    };
+    let prev = if pos == 0 { None } else { Some(bytes[pos - 1]) };
+    let next = bytes.get(pos + 1).copied();
+    if next == Some(marker) || prev == Some(marker) {
+        return false;
+    }
+    let prev_ok = match prev {
+        None => true,
+        Some(b' ') => true,
+        Some(b) if is_inline_sigil(b) => true,
+        Some(b) if is_punct(b) => true,
+        _ => false,
+    };
+    let next_ok = matches!(next, Some(b) if b != b' ' && b != marker);
+    prev_ok && next_ok
 }
 
 pub fn parse_args(src: &str, cursor: &mut usize) -> Result<ShortArgs, Diagnostic> {
