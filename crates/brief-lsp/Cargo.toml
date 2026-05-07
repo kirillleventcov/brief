@@ -1,0 +1,16 @@
+[package]
+name        = "brief-lsp"
+version.workspace    = true
+edition.workspace    = true
+
+[[bin]]
+name = "brief-lsp"
+path = "src/main.rs"
+
+[dependencies]
+tower-lsp-server    = "0.23"
+tokio               = { version = "1", features = ["full"] }
+dashmap             = "6"
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+brief-core          = { path = "../brief-core" }
