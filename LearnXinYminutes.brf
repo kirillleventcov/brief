@@ -19,9 +19,9 @@ The whole language fits in one file. Read it top to bottom.
 Line comments start with `//` and must occupy the whole line. They are
 stripped before any output.
 
-Block comments use C-style `/* */` delimiters. They cannot nest, and the
-opening `/*` and closing `*/` must each appear at the start or end of a
-line — never in the middle of text.
+Block comments use C-style `/* */` delimiters. They cannot nest. The
+opening `/*` must begin a line and the closing `*/` must end one;
+anything else is parsed as ordinary text rather than as a comment.
 
 ## 2. Headings
 
@@ -38,8 +38,8 @@ followed by exactly one space and the heading text.
 ```
 
 Seven or more `#` is an error: B0301 "heading level exceeds maximum of
-6". Setext headings (`===` / `---` underlines) do NOT exist. Two spaces,
-zero spaces, or no text after the `#` run are all errors.
+6". Setext headings (`===` / `---` underlines) do NOT exist. Zero
+spaces or two spaces after the `#` run is B0302.
 
 ## 3. Paragraphs and line breaks
 
@@ -65,9 +65,9 @@ Each kind of emphasis uses a SINGLE-character marker on each side:
 - `+underline+` renders as underline
 - `~strike~` renders as strikethrough
 
-Doubled markers (`**bold**`, `__italic__`) are NOT valid. Brief refuses
-them rather than treating them as a different style — this is the entire
-point.
+Doubled markers like `**bold**` and `__italic__` are NOT recognized as
+emphasis. They are parsed as literal text rather than as a stronger
+style — there is no `**`/`__` in the language.
 
 ```brief
 A line with *bold*, _italic_, +underline+, and ~strikethrough~ words.
@@ -76,8 +76,8 @@ A line with *bold*, _italic_, +underline+, and ~strikethrough~ words.
 ```
 
 Emphasis kinds nest freely with each other, but the SAME kind cannot
-nest (that would be B0204). Multi-line emphasis is also an error
-(B0205).
+nest (that would be B0204). Each emphasis must open and close inside a
+single paragraph; an unclosed run falls back to literal text.
 
 A marker flanked by alphanumerics on both sides is treated as a literal
 character, not as emphasis:
@@ -122,11 +122,11 @@ Term 2
 @end
 ```
 
-The `: ` marker is exact: colon followed by one space. Two spaces, no
-space, or any other character after the colon is a B0505 error.
-Continuation lines align to the content column of `: ` (parent indent
-plus two spaces). Multiple definitions per term are not supported in
-v0.3 — two `: ` lines under one term is a B0505 error.
+The `: ` marker is exact: colon followed by one space. Anything else
+is not recognized as a definition marker and is treated as a term line
+instead. Continuation lines align to the content column of `: ` (parent
+indent plus two spaces). Multiple definitions per term are not
+supported in v0.3 — two `: ` lines under one term is a B0505 error.
 
 A live definition list:
 
@@ -203,10 +203,10 @@ without a trailing space) is plain text.
 ```
 
 HTML emit renders these as a checkbox `<input type="checkbox" disabled>`
-inside `<li class="task-list-item">`, with the parent `<ul>` carrying
+inside `<li class="task-list-item">`, with the parent list carrying
 `class="contains-task-list"` if any item is a task. LLM emit preserves
-the marker verbatim. Task markers are NOT supported on ordered list
-items — `1. [x] foo` is just text.
+the marker verbatim. Both unordered and ordered list items can carry
+task markers.
 
 ## 7. Blockquotes
 
@@ -237,8 +237,9 @@ fn main() {
 
 ## 9. Horizontal rule
 
-Exactly three dashes, on a line by themselves. Two or four dashes are
-errors.
+Exactly three dashes, on a line by themselves. Anything else (two
+dashes, four dashes, leading whitespace) is parsed as a paragraph, not
+as a horizontal rule.
 
 ---
 
@@ -256,9 +257,9 @@ The trailing `|` is optional. Cells are trimmed of leading and trailing
 whitespace. Every row must have the same number of cells as the header
 — mismatches are an error (B0502).
 
-A `|` inside a `` ` ``-delimited or ``` `` ```-delimited inline code span
-is not a cell separator. To put a literal `|` outside a code span into a
-cell, escape it as `\|`.
+A `|` inside an inline code span (single- or double-backtick; see §5)
+is not a cell separator. To put a literal `|` outside a code span into
+a cell, escape it as `\|`.
 
 Column alignment is set on the directive:
 
@@ -292,6 +293,7 @@ Built-in shortcodes that ship with the reference compiler:
 | sub | inline | subscript (replaces inline `<sub>`)
 | sup | inline | superscript (replaces inline `<sup>`)
 | details | block | collapsible block (replaces `<details>/<summary>`)
+| dl | block | definition list (see §5a)
 | t | block | tables (special-cased)
 | code | block | same as triple-backtick fence
 | callout | block | boxed note
@@ -325,8 +327,10 @@ to the reference, never elsewhere in the file. The compiler auto-numbers
 them in document order and emits a list at the end (HTML `<ol
 class="footnotes">`, LLM `[^1]: ...`).
 
-A block callout — the `kind` argument is constrained to one of `info`,
-`warning`, or `danger`; anything else is B0404 BadEnumValue.
+A block callout — the `kind` argument is constrained to one of `note`,
+`tip`, `important`, `warning`, or `caution`; anything else is B0404
+BadEnumValue. (`info` and `danger` are accepted as deprecated aliases
+for `note` and `caution` and emit B0408 as a warning.)
 
 @callout(kind: warning)
 Watch out for the @kbd[Shift+Delete] shortcut on Linux.
@@ -388,6 +392,10 @@ shortcodes render to compact forms:
 - `@ref[path#anchor](text)` becomes just `text` — the cross-document
   link is dropped because it has no meaning in a flattened LLM context
 
+The `--target=json` mode dumps the parsed AST in Rust's `{:#?}` debug
+format for inspection. Despite the name it is NOT JSON-parseable — the
+flag exists for examining the parser's view of a document.
+
 `--report-tokens` prints a stderr line with a cl100k character/token
 estimate. The estimate is best-effort and not normative.
 
@@ -413,7 +421,7 @@ template_llm = "[note] {{content}} [/note]"
 [shortcodes.callout]
 kind = "block"
 arguments = { kind = { type = "string", required = true,
-  oneof = ["info", "warning", "danger"] } }
+  oneof = ["note", "tip", "important", "warning", "caution"] } }
 template_html = "templates/callout.html"
 ```
 
@@ -445,9 +453,12 @@ Code ranges:
 - B05xx — semantic / cross-cutting (list sequence, table columns)
 - B06xx — cross-document references (missing file, missing anchor,
   bad target, no project root)
+- B07xx — LLM-mode code-block minification (refused languages, line
+  comments converted, oversized blocks)
 
-`brief explain B0204` prints the long-form explanation. There is no
-`--allow-warnings`. There never will be.
+`brief explain B0204` prints the long-form explanation for codes that
+have one; codes without a long-form entry print "unknown error code".
+There is no `--allow-warnings`. There never will be.
 
 ## 16. The whole list of things that are intentionally NOT here
 
