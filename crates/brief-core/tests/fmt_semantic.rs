@@ -151,7 +151,9 @@ fn semantic_preserved_frontmatter_passthrough() {
 fn semantic_preserved_for_real_repo_doc() {
     // The flagship corpus file. If this passes, the formatter is
     // semantically transparent for representative real inputs.
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("LearnXinYminutes.brf");
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("LearnXinYminutes.brf");
     let raw = std::fs::read_to_string(&p).unwrap();
     assert_semantic_preserved("LearnXinYminutes.brf", &raw);
 }

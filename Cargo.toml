@@ -7,8 +7,11 @@ members  = ["crates/brief-core", "crates/brief-cli", "crates/brief-web", "crates
 exclude  = ["crates/brief-core/fuzz"]
 
 [workspace.package]
-version = "0.3.0"
-edition = "2024"
+version    = "0.3.0"
+edition    = "2024"
+license    = "MIT"
+repository = "https://github.com/kirillleventcov/brief"
+authors    = ["Kirill Leventcov"]
 
 [profile.release]
 lto           = true

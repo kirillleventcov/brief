@@ -269,7 +269,9 @@ fn formatter_is_idempotent_on_real_repo_doc() {
     // The flagship doc shipped with the repo should round-trip through the
     // formatter without any further change after the first pass. This is
     // the broadest "real input" smoke test we can run.
-    let learn = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("LearnXinYminutes.brf");
+    let learn = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("LearnXinYminutes.brf");
     let raw = std::fs::read_to_string(&learn).unwrap();
     let dir = temp_dir("idempotent_learn");
     let staging = dir.join("learn.brf");

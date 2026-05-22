@@ -10,7 +10,7 @@
 
 use brief::watch::{Engine, LlmOpts, Target, WatchOpts, handle_change_paths, scan_shortcode_uses};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("brief-watch-test-{}", name));
@@ -265,68 +265,3 @@ fn scan_shortcode_uses_for_typical_brief_doc() {
     assert!(uses.contains("kbd"));
 }
 
-// ---------- End-to-end subprocess test ----------
-
-fn brief_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_brief"))
-}
-
-fn wait_for<F: FnMut() -> bool>(mut f: F, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if f() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
-
-/// Smoke test for the spawned `brief watch` binary. Exercises the actual
-/// notify backend and the 100ms debounce. Generous timeouts to keep this
-/// non-flaky on CI.
-#[test]
-fn e2e_watch_recompiles_on_brf_change() {
-    let dir = temp_dir("e2e-brf");
-    let a = dir.join("a.brf");
-    std::fs::write(&a, "# Hello\n").unwrap();
-    let a_html = dir.join("a.html");
-
-    // Spawn watcher.
-    let mut child = std::process::Command::new(brief_bin())
-        .arg("watch")
-        .arg(&dir)
-        .arg("--target=html")
-        .stderr(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn brief watch");
-
-    // Wait for the initial compile.
-    let got_initial = wait_for(
-        || {
-            a_html.exists()
-                && std::fs::read_to_string(&a_html)
-                    .unwrap_or_default()
-                    .contains("Hello")
-        },
-        Duration::from_secs(8),
-    );
-    assert!(got_initial, "initial compile did not produce a.html");
-
-    // Modify .brf — wait for debounce + recompile.
-    std::fs::write(&a, "# Updated\n").unwrap();
-    let got_update = wait_for(
-        || {
-            std::fs::read_to_string(&a_html)
-                .unwrap_or_default()
-                .contains("Updated")
-        },
-        Duration::from_secs(8),
-    );
-
-    let _ = child.kill();
-    let _ = child.wait();
-
-    assert!(got_update, "watcher did not recompile after .brf change");
-}

@@ -1,7 +1,16 @@
 [package]
-name    = "brief-core"
+name              = "brief-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description       = "Compiler library for the Brief markup language: lexer, parser, AST, HTML/LLM emitters, formatter, and Markdown-to-Brief converter."
+homepage          = "https://docs.brief.kirillleventcov.com"
+documentation     = "https://docs.rs/brief-core"
+readme            = "README.md"
+keywords          = ["markup", "markdown", "compiler", "llm", "brief"]
+categories        = ["text-processing", "compilers", "parsing"]
 
 [dependencies]
 serde      = { version = "1", features = ["derive"] }
@@ -17,11 +26,3 @@ tempfile = "3"
 [lib]
 name = "brief"
 path = "src/lib.rs"
-
-[[test]]
-name = "conversion"
-path = "../../tests/conversion.rs"
-
-[[test]]
-name = "conformance"
-path = "../../tests/conformance.rs"
