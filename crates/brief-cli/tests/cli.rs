@@ -283,3 +283,138 @@ fn batch_continues_past_failure() {
     assert!(dir.join("good.brf").exists());
     assert!(dir.join("good2.brf").exists());
 }
+
+#[test]
+fn compile_w_refuses_to_overwrite_input() {
+    let dir = temp_dir("compile_w_selfclobber");
+    let input = dir.join("note.txt");
+    std::fs::write(&input, "# Hello\n\nContent.\n").unwrap();
+    // --target=llm derives note.txt as the output path — the input itself.
+    let out = Command::new(brief_bin())
+        .arg("compile")
+        .arg(&input)
+        .arg("--target=llm")
+        .arg("-w")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("refusing to overwrite input"), "{}", stderr);
+    let content = std::fs::read_to_string(&input).unwrap();
+    assert_eq!(content, "# Hello\n\nContent.\n", "source must be untouched");
+}
+
+#[test]
+fn compile_o_refuses_output_equal_to_input() {
+    let dir = temp_dir("compile_o_selfclobber");
+    let input = dir.join("note.brf");
+    std::fs::write(&input, "# Hello\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("compile")
+        .arg(&input)
+        .arg("-o")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(std::fs::read_to_string(&input).unwrap(), "# Hello\n");
+}
+
+#[test]
+fn compile_w_recompile_over_existing_output_is_fine() {
+    let dir = temp_dir("compile_w_recompile");
+    let input = dir.join("note.brf");
+    std::fs::write(&input, "# Hello\n").unwrap();
+    for _ in 0..2 {
+        let status = Command::new(brief_bin())
+            .arg("compile")
+            .arg(&input)
+            .arg("--target=llm")
+            .arg("-w")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    assert!(dir.join("note.txt").exists());
+}
+
+#[test]
+fn compile_unknown_config_key_is_an_error() {
+    let dir = temp_dir("strict_config");
+    std::fs::write(dir.join("brief.toml"), "[compile]\ntypo_key = true\n").unwrap();
+    let input = dir.join("d.brf");
+    std::fs::write(&input, "# Hi\n").unwrap();
+    let out = Command::new(brief_bin())
+        .current_dir(&dir)
+        .arg("compile")
+        .arg("d.brf")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("bad brief.toml"), "{}", stderr);
+}
+
+#[test]
+fn compile_respects_default_target_from_config() {
+    let dir = temp_dir("default_target");
+    std::fs::write(
+        dir.join("brief.toml"),
+        "[compile]\ndefault_target = \"llm\"\n",
+    )
+    .unwrap();
+    let input = dir.join("d.brf");
+    std::fs::write(&input, "# Hi\n\nBody text.\n").unwrap();
+    let out = Command::new(brief_bin())
+        .current_dir(&dir)
+        .arg("compile")
+        .arg("d.brf")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("<h1>"),
+        "llm target must not emit HTML: {}",
+        stdout
+    );
+    assert!(stdout.contains("# Hi"), "{}", stdout);
+}
+
+#[test]
+fn compile_explicit_target_overrides_config_default() {
+    let dir = temp_dir("default_target_override");
+    std::fs::write(
+        dir.join("brief.toml"),
+        "[compile]\ndefault_target = \"llm\"\n",
+    )
+    .unwrap();
+    let input = dir.join("d.brf");
+    std::fs::write(&input, "# Hi\n").unwrap();
+    let out = Command::new(brief_bin())
+        .current_dir(&dir)
+        .arg("compile")
+        .arg("d.brf")
+        .arg("--target=html")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("<h1>"), "{}", stdout);
+}
+
+#[test]
+fn explain_covers_every_diagnostic_code() {
+    for code in brief::diag::Code::ALL {
+        let out = Command::new(brief_bin())
+            .arg("explain")
+            .arg(code.as_str())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "`brief explain {}` returned unknown-code",
+            code.as_str()
+        );
+    }
+}

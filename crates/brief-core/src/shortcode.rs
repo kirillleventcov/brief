@@ -37,6 +37,7 @@ pub enum ArgType {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ArgSpec {
     #[serde(rename = "type")]
     pub ty: ArgType,
@@ -63,6 +64,7 @@ impl Default for ShortKindOpt {
 }
 
 #[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Shortcode {
     #[serde(default)]
     pub kind: ShortKindOpt,

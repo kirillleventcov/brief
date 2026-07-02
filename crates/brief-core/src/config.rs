@@ -3,7 +3,11 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+// Every config struct carries `deny_unknown_fields`: a typoed or
+// unsupported key must be a load error, not a silent no-op — the same
+// strictness the language itself promises.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub project: Project,
@@ -11,11 +15,10 @@ pub struct Config {
     pub compile: Compile,
     #[serde(default)]
     pub shortcodes: BTreeMap<String, Shortcode>,
-    #[serde(default)]
-    pub hooks: Hooks,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Project {
     #[serde(default)]
     pub name: String,
@@ -24,6 +27,7 @@ pub struct Project {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Compile {
     #[serde(default)]
     pub strict_heading_levels: bool,
@@ -34,6 +38,7 @@ pub struct Compile {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LlmCompile {
     /// Master switch. When false, code blocks are emitted verbatim regardless
     /// of language tag or `@minify` attribute.
@@ -90,14 +95,6 @@ fn default_minify_languages() -> Vec<String> {
 }
 fn default_preserve_code_fences() -> bool {
     true
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-pub struct Hooks {
-    #[serde(default)]
-    pub before_compile: Vec<String>,
-    #[serde(default)]
-    pub after_compile: Vec<String>,
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {

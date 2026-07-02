@@ -34,8 +34,11 @@ template_llm  = "[note] {{content}} [/note]"
 kind = "block"
 arguments = { kind = { type = "string", required = true,
   oneof = ["note", "tip", "important", "warning", "caution"] } }
-template_html = "templates/callout.html"
+template_html = "<aside class=\"callout-{{args.kind}}\">{{content}}</aside>"
 ```
+
+Unknown keys anywhere in `brief.toml` are a load error, not a silent
+no-op — the same strictness the language applies to documents.
 
 ## Sections
 
@@ -87,10 +90,12 @@ arguments
 : Optional. A table of argument specs. Each spec has `type` (one of
   `string`, `int`, `ident`, `array`), an optional `required` boolean,
   an optional `position` integer (for positional arguments), and an
-  optional `oneof` array (for enum-constrained string values).
+  optional `oneof` array (for enum-constrained string values). Passing
+  an argument the shortcode does not declare is @ec[B0409].
 template_html
-: Either an inline string or a path to a template file. Mustache-style
-  with `{{content}}` and `{{args.<name>}}` placeholders.
+: An inline template string, mustache-style with `{{content}}` and
+  `{{args.<name>}}` placeholders. Template files are not supported —
+  the value is always the template itself.
 template_llm
 : Same as `template_html`, used when the compile target is `llm`.
 @end
@@ -105,19 +110,6 @@ Templates are *minimal* mustache. Placeholders only:
 There are no conditionals, no loops, no embedded code. Logic that wants
 those belongs in a custom shortcode that wraps the conditional content,
 not in the template itself.
-
-## Hooks
-
-Hooks are external programs invoked before or after compilation:
-
-```toml
-[hooks]
-before_compile = ["scripts/lint.sh"]
-after_compile  = ["scripts/upload.sh"]
-```
-
-Hooks receive the source path on stdin or as `argv[1]`. A non-zero exit
-from a `before_compile` hook aborts compilation.
 
 ## Where the compiler looks
 

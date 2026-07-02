@@ -264,4 +264,3 @@ fn scan_shortcode_uses_for_typical_brief_doc() {
     assert!(uses.contains("link"));
     assert!(uses.contains("kbd"));
 }
-

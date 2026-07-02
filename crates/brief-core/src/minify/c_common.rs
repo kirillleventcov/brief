@@ -102,6 +102,13 @@ fn first_char(s: &str) -> Option<char> {
     s.chars().next()
 }
 
+/// Wrap a comment body in `/* … */`, defusing any `*/` inside it. A line
+/// comment like `// see */ marker` would otherwise close the spliced block
+/// comment early and leak the tail as live tokens.
+pub fn safe_block_comment(body: &str) -> String {
+    format!("/*{}*/", body.replace("*/", "* /"))
+}
+
 /// Emit a token stream stripping all whitespace and (default) all comments.
 /// Used by Rust, Java, SQL.
 pub fn emit_aggressive(
@@ -118,7 +125,7 @@ pub fn emit_aggressive(
                 if !opts_keep_comments {
                     continue;
                 }
-                let block = format!("/*{}*/", body);
+                let block = safe_block_comment(body);
                 push_with_space(&mut out, &mut prev_emit_last, &block);
                 warnings.push(MinifyWarning::LineCommentConverted);
             }
@@ -126,7 +133,7 @@ pub fn emit_aggressive(
                 if !opts_keep_comments {
                     continue;
                 }
-                let block = format!("/*{}*/", body);
+                let block = safe_block_comment(body);
                 push_with_space(&mut out, &mut prev_emit_last, &block);
             }
             TokenKind::Word(s)
@@ -177,7 +184,7 @@ pub fn emit_conservative(
                 if !opts_keep_comments {
                     continue;
                 }
-                let block = format!("/*{}*/", body);
+                let block = safe_block_comment(body);
                 push_with_space(&mut out, &mut prev_emit_last, &block);
                 warnings.push(MinifyWarning::LineCommentConverted);
             }
@@ -185,7 +192,7 @@ pub fn emit_conservative(
                 if !opts_keep_comments {
                     continue;
                 }
-                let block = format!("/*{}*/", body);
+                let block = safe_block_comment(body);
                 push_with_space(&mut out, &mut prev_emit_last, &block);
             }
             TokenKind::Word(s)

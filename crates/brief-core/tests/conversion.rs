@@ -846,3 +846,19 @@ fn gfm_all_five_alert_kinds_roundtrip() {
         );
     }
 }
+
+#[test]
+fn link_url_balanced_parens_pass_through() {
+    let (out, holes) = run("[rust](https://en.wikipedia.org/wiki/Rust_(programming_language))\n");
+    assert_eq!(
+        out,
+        "@link[rust](https://en.wikipedia.org/wiki/Rust_(programming_language))\n"
+    );
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn link_url_unbalanced_paren_percent_encoded() {
+    let (out, _) = run("[x](https://e.com/a\\)b)\n");
+    assert_eq!(out, "@link[x](https://e.com/a%29b)\n");
+}

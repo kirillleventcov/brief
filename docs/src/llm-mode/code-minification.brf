@@ -58,8 +58,10 @@ fn add(a:i32,b:i32)->i32{/* Adds two numbers.*/a+b}
 
 The conversion from `//` to `/* */` triggers @ec[B0703] *"line comment
 converted to block-comment form for minification"* per converted line.
-Silence with `--allow B0703` if you have manually verified the line
-comments do not contain `*/`.
+Any `*/` inside the comment text is rewritten to `* /` so the emitted
+block comment cannot close early. The warning is informational and does
+not affect the exit code; use `@nominify` if you want the comments left
+exactly as written.
 
 ## Per-block opt-in
 
@@ -91,9 +93,11 @@ Each minifier respects its language's lexical structure:
 
 @dl
 JS / TS
-: Newlines preserved; ASI behavior would otherwise change. The minifier
-  inserts an explicit `;` before stripping a newline that would have
-  terminated a statement.
+: Newlines preserved verbatim — ASI behavior would otherwise change
+  (`return` followed by a newline must stay that way). Only horizontal
+  whitespace and comments are stripped. Regex-vs-division after `}` is
+  disambiguated by tracking whether each brace opened a statement block
+  or an object literal.
 Go
 : Same as JS / TS. Lexical newlines drive automatic semicolon insertion.
 C / C++
@@ -115,16 +119,19 @@ JSON / JSONL
 
 ## Correctness
 
-Minification is *semantically lossless*. Each minifier passes a property
-test:
+Minification *aims* to be semantically lossless, and each minifier passes
+a property test:
 
 ```text
 parse → minify → re-parse  ⇒  AST equal
 ```
 
-If a minifier cannot guarantee this for a given input, it falls back to
-verbatim and emits @ec[B0701]. Emitting silently broken code to an LLM is
-worse than emitting verbose code.
+The honest caveat: the minifiers are lexers, not full parsers, and a
+lexer cannot resolve every ambiguity in languages like JavaScript and
+C++. Known-ambiguous constructs are handled conservatively, and inputs
+that fail to lex fall back to verbatim with @ec[B0701] — emitting
+silently broken code to an LLM is worse than emitting verbose code. If a
+block matters enough that any risk is unacceptable, mark it `@nominify`.
 
 ## Reference-destruction warning
 
@@ -132,10 +139,10 @@ A fenced block longer than 50 source lines that gets minified emits
 @ec[B0702] *"minified code block was originally many lines; LLM consumers
 cannot reference specific lines"* once.
 
-This is a warning, not an error. Suppress with `--allow B0702` if your
-prompt does not depend on line references inside code samples. Keep it on
-if your prompt asks the LLM to "look at line 12" — minification deletes
-that addressability.
+This is a warning, not an error — compilation succeeds with exit 0. If
+your prompt asks the LLM to "look at line 12", add `@nominify` to that
+block: minification deletes line addressability, and there is no flag to
+silence the warning away.
 
 ## Configuration knobs
 
@@ -163,15 +170,16 @@ preserve_code_fences
 
 ## Cost savings
 
-Empirical measurements on the project's own corpus:
+Measured with a real cl100k tokenizer against equivalent hand-written
+Markdown:
 
 @t
 | Document shape | Token reduction (LLM mode vs. Markdown)
-| Prose-heavy | around 20 percent
-| Mixed prose + tables | around 25 percent
-| JSON-heavy | over 50 percent
+| Prose-heavy | single digits — roughly a wash
+| JSON- and code-heavy | around a third, rising with code density
 
-JSON-heavy documents get the largest win because Brief is the only Markdown
-replacement that ships JSON minification by default. The reduction is
-durable: the Markdown ecosystem cannot ship this without breaking changes
-to renderer behavior.
+The honest summary: for prose, Brief-LLM output is about the same size as
+clean Markdown. The real win is concentrated in code and data blocks,
+because Brief is the only Markdown replacement that ships code
+minification by default. The more JSON and code a document carries, the
+larger the saving.

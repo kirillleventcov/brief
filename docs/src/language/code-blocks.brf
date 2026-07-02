@@ -32,7 +32,8 @@ on a line by themselves.
 Because the closing fence is just three backticks, you cannot literally
 nest one fence inside another. To document the syntax of a code fence
 without rendering it as a real block, describe it in prose or use the
-`@code` block shortcode form, which produces the same output as a fence.
+`@code` block shortcode form, which produces the same output as a fence
+and whose body is equally verbatim — fences included, no inline parsing.
 
 ## Minification attributes
 
@@ -95,6 +96,6 @@ full breakdown.
 
 A 30-line pretty-printed JSON object is identical in meaning to its
 single-line form. An LLM consumes both equally well. Token bills are paid
-in the present, and JSON-heavy documents see >50 percent reduction in LLM
-mode. That is the durable advantage Markdown can't ship without breaking
-changes.
+in the present, and JSON-heavy documents measure around a third fewer
+tokens in LLM mode (cl100k), rising with JSON density. That is the
+durable advantage Markdown can't ship without breaking changes.

@@ -15,7 +15,7 @@ Markdown is forgiving — it silently accepts ambiguous input. That's fine for a
 Brief, on the other hand follows the following conventions:
 
 - **One way to do it.** Every construct has a single canonical spelling. `*bold*`, not `**bold**`. `-` for bullets, never `*` or `+`. Sequential ordered lists or it's an error.
-- **Compiler time errors.** Ambiguous input is a compile error with a source span and an error code, in the style of `rustc`. There are no warnings — just success or failure.
+- **Compiler time errors.** Ambiguous input is a compile error with a source span and an error code, in the style of `rustc`. Warnings exist only as advisories from lossy LLM-mode transforms — a document is never "sort of" valid.
 - **Token-economic LLM target.** `brief compile doc.brf --target=llm` produces a deterministic, token-minimized rendering for LLM prompts, with `--report-tokens` for budgeting.
 - **No inline HTML.** The single extension point is registered shortcodes.
 

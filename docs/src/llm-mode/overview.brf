@@ -61,13 +61,13 @@ Frontmatter
 | Source | LLM-mode output
 | `@link[text](url)` | `[text](url)`
 | `@image(src, alt)` | `[image: alt]`
-| `@kbd[Ctrl+C]` | `Ctrl+C`
+| `@kbd[Ctrl+C]` | `[kbd:Ctrl+C]`
 | `@callout(kind: warning) ... @end` | `[!warning] ... [/!]`
 | `@math[x^2]` | `$x^2$`
 | `@footnote[body]` | `[^N]` inline, `[^N]: body` appended at end of doc
 | `@ref[path#anchor](text)` | `text` — the cross-document link is dropped
-| `@sub[2]` | `_2`
-| `@sup[2]` | `^2`
+| `@sub[2]` | `[sub:2]`
+| `@sup[2]` | `[sup:2]`
 
 ## Determinism
 
@@ -99,8 +99,8 @@ Building agent prompts
 : A prompt that loads a document into context pays per token on every
   call. LLM mode is the right rendering.
 Cost-budgeting documentation
-: `--report-tokens` plus a CI gate keeps the cl100k token count within a
-  budget you set for your prompt corpus.
+: `--report-tokens` plus a CI gate keeps the estimated token count within
+  a budget you set for your prompt corpus.
 Round-tripping
 : You don't. LLM mode is one-way. Keep the `.brf` source and re-compile.
 @end

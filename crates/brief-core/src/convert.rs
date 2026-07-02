@@ -911,6 +911,7 @@ impl<'a> Walker<'a> {
                         note,
                     });
                 }
+                let url = brief_safe_url(&url);
                 if let Some(t) = opt_title {
                     self.write("@link(title: \"");
                     self.write(&t);
@@ -1637,6 +1638,32 @@ fn escape_brief_inline_text(s: &str) -> String {
         i += w;
     }
     out
+}
+
+/// Make a URL safe for Brief's `@link[text](url)` sugar. The compiler scans
+/// the `(url)` with balanced-paren counting, so balanced parens pass through
+/// verbatim; unbalanced ones would swallow or truncate the URL and must be
+/// percent-encoded.
+fn brief_safe_url(url: &str) -> String {
+    let mut depth = 0i64;
+    let mut balanced = true;
+    for b in url.bytes() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth < 0 {
+                    balanced = false;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if balanced && depth == 0 {
+        return url.to_string();
+    }
+    url.replace('(', "%28").replace(')', "%29")
 }
 
 fn compute_line_offsets(s: &str) -> Vec<usize> {

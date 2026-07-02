@@ -142,10 +142,13 @@ fn render_item(it: &ListItem, ctx: &mut Ctx, out: &mut String) {
 }
 
 fn render_table(args: &ShortArgs, header: &Row, rows: &[Row], ctx: &mut Ctx, out: &mut String) {
+    // The parser rejects align values outside this set, but the renderer
+    // must stay safe on any AST it's handed: these strings land in a style
+    // attribute, so only whitelisted values may pass.
     let aligns: Vec<&str> = if let Some(ArgValue::Array(a)) = args.keyword.get("align") {
         a.iter()
-            .map(|v| match v {
-                ArgValue::Ident(s) | ArgValue::Str(s) => s.as_str(),
+            .map(|v| match v.as_str() {
+                Some(s @ ("left" | "right" | "center")) => s,
                 _ => "left",
             })
             .collect()
@@ -385,24 +388,8 @@ fn render_shortcode_html(
             let raw = inner.unwrap_or("");
             let _ = write!(out, "<span class=\"math\">{}</span>", escape_html(raw));
         }
-        "code" => {
-            let lang = args
-                .keyword
-                .get("lang")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let body = inner.unwrap_or("");
-            if !lang.is_empty() {
-                let _ = write!(
-                    out,
-                    "<pre><code class=\"language-{}\">{}</code></pre>\n",
-                    escape_attr(lang),
-                    escape_html(body)
-                );
-            } else {
-                let _ = write!(out, "<pre><code>{}</code></pre>\n", escape_html(body));
-            }
-        }
+        // `@code` never reaches the emitter as a shortcode: the parser turns
+        // it into a `Block::CodeBlock` so the body stays verbatim.
         _ => {
             let _ = write!(
                 out,

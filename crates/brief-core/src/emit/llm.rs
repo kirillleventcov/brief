@@ -294,7 +294,7 @@ fn try_minify(lang: Option<&str>, body: &str, attrs: &CodeAttrs, ctx: &mut Ctx) 
                 match w {
                     MinifyWarning::LineCommentConverted => {
                         ctx.warnings.push(format!(
-                            "warning[B0703]: line comment converted to block form for minification in `{}` block; verify no `*/` content",
+                            "warning[B0703]: line comment converted to block form for minification in `{}` block",
                             lang
                         ));
                     }
@@ -320,20 +320,24 @@ fn try_minify(lang: Option<&str>, body: &str, attrs: &CodeAttrs, ctx: &mut Ctx) 
 }
 
 fn render_table(header: &Row, rows: &[Row], ctx: &mut Ctx, out: &mut String) {
+    // A literal `|` inside a cell (from a `\|` escape or inline code) would
+    // read as a column separator in the flattened output; re-escape it so the
+    // table keeps its column structure for the LLM consumer.
+    let render_cell = |c: &Vec<Inline>, ctx: &mut Ctx| -> String {
+        let mut s = String::new();
+        render_inline_seq_to(c, ctx, &mut s);
+        s.replace('|', "\\|")
+    };
     let mut row_strs: Vec<Vec<String>> = Vec::new();
     let mut h: Vec<String> = Vec::new();
     for c in &header.cells {
-        let mut s = String::new();
-        render_inline_seq_to(c, ctx, &mut s);
-        h.push(s);
+        h.push(render_cell(c, ctx));
     }
     row_strs.push(h);
     for r in rows {
         let mut row: Vec<String> = Vec::new();
         for c in &r.cells {
-            let mut s = String::new();
-            render_inline_seq_to(c, ctx, &mut s);
-            row.push(s);
+            row.push(render_cell(c, ctx));
         }
         row_strs.push(row);
     }

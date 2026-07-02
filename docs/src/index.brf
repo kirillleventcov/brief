@@ -28,7 +28,8 @@ compile error.
 
 @feature(title: "Compiler-time errors")
 Ambiguous input is a compile error with a source span and an error code, in
-the style of `rustc`. There are no warnings — just success or failure.
+the style of `rustc`. Warnings exist only as advisories from lossy LLM-mode
+transforms — a document is never "sort of" valid.
 @end
 
 @feature(title: "Token economy")
@@ -61,8 +62,8 @@ Press @kbd[Ctrl+C] to abort the long-running compile.
 @end
 
 Some claim Brief saves tokens.@footnote[Measured against Markdown
-on the project's own docs, roughly 25 percent on average.] The
-compiler can prove it.
+with a cl100k tokenizer: prose is roughly a wash; code- and JSON-heavy
+documents save around a third.] The compiler can prove it.
 ```
 
 That is the language. There are no surprises. The full grammar reference

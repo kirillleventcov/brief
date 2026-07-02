@@ -60,17 +60,18 @@ transformation in reverse.
 
 ## JSON-AST target
 
-The parsed document tree, serialized as JSON. Useful when you are writing
-tooling that wants to inspect Brief without re-implementing the parser.
+The parsed document tree, dumped for inspection. Useful when you are
+writing tooling that wants to see what the parser produced without
+re-implementing it.
 
 ```bash
 brief compile doc.brf --target=json -w
 ```
 
-The schema mirrors the AST in the
-@ref[language/headings.brf](language reference) — every block and inline
-node carries its source span (`byte_offset`, `length`) so a downstream tool
-can highlight regions, build cross-references, or check additional rules.
+The current output is Rust's pretty-printed debug format, not
+schema-stable JSON — field names mirror the AST structs, and every block
+and inline node carries its source span as `start` / `len` byte offsets.
+Treat the exact shape as unstable until a real serializer lands.
 
 ## Token budgeting
 
@@ -78,11 +79,12 @@ can highlight regions, build cross-references, or check additional rules.
 
 ```bash
 brief compile doc.brf --target=llm --report-tokens > /dev/null
-brief: doc.brf -> 1,247 chars, ~340 tokens (cl100k estimate)
+brief: doc.brf -> 1,247 chars, ~340 tokens (chars/4 heuristic)
 ```
 
-The estimate is best-effort and not normative. If your downstream
-tokenizer differs from cl100k, treat the number as a relative gauge — it
-will still tell you whether one phrasing saves tokens against another.
-See @ref[llm-mode/token-budgeting.brf](Token budgeting) for measurement
+The estimate is a plain characters-divided-by-four heuristic — cheap and
+tokenizer-agnostic, but off by a wide margin on dense code or JSON. Treat
+the number as a relative gauge between two phrasings, never as a budget
+figure; for real numbers run your target model's tokenizer. See
+@ref[llm-mode/token-budgeting.brf](Token budgeting) for measurement
 guidance.

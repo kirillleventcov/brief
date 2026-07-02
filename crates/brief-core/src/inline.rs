@@ -328,18 +328,38 @@ impl<'a> Parser<'a> {
             // Markdown-link sugar: `@name[text](url)` -- the trailing parens
             // hold a single raw-string positional argument. This is the only
             // place where a URL-like value escapes the strict arg grammar.
+            // Parens inside the URL are allowed when balanced (Wikipedia
+            // disambiguation URLs); the closing delimiter is the first `)`
+            // that isn't matched by a `(` inside the URL.
             if self.peek() == Some(b'(') {
                 self.pos += 1;
                 let url_start = self.pos;
+                let mut open_parens = 0usize;
                 while let Some(b) = self.peek() {
-                    if b == b')' {
-                        break;
+                    match b {
+                        b'(' => open_parens += 1,
+                        b')' => {
+                            if open_parens == 0 {
+                                break;
+                            }
+                            open_parens -= 1;
+                        }
+                        _ => {}
                     }
                     self.pos += 1;
                 }
                 let url = self.src[url_start..self.pos].to_string();
                 if self.peek() == Some(b')') {
                     self.pos += 1;
+                } else {
+                    self.diags.push(
+                        Diagnostic::new(
+                            Code::BadArgSyntax,
+                            self.span(url_start, self.pos - url_start),
+                        )
+                        .label("`(url)` is never closed")
+                        .help("percent-encode unmatched parentheses in the URL as %28 / %29"),
+                    );
                 }
                 args.positional.push(ArgValue::Str(url));
             }
@@ -595,6 +615,32 @@ mod tests {
     fn nested_same_marker_errors() {
         let (_, d) = parse("*outer *inner* outer*");
         assert!(d.iter().any(|x| x.code == Code::EmphasisSameMarker));
+    }
+
+    #[test]
+    fn link_url_with_balanced_parens() {
+        let (n, d) =
+            parse("@link[rust](https://en.wikipedia.org/wiki/Rust_(programming_language)) x");
+        assert!(d.is_empty(), "{:?}", d);
+        if let Inline::Shortcode { args, .. } = &n[0] {
+            assert_eq!(
+                args.positional[0].as_str(),
+                Some("https://en.wikipedia.org/wiki/Rust_(programming_language)")
+            );
+        } else {
+            panic!("expected shortcode, got {:?}", n[0]);
+        }
+        if let Inline::Text { value, .. } = &n[1] {
+            assert_eq!(value, " x");
+        } else {
+            panic!("tail must survive as text");
+        }
+    }
+
+    #[test]
+    fn link_url_unterminated_paren_is_b0406() {
+        let (_, d) = parse("@link[x](https://e.com/a(b now");
+        assert!(d.iter().any(|x| x.code == Code::BadArgSyntax), "{:?}", d);
     }
 
     #[test]

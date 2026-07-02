@@ -389,13 +389,18 @@ fn first_paragraph_text(doc: &Document) -> String {
     for b in &doc.blocks {
         if let Block::Paragraph { content, .. } = b {
             let mut t = summary::inline_text(content).trim().to_string();
-            // Trim to a reasonable meta-description length.
+            // Trim to a reasonable meta-description length. Escaping happens
+            // at the template boundary (theme::render_page), not here.
             if t.len() > 200 {
-                t.truncate(200);
+                let mut cut = 200;
+                while !t.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                t.truncate(cut);
                 t.push('…');
             }
             if !t.is_empty() {
-                return escape_attr(&t);
+                return t;
             }
         }
     }

@@ -54,16 +54,41 @@ pub struct PageContext<'a> {
 }
 
 pub fn render_page(template: &str, ctx: &PageContext<'_>) -> String {
+    // Text-ish values (page H1, frontmatter description, site title, paths)
+    // are escaped here, at the single template boundary — a page titled
+    // `# x <script>…` must not become live markup in `<title>` or the
+    // header. Only content/sidebar/reload_script are trusted HTML.
+    let title = escape_text(ctx.title);
+    let description = escape_text(ctx.description);
+    let site_title = escape_text(ctx.site_title);
+    let base_url = escape_text(ctx.base_url);
+    let stylesheet = escape_text(ctx.stylesheet_path);
     let mut subs: BTreeMap<&str, &str> = BTreeMap::new();
-    subs.insert("title", ctx.title);
-    subs.insert("description", ctx.description);
-    subs.insert("site_title", ctx.site_title);
+    subs.insert("title", &title);
+    subs.insert("description", &description);
+    subs.insert("site_title", &site_title);
     subs.insert("content", ctx.content_html);
     subs.insert("sidebar", ctx.sidebar_html);
-    subs.insert("base_url", ctx.base_url);
-    subs.insert("stylesheet", ctx.stylesheet_path);
+    subs.insert("base_url", &base_url);
+    subs.insert("stylesheet", &stylesheet);
     subs.insert("reload_script", ctx.reload_script);
     expand(template, &subs)
+}
+
+/// Escape for both element-text and double-quoted-attribute positions —
+/// theme templates use the same placeholder in either.
+fn escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn expand(template: &str, subs: &BTreeMap<&str, &str>) -> String {
@@ -118,5 +143,39 @@ pub fn site_title(cfg: &BookConfig) -> &str {
         "Brief site"
     } else {
         cfg.book.title.as_str()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_page_escapes_title_and_description() {
+        let template = "<title>{{ title }} — {{ site_title }}</title>\n<meta content=\"{{ description }}\">\n<main>{{ content }}</main>";
+        let ctx = PageContext {
+            title: "x <script>alert(1)</script>",
+            description: "a \"quoted\" & <desc>",
+            site_title: "S<b>",
+            content_html: "<p>real html stays</p>",
+            sidebar_html: "",
+            base_url: "/",
+            stylesheet_path: "/style.css",
+            reload_script: "",
+        };
+        let out = render_page(template, &ctx);
+        assert!(!out.contains("<script>alert(1)</script>"), "{}", out);
+        assert!(
+            out.contains("x &lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{}",
+            out
+        );
+        assert!(
+            out.contains("a &quot;quoted&quot; &amp; &lt;desc&gt;"),
+            "{}",
+            out
+        );
+        assert!(out.contains("S&lt;b&gt;"), "{}", out);
+        assert!(out.contains("<p>real html stays</p>"), "{}", out);
     }
 }

@@ -8,7 +8,9 @@ written by humans and consumed by humans *and* LLMs. It has three goals:
 2. *Token economy.* The source and the rendered LLM output are designed
    to be cheaper than equivalent Markdown.
 3. *Real compiler.* Errors come with source spans, error codes, and help
-   text, like `rustc`. There are no warnings — just success or failure.
+   text, like `rustc`. A document is never "sort of" valid: the only
+   warnings are advisories from lossy LLM-mode transforms, and they never
+   change the exit code.
 
 There is no inline HTML. The single extension point is *shortcodes*.
 
@@ -369,13 +371,34 @@ spans and code blocks, which are verbatim by definition.
 \*not bold\* \[not a bracket\] \\\\backslash
 ```
 
-## 13. Compiling
+## 12a. Frontmatter
+
+A document may open with TOML metadata between `+++` fences. It must be
+the very first content in the file. The compiler parses it (bad TOML is
+B0314, an unclosed block is B0313) and strips it from output by default;
+`--keep-metadata` renders it as a definition list in LLM mode.
+
+```brief
++++
+title = "My document"
+date = "2026-07-02"
++++
+```
+
+## 13. Compiling and tooling
 
 ```
 brief compile doc.brf --target=html
 brief compile doc.brf --target=llm --report-tokens
 brief compile doc.brf --target=json
+brief fmt doc.brf --write     // canonical formatter, gofmt-doctrine
+brief watch src/ --target=html // recompile on change, 100ms debounce
+brief explain B0204            // long-form help for any error code
 ```
+
+There is also `brief-lsp`, a language server for editor integration
+(diagnostics as you type), and `brief-web`, a static site builder for
+Brief projects.
 
 The `--target=llm` mode produces a deterministic, token-minimized
 rendering for inclusion in LLM prompts. Comments are stripped, blank
@@ -396,8 +419,9 @@ The `--target=json` mode dumps the parsed AST in Rust's `{:#?}` debug
 format for inspection. Despite the name it is NOT JSON-parseable — the
 flag exists for examining the parser's view of a document.
 
-`--report-tokens` prints a stderr line with a cl100k character/token
-estimate. The estimate is best-effort and not normative.
+`--report-tokens` prints a stderr line with a rough token estimate
+(characters divided by four). Treat it as a relative gauge between two
+phrasings, not a budget figure.
 
 ## 14. Configuration: brief.toml
 
@@ -422,12 +446,13 @@ template_llm = "[note] {{content}} [/note]"
 kind = "block"
 arguments = { kind = { type = "string", required = true,
   oneof = ["note", "tip", "important", "warning", "caution"] } }
-template_html = "templates/callout.html"
+template_html = "<aside class=\"callout-{{args.kind}}\">{{content}}</aside>"
 ```
 
 Templates are minimal mustache: only `{{content}}` (rendered children)
-and `{{args.name}}` (argument values). No conditionals, no loops, no
-embedded code. Logic belongs in build hooks, not templates.
+and `{{args.name}}` (argument values), always inline strings — never
+file paths. No conditionals, no loops, no embedded code. Unknown keys
+anywhere in `brief.toml` are a load error.
 
 ## 15. Diagnostics and error codes
 
@@ -456,9 +481,9 @@ Code ranges:
 - B07xx — LLM-mode code-block minification (refused languages, line
   comments converted, oversized blocks)
 
-`brief explain B0204` prints the long-form explanation for codes that
-have one; codes without a long-form entry print "unknown error code".
-There is no `--allow-warnings`. There never will be.
+`brief explain B0204` prints the long-form explanation; every code the
+compiler can emit has one. There is no `--allow-warnings`. There never
+will be.
 
 ## 16. The whole list of things that are intentionally NOT here
 

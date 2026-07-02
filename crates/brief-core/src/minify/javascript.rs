@@ -10,10 +10,13 @@
 //! - **Regex literals** `/pattern/flags`. Lexically ambiguous with
 //!   division. We disambiguate via the previous-significant-token
 //!   heuristic: regex iff the previous non-whitespace, non-comment
-//!   token was a punctuator (other than `)`/`]`/`}`/`++`/`--`) or one
+//!   token was a punctuator (other than `)`/`]`/`++`/`--`) or one
 //!   of the expression-position keywords (`return`, `typeof`, `in`,
 //!   `of`, `delete`, `void`, `new`, `throw`, `await`, `yield`,
-//!   `instanceof`, `case`, `do`, `else`).
+//!   `instanceof`, `case`, `do`, `else`). A previous `}` is ambiguous
+//!   on its own: a statement-block `}` is followed by regex, an
+//!   object-literal (or arrow-body) `}` by division. We track every
+//!   `{`'s kind on a stack, classified by the token before it.
 //! - **ASI**. JavaScript can implicitly insert `;` at end of certain
 //!   lines. Stripping such newlines without inserting an explicit `;`
 //!   changes semantics (`return\n{x:1}` returns undefined; `return{x:1}`
@@ -32,9 +35,21 @@ pub fn minify(source: &str, opts: &MinifyOptions) -> Result<MinifyOutput, Minify
     emit_conservative(&toks, opts.keep_comments)
 }
 
+/// What a `{` opened — decides whether the matching `}` ends a statement
+/// (regex may follow) or an expression (division may follow).
+#[derive(Clone, Copy, PartialEq)]
+enum BraceKind {
+    Block,
+    Object,
+}
+
 fn tokenize(src: &str) -> Result<Vec<Token<'_>>, MinifyError> {
     let bytes = src.as_bytes();
     let mut out: Vec<Token<'_>> = Vec::new();
+    let mut brace_stack: Vec<BraceKind> = Vec::new();
+    // Kind of the most recent `}` token. Only consulted when that `}` is
+    // still the previous significant token, so one slot is enough.
+    let mut last_close = BraceKind::Block;
     let mut i = 0usize;
     while i < bytes.len() {
         let c = bytes[i];
@@ -76,7 +91,7 @@ fn tokenize(src: &str) -> Result<Vec<Token<'_>>, MinifyError> {
             continue;
         }
         // Regex disambiguation: a `/` may start a regex or be division.
-        if c == b'/' && regex_is_expected(&out) {
+        if c == b'/' && regex_is_expected(&out, last_close) {
             let n = scan_regex(src, i)?;
             out.push(Token::new(TokenKind::Regex(&src[i..i + n])));
             i += n;
@@ -101,16 +116,69 @@ fn tokenize(src: &str) -> Result<Vec<Token<'_>>, MinifyError> {
             continue;
         }
         let n = scan_multi_punct(bytes, i);
-        out.push(Token::new(TokenKind::Punct(&src[i..i + n])));
+        let punct = &src[i..i + n];
+        if punct == "{" {
+            brace_stack.push(if open_brace_is_object(&out) {
+                BraceKind::Object
+            } else {
+                BraceKind::Block
+            });
+        } else if punct == "}" {
+            // Unbalanced `}` (mid-snippet input): assume statement position.
+            last_close = brace_stack.pop().unwrap_or(BraceKind::Block);
+        }
+        out.push(Token::new(TokenKind::Punct(punct)));
         i += n;
     }
     Ok(out)
 }
 
+/// Is a `{` here an object literal (expression) rather than a statement
+/// block? Also groups arrow bodies (`=> {`) with expressions, because their
+/// closing `}` ends an expression either way.
+fn open_brace_is_object(prev_tokens: &[Token<'_>]) -> bool {
+    for tok in prev_tokens.iter().rev() {
+        match &tok.kind {
+            TokenKind::LineComment(_) | TokenKind::BlockComment(_) | TokenKind::Newline => continue,
+            TokenKind::Word(s) => {
+                return matches!(
+                    *s,
+                    "return"
+                        | "typeof"
+                        | "in"
+                        | "of"
+                        | "delete"
+                        | "void"
+                        | "new"
+                        | "throw"
+                        | "await"
+                        | "yield"
+                        | "instanceof"
+                        | "case"
+                );
+            }
+            TokenKind::Punct(s) => {
+                // After a closed group, another brace, `;`, or postfix
+                // operator, a `{` starts a statement block (function/if/for
+                // bodies arrive via `) {`). Anywhere else — after `=`, `(`,
+                // `,`, `:`, `[`, binary operators, `=>` — it's an expression.
+                return !matches!(*s, ")" | "]" | "}" | "{" | ";" | "++" | "--");
+            }
+            TokenKind::StrLit(_)
+            | TokenKind::Template(_)
+            | TokenKind::Regex(_)
+            | TokenKind::Preproc(_) => return false,
+        }
+    }
+    // Start of source: statement position.
+    false
+}
+
 /// Heuristic: should a `/` here start a regex literal? Yes iff the previous
 /// "significant" token (skipping whitespace/comments/newlines) is one
-/// after which an expression is expected.
-fn regex_is_expected(prev_tokens: &[Token<'_>]) -> bool {
+/// after which an expression is expected. `last_close` is the kind of the
+/// most recent `}`, used when that `}` is the previous significant token.
+fn regex_is_expected(prev_tokens: &[Token<'_>], last_close: BraceKind) -> bool {
     // Scan backward past comments/newlines.
     for tok in prev_tokens.iter().rev() {
         match &tok.kind {
@@ -135,9 +203,15 @@ fn regex_is_expected(prev_tokens: &[Token<'_>]) -> bool {
                 );
             }
             TokenKind::Punct(s) => {
-                // After `)`, `]`, `}`, `++`, `--`, an expression has
-                // ended; `/` is division. Anything else, expect regex.
-                return !matches!(*s, ")" | "]" | "}" | "++" | "--");
+                // A statement-block `}` is followed by a new statement, which
+                // may open with a regex; an object-literal/arrow-body `}`
+                // ends an expression, so `/` is division.
+                if *s == "}" {
+                    return last_close == BraceKind::Block;
+                }
+                // After `)`, `]`, `++`, `--`, an expression has ended;
+                // `/` is division. Anything else, expect regex.
+                return !matches!(*s, ")" | "]" | "++" | "--");
             }
             TokenKind::StrLit(_)
             | TokenKind::Template(_)
@@ -540,6 +614,38 @@ mod tests {
     #[test]
     fn unterminated_regex() {
         assert!(minify("const r = /oops", &MinifyOptions::default()).is_err());
+    }
+
+    #[test]
+    fn regex_after_statement_block_brace() {
+        // A `}` closing a statement block may be followed by a regex; the
+        // whitespace inside it must survive.
+        let src = "if (c) { g() } /foo  bar/.exec(s)\n";
+        let out = min(src);
+        assert!(out.contains("/foo  bar/"), "got: {}", out);
+    }
+
+    #[test]
+    fn regex_after_else_block_brace() {
+        let src = "if (c) { g() } else { h() } /foo  bar/.exec(s)\n";
+        let out = min(src);
+        assert!(out.contains("/foo  bar/"), "got: {}", out);
+    }
+
+    #[test]
+    fn division_after_object_literal_brace() {
+        // A `}` closing an object literal ends an expression; `/` here is
+        // division and must not swallow code as a regex body.
+        let src = "const x = {a: 1} / b / c;\n";
+        let out = min(src);
+        assert_eq!(out, "const x={a:1}/b/c;\n");
+    }
+
+    #[test]
+    fn nested_blocks_and_object_braces() {
+        let src = "function f() { const o = {a: 1}; if (o) { g() } } /re  x/.test(s)\n";
+        let out = min(src);
+        assert!(out.contains("/re  x/"), "got: {}", out);
     }
 
     #[test]

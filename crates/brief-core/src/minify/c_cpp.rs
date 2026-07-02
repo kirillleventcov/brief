@@ -20,7 +20,7 @@
 //! (`c`, `h`) it's false; for C++ tags (`cpp`, `c++`, `cc`, `cxx`,
 //! `hpp`, `hxx`) it's true.
 
-use super::c_common::{Token, TokenKind};
+use super::c_common::{Token, TokenKind, safe_block_comment};
 use super::{MinifyError, MinifyOptions, MinifyOutput, MinifyWarning};
 
 pub fn minify(
@@ -81,9 +81,26 @@ fn tokenize(src: &str, is_cpp: bool) -> Result<Vec<Token<'_>>, MinifyError> {
         }
         at_line_start = false;
         if c == b'/' && peek(bytes, i + 1) == Some(b'/') {
+            // Translation phase 2 splices `\<nl>` before comments are
+            // recognized, so a line comment ending in `\` swallows the next
+            // line too. Missing this would resurrect commented-out code.
             let start = i + 2;
             let mut j = start;
-            while j < bytes.len() && bytes[j] != b'\n' {
+            while j < bytes.len() {
+                if bytes[j] == b'\\' && peek(bytes, j + 1) == Some(b'\n') {
+                    j += 2;
+                    continue;
+                }
+                if bytes[j] == b'\\'
+                    && peek(bytes, j + 1) == Some(b'\r')
+                    && peek(bytes, j + 2) == Some(b'\n')
+                {
+                    j += 3;
+                    continue;
+                }
+                if bytes[j] == b'\n' {
+                    break;
+                }
                 j += 1;
             }
             out.push(Token::new(TokenKind::LineComment(&src[start..j])));
@@ -156,7 +173,7 @@ fn emit(tokens: &[Token<'_>], keep_comments: bool) -> Result<MinifyOutput, Minif
                 if !keep_comments {
                     continue;
                 }
-                let block = format!("/*{}*/", body);
+                let block = safe_block_comment(body);
                 push_with_space(&mut out, &mut prev_emit_last, &block);
                 warnings.push(MinifyWarning::LineCommentConverted);
             }
@@ -164,7 +181,7 @@ fn emit(tokens: &[Token<'_>], keep_comments: bool) -> Result<MinifyOutput, Minif
                 if !keep_comments {
                     continue;
                 }
-                let block = format!("/*{}*/", body);
+                let block = safe_block_comment(body);
                 push_with_space(&mut out, &mut prev_emit_last, &block);
             }
             TokenKind::Word(s)
@@ -515,6 +532,39 @@ mod tests {
         .unwrap();
         assert!(r.body.starts_with("/* hi*/"));
         assert_eq!(r.warnings.len(), 1);
+    }
+
+    #[test]
+    fn c_line_comment_continuation_stays_dead() {
+        // `\` at the end of a `//` comment splices the next line into the
+        // comment (translation phase 2); `int y = 2;` is dead code and must
+        // not be resurrected.
+        let src = "int x = 1; // note \\\nint y = 2;\nint z = 3;\n";
+        let out = min_c(src);
+        assert!(!out.contains("int y=2;"), "dead code resurrected: {}", out);
+        assert!(out.contains("int x=1;"), "got: {}", out);
+        assert!(out.contains("int z=3;"), "got: {}", out);
+    }
+
+    #[test]
+    fn c_keep_comments_defuses_close_marker() {
+        // A `*/` inside a line comment must not close the spliced block
+        // comment early and leak the tail as live tokens.
+        let src = "// see */ marker\nint x;\n";
+        let r = minify(
+            src,
+            &MinifyOptions {
+                keep_comments: true,
+            },
+            false,
+        )
+        .unwrap();
+        let after_comment = r.body.split("*/").nth(1).unwrap_or("");
+        assert!(
+            !after_comment.contains("marker"),
+            "comment text leaked as live code: {}",
+            r.body
+        );
     }
 
     #[test]

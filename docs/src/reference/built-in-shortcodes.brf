@@ -103,7 +103,8 @@ at the first non-`|` line. Full reference:
 ## `@code` — code blocks
 
 Equivalent to a triple-backtick fence. The first positional argument is
-the language tag.
+the language tag (also accepted as `lang:`). The body is verbatim — no
+escapes, no inline parsing, exactly like a fence.
 
 ```brief
 @code(rust)
@@ -113,8 +114,9 @@ fn main() {
 @end
 ```
 
-Use the fence form by default; `@code` exists for parity with the
-shortcode model.
+Use the fence form by default. `@code` exists for the one thing a fence
+cannot do: contain a triple-backtick fence in its body, which is how the
+docs you are reading show fence syntax.
 
 ## `@callout` — boxed notes
 

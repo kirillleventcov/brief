@@ -47,8 +47,9 @@ brief compile notes.brf --target=llm -w            # writes notes.txt
 brief compile notes.brf --target=llm --report-tokens
 ```
 
-`--report-tokens` adds a stderr line with the cl100k character/token
-estimate, useful for budgeting LLM prompts.
+`--report-tokens` adds a stderr line with a rough token estimate
+(characters divided by four), useful as a relative gauge when trimming
+LLM prompts.
 
 ## What the compiler enforces
 

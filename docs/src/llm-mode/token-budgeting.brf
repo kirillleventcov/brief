@@ -11,12 +11,14 @@ Add `--report-tokens` to any LLM-mode compile. The compiler prints a
 stderr line:
 
 ```text
-brief: doc.brf -> 1,247 chars, ~340 tokens (cl100k estimate)
+brief: doc.brf -> 1,247 chars, ~340 tokens (chars/4 heuristic)
 ```
 
-The estimate uses cl100k_base — OpenAI's tokenizer for GPT-3.5 / GPT-4.
-It is best-effort and *not* normative. Other tokenizers will produce
-different counts; treat the number as a relative gauge.
+The estimate is characters divided by four — no tokenizer is involved.
+That approximation is decent for English prose and off by a wide margin
+(up to roughly 45 percent) for dense JSON or code. Treat the number as a
+relative gauge between two phrasings; for real budgets run your target
+model's tokenizer over the compiled output.
 
 ```bash
 brief compile prompt.brf --target=llm --report-tokens > /dev/null
@@ -95,17 +97,16 @@ Measure the *quality* of the LLM's output, not just the token count. A
 50-token saving that drops accuracy by 10 percent is a bad trade. The
 estimator can't tell you that; only your eval can.
 
-## Where the cl100k assumption breaks
+## Where the chars/4 assumption breaks
 
-Different downstream tokenizers diverge from cl100k for specific token
-classes:
+The heuristic assumes roughly four characters per token, which holds for
+plain English prose and drifts everywhere else:
 
-- Anthropic's tokenizer for Claude treats whitespace and punctuation
-  differently in places.
-- Open-weight models (Llama, Mistral) use SentencePiece variants with
-  their own quirks.
-- Multilingual content costs more in cl100k than in BPE-trained
-  tokenizers tuned for the target language.
+- Dense JSON and code tokenize far worse than 4:1 — the estimate can be
+  off by roughly 45 percent on config-heavy documents.
+- Tokenizers differ: cl100k, Anthropic's tokenizer, and SentencePiece
+  variants (Llama, Mistral) each split whitespace, punctuation, and
+  multilingual text differently.
 
 The compiler's number is still useful for *relative* measurement on the
 same source — but if you depend on exact tokenization for a specific

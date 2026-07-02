@@ -11,6 +11,7 @@ pub fn parse(tokens: Vec<Token>, src: &SourceMap) -> (Document, Vec<Diagnostic>)
         toks: tokens,
         pos: fm_consumed,
         diags: fm_diags,
+        depth: 0,
     };
     let mut blocks = p.parse_blocks(0, None);
     // Anything left after a top-level parse must be a stray `@end`.
@@ -115,11 +116,18 @@ fn parse_frontmatter(
     (None, idx, diags)
 }
 
+/// Blocks may nest via list children, block shortcodes, and blockquote
+/// markers. Each level recurses on the native stack, so nesting must be
+/// bounded or hostile/degenerate input aborts the process with a stack
+/// overflow instead of a diagnostic.
+const MAX_NESTING_DEPTH: usize = 64;
+
 struct Parser<'a> {
     _src: &'a SourceMap,
     toks: Vec<Token>,
     pos: usize,
     diags: Vec<Diagnostic>,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -131,6 +139,55 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_blocks(&mut self, base_indent: u16, end_at_indent_below: Option<u16>) -> Vec<Block> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            self.diags.push(
+                Diagnostic::new(Code::NestingTooDeep, self.peek().span).label(format!(
+                    "blocks nest deeper than {} levels",
+                    MAX_NESTING_DEPTH
+                )),
+            );
+            self.skip_overdeep_region(base_indent, end_at_indent_below);
+            return Vec::new();
+        }
+        self.depth += 1;
+        let out = self.parse_blocks_inner(base_indent, end_at_indent_below);
+        self.depth -= 1;
+        out
+    }
+
+    /// Consume the tokens a `parse_blocks` call would have owned, without
+    /// recursing, so callers past the depth ceiling still make progress.
+    fn skip_overdeep_region(&mut self, base_indent: u16, end_at_indent_below: Option<u16>) {
+        while !self.at_eof() {
+            match &self.peek().kind {
+                TokenKind::Eof => break,
+                TokenKind::Blank => {
+                    self.pos += 1;
+                }
+                TokenKind::Line(s) => {
+                    let indent = self.peek().indent;
+                    if indent < base_indent {
+                        break;
+                    }
+                    if let Some(min) = end_at_indent_below {
+                        if indent < min {
+                            break;
+                        }
+                    }
+                    if s[indent as usize..].trim() == "@end" {
+                        break;
+                    }
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    fn parse_blocks_inner(
+        &mut self,
+        base_indent: u16,
+        end_at_indent_below: Option<u16>,
+    ) -> Vec<Block> {
         let mut out = Vec::new();
         loop {
             if self.at_eof() {
@@ -190,6 +247,23 @@ impl<'a> Parser<'a> {
         }
         if trimmed == "---" {
             return Some(self.parse_hr());
+        }
+        // A dash-only line that isn't exactly three dashes is a malformed
+        // horizontal rule, not prose — silently reading it as a paragraph
+        // would hide the typo.
+        if trimmed.len() >= 2 && trimmed.bytes().all(|b| b == b'-') {
+            let span = self.peek().span;
+            self.diags.push(
+                Diagnostic::new(Code::BadHorizontalRule, span).label(format!(
+                    "horizontal rule is exactly `---`, got {} dashes",
+                    trimmed.len()
+                )),
+            );
+            self.pos += 1;
+            return Some(Block::Paragraph {
+                content: vec![],
+                span,
+            });
         }
         if trimmed.starts_with("```") {
             return Some(self.parse_code_fence());
@@ -578,7 +652,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_blockquote(&mut self, indent: u16) -> Block {
-        let mut lines: Vec<(u8, String, Span)> = Vec::new();
+        let mut lines: Vec<(usize, String, Span)> = Vec::new();
         let start = self.peek().span;
         loop {
             if self.at_eof() {
@@ -594,7 +668,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             let trimmed = &line[indent as usize..];
-            let mut depth: u8 = 0;
+            let mut depth: usize = 0;
             let mut idx = 0usize;
             let bytes = trimmed.as_bytes();
             while idx < bytes.len() && bytes[idx] == b'>' {
@@ -602,6 +676,16 @@ impl<'a> Parser<'a> {
                 idx += 1;
             }
             if depth == 0 {
+                break;
+            }
+            if depth > MAX_NESTING_DEPTH {
+                self.diags.push(
+                    Diagnostic::new(Code::NestingTooDeep, tok.span).label(format!(
+                        "blockquote nests deeper than {} levels",
+                        MAX_NESTING_DEPTH
+                    )),
+                );
+                self.pos += 1;
                 break;
             }
             if bytes.get(idx) != Some(&b' ') {
@@ -724,6 +808,22 @@ impl<'a> Parser<'a> {
                         cols
                     )),
                 );
+            }
+            // `@t` becomes a `Block::Table` before the resolver sees it, so
+            // the enum check must live here. The emitter writes these values
+            // into a style attribute; anything outside the allowed set is
+            // both a user error and an injection vector.
+            for v in a {
+                let ok = matches!(v.as_str(), Some("left") | Some("right") | Some("center"));
+                if !ok {
+                    self.diags
+                        .push(
+                            Diagnostic::new(Code::BadEnumValue, directive.span).label(format!(
+                                "`align` entries must be `left`, `right`, or `center`, got `{}`",
+                                v.as_str().unwrap_or(v.type_name())
+                            )),
+                        );
+                }
             }
         }
         let span = rows
@@ -850,6 +950,17 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     if let Some(rest) = body.strip_prefix(": ") {
+                        // The marker is exactly `: ` — colon, one space.
+                        // Extra spaces would silently become part of the
+                        // definition text, so they're rejected as documented.
+                        if rest.starts_with(' ') {
+                            self.diags.push(
+                                Diagnostic::new(Code::BadDefinitionList, tok.span)
+                                    .label("`:` must be followed by exactly one space"),
+                            );
+                            self.pos += 1;
+                            continue;
+                        }
                         if pending_term.is_none() && pending_def.is_none() {
                             self.diags.push(
                                 Diagnostic::new(Code::BadDefinitionList, tok.span)
@@ -871,6 +982,12 @@ impl<'a> Parser<'a> {
                         }
                         let base = tok.span.start + indent as u32 + 2;
                         pending_def = Some((rest.to_string(), base, tok.span));
+                        self.pos += 1;
+                    } else if body.starts_with(':') {
+                        self.diags.push(
+                            Diagnostic::new(Code::BadDefinitionList, tok.span)
+                                .label("`:` must be followed by exactly one space"),
+                        );
                         self.pos += 1;
                     } else {
                         // Term line.
@@ -953,6 +1070,9 @@ impl<'a> Parser<'a> {
             return None;
         }
         self.pos += 1;
+        if name == "code" {
+            return Some(self.parse_code_shortcode_body(indent, &tok, args));
+        }
         let children = self.parse_blocks(indent, Some(indent));
         let mut end_span = tok.span;
         match &self.peek().kind {
@@ -975,6 +1095,106 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `@code` bodies are verbatim, exactly like a triple-backtick fence —
+    /// the shortcode exists so fence syntax itself can appear inside a code
+    /// block. The body must never go through `parse_blocks`/`parse_inline`;
+    /// that would reject ordinary code (`*ptr` reads as emphasis) and
+    /// double-escape the rest.
+    fn parse_code_shortcode_body(&mut self, indent: u16, open: &Token, args: ShortArgs) -> Block {
+        let lang = self.code_shortcode_lang(args, open.span);
+        let mut body = String::new();
+        let mut span = open.span;
+        loop {
+            match &self.peek().kind {
+                TokenKind::Eof => {
+                    self.diags.push(
+                        Diagnostic::new(Code::UnterminatedBlock, open.span)
+                            .label("`@code` block was never closed with `@end`"),
+                    );
+                    break;
+                }
+                TokenKind::Blank => {
+                    body.push('\n');
+                    span = span.join(self.peek().span);
+                    self.pos += 1;
+                }
+                TokenKind::Line(s) => {
+                    if s.trim() == "@end" && self.peek().indent == indent {
+                        span = span.join(self.peek().span);
+                        self.pos += 1;
+                        break;
+                    }
+                    body.push_str(s);
+                    body.push('\n');
+                    span = span.join(self.peek().span);
+                    self.pos += 1;
+                }
+            }
+        }
+        if body.ends_with('\n') {
+            body.pop();
+        }
+        Block::CodeBlock {
+            lang,
+            body,
+            attrs: CodeAttrs::default(),
+            span,
+        }
+    }
+
+    /// `@code` becomes a `CodeBlock` before the resolver ever sees it, so its
+    /// arguments must be checked here: one optional `lang`, positional or
+    /// keyword, string or ident.
+    fn code_shortcode_lang(&mut self, args: ShortArgs, span: Span) -> Option<String> {
+        let mut lang: Option<String> = None;
+        for (i, v) in args.positional.iter().enumerate() {
+            if i > 0 {
+                self.diags.push(
+                    Diagnostic::new(Code::BadArgSyntax, span)
+                        .label("`@code` takes at most one positional argument (the language)"),
+                );
+                break;
+            }
+            match v.as_str() {
+                Some(s) => lang = Some(s.to_string()),
+                None => {
+                    self.diags
+                        .push(Diagnostic::new(Code::ArgTypeMismatch, span).label(format!(
+                            "argument `lang` has type {} but expected String",
+                            v.type_name()
+                        )));
+                }
+            }
+        }
+        for (kw, v) in &args.keyword {
+            if kw != "lang" {
+                self.diags.push(
+                    Diagnostic::new(Code::BadArgSyntax, span)
+                        .label(format!("`@code` has no argument named `{}`", kw)),
+                );
+                continue;
+            }
+            if lang.is_some() {
+                self.diags.push(
+                    Diagnostic::new(Code::DuplicateKwarg, span)
+                        .label("`lang` given both positionally and by keyword"),
+                );
+                continue;
+            }
+            match v.as_str() {
+                Some(s) => lang = Some(s.to_string()),
+                None => {
+                    self.diags
+                        .push(Diagnostic::new(Code::ArgTypeMismatch, span).label(format!(
+                            "argument `lang` has type {} but expected String",
+                            v.type_name()
+                        )));
+                }
+            }
+        }
+        lang
+    }
+
     fn skip_blanks(&mut self) {
         while matches!(self.peek().kind, TokenKind::Blank) {
             self.pos += 1;
@@ -982,7 +1202,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn build_blockquote(items: &[(u8, String, Span)], depth: u8) -> (Vec<Block>, Span) {
+fn build_blockquote(items: &[(usize, String, Span)], depth: usize) -> (Vec<Block>, Span) {
     let mut paras: Vec<Block> = Vec::new();
     let mut full_span = Span::DUMMY;
     let mut i = 0;
@@ -1776,5 +1996,138 @@ mod tests {
             "{:?}",
             d
         );
+    }
+
+    #[test]
+    fn deep_list_nesting_is_b0318_not_crash() {
+        let src: String = (0..6000)
+            .map(|i| format!("{}- x\n", "  ".repeat(i)))
+            .collect();
+        let (_, d) = p(&src);
+        assert!(d.iter().any(|x| x.code == Code::NestingTooDeep), "{:?}", d);
+    }
+
+    #[test]
+    fn deep_shortcode_nesting_is_b0318_not_crash() {
+        let src = format!("{}x\n{}", "@details\n".repeat(6000), "@end\n".repeat(6000));
+        let (_, d) = p(&src);
+        assert!(d.iter().any(|x| x.code == Code::NestingTooDeep), "{:?}", d);
+    }
+
+    #[test]
+    fn deep_blockquote_markers_is_b0318_not_crash() {
+        let src = format!("{} hi\n", ">".repeat(50_000));
+        let (_, d) = p(&src);
+        assert!(d.iter().any(|x| x.code == Code::NestingTooDeep), "{:?}", d);
+    }
+
+    #[test]
+    fn code_shortcode_body_is_verbatim() {
+        let (doc, d) = p("@code(lang: rust)\nlet x = *ptr;\n@end\n");
+        assert!(d.is_empty(), "{:?}", d);
+        match &doc.blocks[0] {
+            Block::CodeBlock { lang, body, .. } => {
+                assert_eq!(lang.as_deref(), Some("rust"));
+                assert_eq!(body, "let x = *ptr;");
+            }
+            b => panic!("expected CodeBlock, got {:?}", b),
+        }
+    }
+
+    #[test]
+    fn code_shortcode_positional_lang_and_nested_fence() {
+        let (doc, d) = p("@code(brief)\n```rust\nfn main() {}\n```\n@end\n");
+        assert!(d.is_empty(), "{:?}", d);
+        match &doc.blocks[0] {
+            Block::CodeBlock { lang, body, .. } => {
+                assert_eq!(lang.as_deref(), Some("brief"));
+                assert_eq!(body, "```rust\nfn main() {}\n```");
+            }
+            b => panic!("expected CodeBlock, got {:?}", b),
+        }
+    }
+
+    #[test]
+    fn code_shortcode_unknown_arg_is_b0406() {
+        let (_, d) = p("@code(bogus: 1)\nx\n@end\n");
+        assert!(d.iter().any(|x| x.code == Code::BadArgSyntax), "{:?}", d);
+    }
+
+    #[test]
+    fn code_shortcode_unterminated_is_b0306() {
+        let (_, d) = p("@code\nx\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::UnterminatedBlock),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn table_align_value_outside_enum_is_b0404() {
+        let (_, d) = p("@t(align: [\"left\\\"><script>x</script>\", right])\n| A | B\n| 1 | 2\n");
+        assert!(d.iter().any(|x| x.code == Code::BadEnumValue), "{:?}", d);
+    }
+
+    #[test]
+    fn table_align_valid_values_ok() {
+        let (_, d) = p("@t(align: [left, right, center])\n| A | B | C\n| 1 | 2 | 3\n");
+        assert!(d.is_empty(), "{:?}", d);
+    }
+
+    #[test]
+    fn four_dash_rule_is_b0304() {
+        let (_, d) = p("----\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::BadHorizontalRule),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn two_dash_rule_is_b0304() {
+        let (_, d) = p("--\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::BadHorizontalRule),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn three_dash_rule_is_ok() {
+        let (doc, d) = p("---\n");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(matches!(doc.blocks[0], Block::HorizontalRule { .. }));
+    }
+
+    #[test]
+    fn dl_extra_space_after_colon_is_b0505() {
+        let (_, d) = p("@dl\nTerm\n:  two spaces\n@end\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::BadDefinitionList),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn dl_no_space_after_colon_is_b0505() {
+        let (_, d) = p("@dl\nTerm\n:nospace\n@end\n");
+        assert!(
+            d.iter().any(|x| x.code == Code::BadDefinitionList),
+            "{:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn nesting_at_limit_is_ok() {
+        let src: String = (0..MAX_NESTING_DEPTH)
+            .map(|i| format!("{}- x\n", "  ".repeat(i)))
+            .collect();
+        let (_, d) = p(&src);
+        assert!(d.is_empty(), "{:?}", d);
     }
 }

@@ -21,8 +21,10 @@ struct Cli {
 enum Cmd {
     Compile {
         input: PathBuf,
-        #[arg(long, default_value = "html")]
-        target: String,
+        /// Output target: html, llm, or json. Defaults to
+        /// `compile.default_target` from brief.toml, then html.
+        #[arg(long)]
+        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -95,8 +97,10 @@ enum Cmd {
     Watch {
         /// Files or directories to watch. Defaults to the current directory.
         paths: Vec<PathBuf>,
-        #[arg(long, default_value = "html")]
-        target: String,
+        /// Output target: html, llm, or json. Defaults to
+        /// `compile.default_target` from brief.toml, then html.
+        #[arg(long)]
+        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -179,7 +183,7 @@ fn main() -> ExitCode {
 
 fn run_watch(
     paths: Vec<PathBuf>,
-    target: String,
+    target: Option<String>,
     cfg_path: Option<PathBuf>,
     strip_emphasis: bool,
     keep_table_rule: bool,
@@ -188,6 +192,14 @@ fn run_watch(
     no_clear: bool,
 ) -> ExitCode {
     use brief::watch::{LlmOpts, Target as WatchTarget, WatchOpts};
+    let config_path = cfg_path.unwrap_or_else(|| PathBuf::from("brief.toml"));
+    let target = match target {
+        Some(t) => t,
+        None => config::load(&config_path)
+            .ok()
+            .and_then(|c| c.compile.default_target)
+            .unwrap_or_else(|| "html".to_string()),
+    };
     let target = match WatchTarget::parse(&target) {
         Some(t) => t,
         None => {
@@ -203,7 +215,6 @@ fn run_watch(
     } else {
         paths
     };
-    let config_path = cfg_path.unwrap_or_else(|| PathBuf::from("brief.toml"));
     let opts = WatchOpts {
         paths,
         target,
@@ -225,7 +236,7 @@ fn run_watch(
 
 fn run_compile(
     input: PathBuf,
-    target: String,
+    target: Option<String>,
     cfg_path: Option<PathBuf>,
     report_tokens: bool,
     strip_emphasis: bool,
@@ -296,6 +307,9 @@ fn run_compile(
         }
     };
     let registry: Registry = config::registry_from(&cfg);
+    let target = target
+        .or_else(|| cfg.compile.default_target.clone())
+        .unwrap_or_else(|| "html".to_string());
     let opts = validate::ValidateOpts {
         strict_heading_levels: cfg.compile.strict_heading_levels,
     };
@@ -409,6 +423,19 @@ fn run_compile(
             print!("{}", output);
         }
         Some(path) => {
+            // `-w` derives the output extension from the target (llm -> .txt),
+            // so compiling a `.txt` input would silently replace the source.
+            let same_file = match (std::fs::canonicalize(path), std::fs::canonicalize(&input)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => path == &input,
+            };
+            if same_file {
+                eprintln!(
+                    "brief: refusing to overwrite input {} with compiled output; use -o with a different path",
+                    input.display()
+                );
+                return ExitCode::from(2);
+            }
             if let Err(e) = std::fs::write(path, &output) {
                 eprintln!("brief: cannot write {}: {}", path.display(), e);
                 return ExitCode::from(2);
@@ -421,7 +448,7 @@ fn run_compile(
         let chars = output.chars().count();
         let approx = (chars + 3) / 4;
         eprintln!(
-            "brief: {} -> {} chars, ~{} tokens (cl100k estimate)",
+            "brief: {} -> {} chars, ~{} tokens (chars/4 heuristic)",
             src.path, chars, approx
         );
     }
@@ -487,7 +514,7 @@ fn run_explain(code: &str) -> ExitCode {
         ),
         (
             Code::LineCommentConverted,
-            "`@minify-keep-comments` converts `//` line comments into `/* */` block form so they can survive on a single minified line. If the comment body contains `*/` the conversion will break the comment; audit those blocks. Or use `@nominify` to keep the source verbatim.",
+            "`@minify-keep-comments` converts `//` line comments into `/* */` block form so they can survive on a single minified line. Any `*/` inside the comment text is rewritten to `* /` so the block cannot close early. Use `@nominify` to keep the source verbatim instead.",
         ),
         (
             Code::RefusedLanguage,
@@ -508,6 +535,138 @@ fn run_explain(code: &str) -> ExitCode {
         (
             Code::RefNoProject,
             "`@ref` only works inside a project rooted by a `brief.toml` file. The compiler walks up from the source file looking for one. Create a `brief.toml` (an empty file is fine) at the desired root, or remove the `@ref` invocation.",
+        ),
+        (
+            Code::InvalidUtf8,
+            "Brief sources must be valid UTF-8. Re-encode the file (e.g. `iconv -t UTF-8`) or find and fix the corrupt bytes at the reported offset.",
+        ),
+        (
+            Code::BomNotAtStart,
+            "A UTF-8 byte-order mark is tolerated only as the very first bytes of the file. A BOM anywhere else is usually the result of concatenating files; delete it.",
+        ),
+        (
+            Code::UnexpectedChar,
+            "The lexer found a character that cannot begin or continue any Brief construct at this position. Usually a control character or stray escape; delete or replace it.",
+        ),
+        (
+            Code::EmphasisCrossLine,
+            "Emphasis spans must open and close on the same source line. Close the span before the line break, or join the lines into one.",
+        ),
+        (
+            Code::DoubledEmphasis,
+            "`**bold**`-style doubled markers are Markdown, not Brief. Brief uses single markers: `*bold*`, `_italic_`, `+underline+`, `~strike~`.",
+        ),
+        (
+            Code::UnterminatedEmph,
+            "An emphasis marker opened a span that never closes on the same line. Close it, or escape the marker (`\\*`) if it's literal text.",
+        ),
+        (
+            Code::UnterminatedCode,
+            "A backtick opened an inline code span that never closes on the same line. Close it, or use a double-backtick span (``` ``code with ` inside`` ```) when the code contains a backtick.",
+        ),
+        (
+            Code::HeadingNoSpace,
+            "A heading marker is the `#`s followed by exactly one space: `# Title`. No space (or several) is an error so `#hashtag`-style text is never silently promoted to a heading.",
+        ),
+        (
+            Code::BadIndent,
+            "Brief indentation is strict: two spaces per nesting level. An odd number of leading spaces (or a level skipped) cannot be interpreted unambiguously; re-indent to multiples of two.",
+        ),
+        (
+            Code::BadHorizontalRule,
+            "A horizontal rule is exactly three dashes on their own line: `---`. Two dashes is too few; four or more is too many. This is strict so a typoed rule never silently becomes paragraph text.",
+        ),
+        (
+            Code::UnterminatedFence,
+            "A ``` code fence was opened but never closed before end of file. Add the closing ``` line. To show fence syntax inside a code block, use the `@code ... @end` shortcode instead of nesting fences.",
+        ),
+        (
+            Code::UnterminatedBlock,
+            "A block shortcode (`@details`, `@dl`, `@code`, a custom block) was never closed. Add `@end` at the same indentation as the opening line.",
+        ),
+        (
+            Code::InlineBlockComment,
+            "`/* ... */` comments are block-level in Brief: they must start at the beginning of a line. For a comment after content on the same line there is no inline form — move it to its own line.",
+        ),
+        (
+            Code::BadListMarker,
+            "Unordered list items are `- ` (dash, one space); ordered items are `1. ` (number, dot, one space). Markdown's `*` and `+` markers are not list markers in Brief.",
+        ),
+        (
+            Code::EmptyDocument,
+            "The source contains no blocks — only whitespace or comments. Brief treats a document with nothing to render as an error rather than emitting an empty output file.",
+        ),
+        (
+            Code::BadBlockquote,
+            "Blockquote markers are `>` (or `>>`, `>>>` for nesting) followed by exactly one space. `>text` without the space is rejected so accidental `>` characters are caught.",
+        ),
+        (
+            Code::StrayEnd,
+            "`@end` closes a block shortcode, but no block shortcode is open here. Remove it, or check the indentation of the opening line — `@end` must sit at the same indent.",
+        ),
+        (
+            Code::StrayContent,
+            "Content appears where the current construct does not allow it — most commonly a `|` row outside a `@t` table. Wrap table rows in `@t ... `(rows end at the first non-`|` line).",
+        ),
+        (
+            Code::BadHeadingAnchor,
+            "A heading anchor is a trailing `{#name}` where name matches `[a-z0-9-]+`: `## Title {#title}`. Fix the anchor syntax or remove the braces.",
+        ),
+        (
+            Code::NestingTooDeep,
+            "Blocks (lists, blockquotes, block shortcodes) nest at most 64 levels deep. Deeper nesting is almost always generated or accidental input; restructure the document.",
+        ),
+        (
+            Code::ArgTypeMismatch,
+            "A shortcode argument has the wrong type — e.g. a bare identifier where a quoted string is declared, or an int where an array is expected. The declared type is in `brief.toml` under `[shortcodes.<name>.arguments]` (built-ins are documented in the reference).",
+        ),
+        (
+            Code::MissingArg,
+            "A required shortcode argument was not supplied. Add it as `@name(arg: value)` or positionally if the argument declares a `position`.",
+        ),
+        (
+            Code::BadEnumValue,
+            "The argument only accepts a fixed set of values (its `oneof` list). For example `@t(align: [...])` entries must be `left`, `right`, or `center`. Use one of the allowed values.",
+        ),
+        (
+            Code::FormMismatch,
+            "The shortcode was used in the wrong form: a block shortcode invoked inline, or an inline shortcode used as a block with `@end`. Check the shortcode's declared `kind`.",
+        ),
+        (
+            Code::BadArgSyntax,
+            "The argument list does not parse: unbalanced parentheses or brackets, a missing `:` after a keyword, an unterminated string, or an unclosed `(url)` in link sugar (percent-encode unmatched parens as %28/%29).",
+        ),
+        (
+            Code::DuplicateKwarg,
+            "The same keyword argument is given more than once (possibly once positionally and once by name). Remove the duplicate.",
+        ),
+        (
+            Code::DeprecatedCalloutKind,
+            "This callout kind is a deprecated alias. Use the GFM set: note, tip, important, warning, caution. This is the compiler's only deprecation warning; it compiles with exit 0.",
+        ),
+        (
+            Code::UnknownArg,
+            "The shortcode does not declare an argument with this name. Check the spelling against the declared arguments (listed in the diagnostic's help text), or declare it in `brief.toml`.",
+        ),
+        (
+            Code::HeadingMonotonic,
+            "With `compile.strict_heading_levels = true`, heading levels may increase by at most one per step (`#` to `##`, never `#` to `###`). Restructure the outline or disable the option.",
+        ),
+        (
+            Code::AlignArrayLength,
+            "`@t(align: [...])` must list exactly one alignment per table column. Add or remove entries until the array length matches the header's cell count.",
+        ),
+        (
+            Code::BadDefinitionList,
+            "A `@dl` body alternates term lines and `: definition` lines — colon, exactly one space, definition. Terms without definitions, definitions without terms, multiple definitions per term, and extra or missing spaces after `:` are all rejected.",
+        ),
+        (
+            Code::DuplicateHeadingAnchor,
+            "Two headings in this document declare the same `{#anchor}`. Anchors are `@ref` targets and must be unique within a file; rename one.",
+        ),
+        (
+            Code::MinifyFailed,
+            "A code block is tagged with a minifiable language but does not lex in that language (e.g. an unterminated string, or pseudo-code tagged `json`). The block is emitted verbatim and compilation continues; fix the code or the language tag. Compiles with exit 0.",
         ),
     ];
     for (c, text) in table {

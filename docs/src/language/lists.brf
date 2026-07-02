@@ -96,8 +96,8 @@ Rules:
   the closing bracket.
 - Anything else (`[X]`, `[  ]`, `[x]` without the trailing space) is plain
   text.
-- Task markers are *not* supported on ordered list items. `1. [x] foo` is
-  just text.
+- Task markers work on ordered items too: `1. [x] foo` renders a checked
+  item inside the `<ol>`.
 
 @callout(kind: note)
 HTML emit renders these as `<input type="checkbox" disabled>` inside

@@ -7,7 +7,9 @@ generator). Everything else lives behind a subcommand.
 
 ## `brief`
 
-The compiler. Subcommands: `compile`, `convert`, `explain`.
+The compiler. Subcommands: `compile`, `convert`, `explain`, `fmt`,
+`watch`. There is also `brief-lsp`, a separate language-server binary
+for editor integration.
 
 ### `brief compile`
 
@@ -25,12 +27,14 @@ Options:
   `compile.default_target`.
 -w, --write
 : Write the output to a file next to the source. `.brf` becomes `.html`,
-  `.txt`, or `.json` depending on the target.
+  `.txt`, or `.json` depending on the target. The compiler refuses to
+  write when the derived path equals the input (e.g. compiling a `.txt`
+  with `--target=llm`), so a source file can never be overwritten.
 -o, --output PATH
 : Write to a specific path. Mutually exclusive with `-w`.
 --report-tokens
-: Only valid with `--target=llm`. Prints a stderr line with the cl100k
-  character/token estimate of the output.
+: Only valid with `--target=llm`. Prints a stderr line with a rough
+  token estimate of the output (characters divided by four).
 --strip-emphasis
 : LLM target only. Drop emphasis markers entirely; text content survives.
 --keep-asset-urls
@@ -76,8 +80,34 @@ brief explain B0204
 ```
 
 Output is the rule, why it exists, a worked example of the error, and a
-worked example of the fix. See @ref[reference/error-codes.brf](Error code registry)
-for the full list.
+worked example of the fix. Every code the compiler can emit has an entry.
+See @ref[reference/error-codes.brf](Error code registry) for the full
+list.
+
+### `brief fmt`
+
+Reformat Brief source into the canonical style — gofmt doctrine, no
+configuration beyond one explicit opt-in.
+
+```bash
+brief fmt doc.brf              # formatted source to stdout
+brief fmt doc.brf --write      # rewrite in place
+brief fmt src/*.brf --check    # exit non-zero if anything would change
+brief fmt doc.brf --sort-frontmatter --write
+```
+
+### `brief watch`
+
+Watch files or directories and recompile on change, with a 100ms
+debounce.
+
+```bash
+brief watch src/ --target=html
+brief watch doc.brf --target=llm --no-clear
+```
+
+Accepts the same target and LLM-mode flags as `brief compile`, plus
+`--no-clear` to keep previous output on screen between runs.
 
 ## `brief-web`
 

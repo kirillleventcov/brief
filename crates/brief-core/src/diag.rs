@@ -37,7 +37,9 @@ pub enum Code {
     UnknownCodeAttribute = 315,
     ConflictingCodeAttributes = 316,
     BadHeadingAnchor = 317,
+    NestingTooDeep = 318,
 
+    MinifyFailed = 701,
     CodeBlockLineCount = 702,
     LineCommentConverted = 703,
     RefusedLanguage = 704,
@@ -50,6 +52,7 @@ pub enum Code {
     BadArgSyntax = 406,
     DuplicateKwarg = 407,
     DeprecatedCalloutKind = 408,
+    UnknownArg = 409,
 
     OrderedListSequence = 501,
     TableColumnMismatch = 502,
@@ -65,6 +68,61 @@ pub enum Code {
 }
 
 impl Code {
+    /// Every diagnostic code the compiler can emit. `brief explain` coverage
+    /// is tested against this list — extend it when adding a variant.
+    pub const ALL: &'static [Code] = &[
+        Code::InvalidUtf8,
+        Code::TabCharacter,
+        Code::BomNotAtStart,
+        Code::UnexpectedChar,
+        Code::EmphasisSameMarker,
+        Code::EmphasisCrossLine,
+        Code::DoubledEmphasis,
+        Code::UnterminatedEmph,
+        Code::UnterminatedCode,
+        Code::HeadingTooDeep,
+        Code::HeadingNoSpace,
+        Code::BadIndent,
+        Code::BadHorizontalRule,
+        Code::UnterminatedFence,
+        Code::UnterminatedBlock,
+        Code::InlineBlockComment,
+        Code::BadListMarker,
+        Code::EmptyDocument,
+        Code::BadBlockquote,
+        Code::StrayEnd,
+        Code::StrayContent,
+        Code::UnterminatedFrontmatter,
+        Code::FrontmatterToml,
+        Code::UnknownCodeAttribute,
+        Code::ConflictingCodeAttributes,
+        Code::BadHeadingAnchor,
+        Code::NestingTooDeep,
+        Code::UnknownShortcode,
+        Code::ArgTypeMismatch,
+        Code::MissingArg,
+        Code::BadEnumValue,
+        Code::FormMismatch,
+        Code::BadArgSyntax,
+        Code::DuplicateKwarg,
+        Code::DeprecatedCalloutKind,
+        Code::UnknownArg,
+        Code::OrderedListSequence,
+        Code::TableColumnMismatch,
+        Code::HeadingMonotonic,
+        Code::AlignArrayLength,
+        Code::BadDefinitionList,
+        Code::DuplicateHeadingAnchor,
+        Code::RefMissingFile,
+        Code::RefMissingAnchor,
+        Code::RefBadTarget,
+        Code::RefNoProject,
+        Code::MinifyFailed,
+        Code::CodeBlockLineCount,
+        Code::LineCommentConverted,
+        Code::RefusedLanguage,
+    ];
+
     pub fn as_str(self) -> String {
         format!("B{:04}", self as u32)
     }
@@ -98,7 +156,9 @@ impl Code {
             UnknownCodeAttribute => "unknown code-fence attribute",
             ConflictingCodeAttributes => "conflicting code-fence attributes",
             BadHeadingAnchor => "invalid heading anchor",
+            NestingTooDeep => "blocks are nested too deeply",
             BadDefinitionList => "malformed definition list",
+            MinifyFailed => "code block did not parse in its tagged language; emitted verbatim",
             CodeBlockLineCount => {
                 "minified code block was originally many lines; LLM consumers cannot reference specific lines"
             }
@@ -112,6 +172,7 @@ impl Code {
             BadArgSyntax => "malformed shortcode argument syntax",
             DuplicateKwarg => "keyword argument given more than once",
             DeprecatedCalloutKind => "callout kind is deprecated; use the GFM equivalent",
+            UnknownArg => "shortcode does not declare this argument",
             OrderedListSequence => "ordered list numbering must be sequential starting from 1",
             TableColumnMismatch => "table row column count does not match header",
             HeadingMonotonic => "heading levels must increase by at most one",

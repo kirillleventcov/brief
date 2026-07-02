@@ -481,9 +481,17 @@ fn typecheck_args(
     diags: &mut Vec<Diagnostic>,
 ) {
     for (kw, v) in &args.keyword {
-        if let Some(spec) = sc.arguments.get(kw)
-            && !type_matches(&spec.ty, v)
-        {
+        let Some(spec) = sc.arguments.get(kw) else {
+            let mut d = Diagnostic::new(Code::UnknownArg, span)
+                .label(format!("no argument named `{}` on this shortcode", kw));
+            if !sc.arguments.is_empty() {
+                let known: Vec<&str> = sc.arguments.keys().map(|s| s.as_str()).collect();
+                d = d.help(format!("declared arguments: {}", known.join(", ")));
+            }
+            diags.push(d);
+            continue;
+        };
+        if !type_matches(&spec.ty, v) {
             diags.push(Diagnostic::new(Code::ArgTypeMismatch, span).label(format!(
                 "argument `{}` has type {} but expected {:?}",
                 kw,
@@ -524,6 +532,30 @@ mod tests {
     fn resolved_refs_starts_empty() {
         let doc = parse_only("hello\n");
         assert!(doc.resolved_refs.is_empty());
+    }
+
+    #[test]
+    fn unknown_keyword_arg_is_b0409() {
+        let mut doc = parse_only("@details(summary: \"s\", bogus: 1)\nx\n@end\n");
+        let reg = crate::shortcode::Registry::with_builtins();
+        let diags = resolve(&mut doc, &reg);
+        assert!(
+            diags.iter().any(|d| d.code == Code::UnknownArg),
+            "diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn declared_keyword_arg_passes() {
+        let mut doc = parse_only("@details(summary: \"s\")\nx\n@end\n");
+        let reg = crate::shortcode::Registry::with_builtins();
+        let diags = resolve(&mut doc, &reg);
+        assert!(
+            diags.iter().all(|d| d.code != Code::UnknownArg),
+            "diags: {:?}",
+            diags
+        );
     }
 
     #[test]

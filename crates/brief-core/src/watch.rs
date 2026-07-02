@@ -392,7 +392,7 @@ pub fn scan_shortcode_uses(source: &str) -> HashSet<String> {
 }
 
 pub fn diff_config(old: &Config, new: &Config) -> ConfigDelta {
-    if old.project != new.project || old.compile != new.compile || old.hooks != new.hooks {
+    if old.project != new.project || old.compile != new.compile {
         return ConfigDelta::All;
     }
 

@@ -932,3 +932,29 @@ fn t_definition_list_malformed_is_b0505() {
     let (_, codes) = compile("@dl\n: Stray definition.\n@end\n");
     assert!(codes.contains(&Code::BadDefinitionList), "{:?}", codes);
 }
+
+#[test]
+fn llm_table_escapes_pipes_in_cells() {
+    // A `\|` escape or an inline-code `|` must not leak as a raw column
+    // separator into the flattened LLM table.
+    let brief_src = "@t\n| a | b\n| x \\| y | `c|d`\n";
+    let src = SourceMap::new("t.brf", brief_src);
+    let tokens = lex(&src).unwrap();
+    let (mut doc, diags) = parse(tokens, &src);
+    assert!(diags.is_empty(), "{:?}", diags);
+    let reg = Registry::with_builtins();
+    let r = resolve(&mut doc, &reg);
+    assert!(r.is_empty(), "{:?}", r);
+    let (out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
+    for line in out.lines().filter(|l| l.starts_with('|')) {
+        let unescaped = line.replace("\\|", "");
+        assert_eq!(
+            unescaped.matches('|').count(),
+            3,
+            "row must keep exactly 2 columns: {:?}",
+            line
+        );
+    }
+    assert!(out.contains("x \\| y"), "{}", out);
+    assert!(out.contains("`c\\|d`"), "{}", out);
+}
