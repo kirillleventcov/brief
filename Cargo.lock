@@ -87,7 +87,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "brief-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "brief-core",
  "clap",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "brief-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "mimalloc",
  "notify",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "brief-lsp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "brief-core",
  "dashmap",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "brief-web"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "brief-core",
  "clap",

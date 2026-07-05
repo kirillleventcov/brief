@@ -975,7 +975,7 @@ impl<'a> Parser<'a> {
                         if pending_def.is_some() {
                             self.diags.push(
                                 Diagnostic::new(Code::BadDefinitionList, tok.span).label(
-                                    "multiple definitions per term are not supported in v0.3",
+                                    "multiple definitions per term are not supported in v0.4",
                                 ),
                             );
                             // Drop the duplicate definition: do not consume
@@ -1333,7 +1333,7 @@ fn parse_fence_info(
                 diags.push(
                     Diagnostic::new(Code::UnknownCodeAttribute, tok_span)
                         .label(format!("unknown code-fence attribute `{}`", tok))
-                        .help("v0.3 supports `@nominify`, `@minify`, `@minify-keep-comments`"),
+                        .help("v0.4 supports `@nominify`, `@minify`, `@minify-keep-comments`"),
                 );
             }
         }

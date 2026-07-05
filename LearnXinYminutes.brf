@@ -128,7 +128,7 @@ The `: ` marker is exact: colon followed by one space. Anything else
 is not recognized as a definition marker and is treated as a term line
 instead. Continuation lines align to the content column of `: ` (parent
 indent plus two spaces). Multiple definitions per term are not
-supported in v0.3 — two `: ` lines under one term is a B0505 error.
+supported in v0.4 — two `: ` lines under one term is a B0505 error.
 
 A live definition list:
 

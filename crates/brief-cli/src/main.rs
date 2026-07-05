@@ -507,7 +507,7 @@ fn run_explain(code: &str) -> ExitCode {
         ),
         (
             Code::UnknownCodeAttribute,
-            "Code-fence attributes are `@`-prefixed identifiers after the language tag (e.g. ```json @nominify). v0.3 recognizes `@nominify`, `@minify`, and `@minify-keep-comments`. Anything else is a compile error so typos are caught early.",
+            "Code-fence attributes are `@`-prefixed identifiers after the language tag (e.g. ```json @nominify). v0.4 recognizes `@nominify`, `@minify`, and `@minify-keep-comments`. Anything else is a compile error so typos are caught early.",
         ),
         (
             Code::ConflictingCodeAttributes,
