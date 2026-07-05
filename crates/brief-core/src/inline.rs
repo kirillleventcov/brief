@@ -22,6 +22,25 @@ struct Parser<'a> {
     diags: Vec<Diagnostic>,
 }
 
+/// Bytes the inline scanner must stop at: escape, code span, shortcode,
+/// the four emphasis markers, and `]` (the only terminator ever passed to
+/// `parse_until`). Everything else — including UTF-8 continuation bytes,
+/// which are all >= 0x80 and never collide with these ASCII values — is
+/// skipped one byte at a time without decoding. The scanner only ever
+/// *stops* on ASCII, so `pos` always lands on a char boundary.
+const SPECIAL: [bool; 256] = {
+    let mut t = [false; 256];
+    t[b'\\' as usize] = true;
+    t[b'`' as usize] = true;
+    t[b'@' as usize] = true;
+    t[b'*' as usize] = true;
+    t[b'_' as usize] = true;
+    t[b'+' as usize] = true;
+    t[b'~' as usize] = true;
+    t[b']' as usize] = true;
+    t
+};
+
 impl<'a> Parser<'a> {
     fn span(&self, start: usize, len: usize) -> Span {
         Span::new(self.base as usize + start, len)
@@ -34,8 +53,14 @@ impl<'a> Parser<'a> {
     fn parse_until(&mut self, terminator: Option<u8>) -> Vec<Inline> {
         let mut out: Vec<Inline> = Vec::new();
         let mut text_start = self.pos;
+        let bytes = self.src.as_bytes();
 
-        while let Some(c) = self.peek() {
+        while self.pos < bytes.len() {
+            let c = bytes[self.pos];
+            if !SPECIAL[c as usize] {
+                self.pos += 1;
+                continue;
+            }
             if Some(c) == terminator {
                 break;
             }
@@ -77,14 +102,11 @@ impl<'a> Parser<'a> {
                     text_start = self.pos;
                 }
                 _ => {
-                    // Advance by full UTF-8 char width so `pos` stays on
-                    // a char boundary; otherwise a later sigil would slice
-                    // through a multibyte sequence.
-                    let w = self.src[self.pos..]
-                        .chars()
-                        .next()
-                        .map_or(1, |c| c.len_utf8());
-                    self.pos += w;
+                    // A special byte that didn't start a construct (`]`
+                    // with no terminator armed, or a marker that isn't an
+                    // opener). All special bytes are ASCII, so +1 keeps
+                    // `pos` on a char boundary.
+                    self.pos += 1;
                 }
             }
         }
@@ -133,8 +155,14 @@ impl<'a> Parser<'a> {
         let mut content: Vec<Inline> = Vec::new();
         let mut text_start = inner_start;
         let mut closed = false;
+        let bytes = self.src.as_bytes();
 
-        while let Some(c) = self.peek() {
+        while self.pos < bytes.len() {
+            let c = bytes[self.pos];
+            if !SPECIAL[c as usize] {
+                self.pos += 1;
+                continue;
+            }
             if c == marker && self.is_close_marker(marker) {
                 if text_start < self.pos {
                     content.push(Inline::Text {
@@ -212,11 +240,9 @@ impl<'a> Parser<'a> {
                     text_start = self.pos;
                 }
                 _ => {
-                    let w = self.src[self.pos..]
-                        .chars()
-                        .next()
-                        .map_or(1, |c| c.len_utf8());
-                    self.pos += w;
+                    // Non-construct special byte (see `parse_until`); all
+                    // special bytes are ASCII so +1 stays on a boundary.
+                    self.pos += 1;
                 }
             }
         }

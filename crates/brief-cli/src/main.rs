@@ -1,3 +1,8 @@
+// mimalloc roughly doubles parse/emit throughput on allocation-heavy
+// documents (the AST is built from many small owned strings and vecs).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use brief::config;
 use brief::diag::{Severity, render_all};
 use brief::emit::{html, llm};

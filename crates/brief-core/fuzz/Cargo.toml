@@ -7,11 +7,17 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+# Keep the fuzz crate out of the parent workspace (cargo-fuzz standard).
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.brief]
+# The package was renamed to `brief-core` for crates.io; its lib target is
+# still named `brief`, which is the name the fuzz targets import.
+[dependencies.brief-core]
 path = ".."
+default-features = false
 
 [[bin]]
 name = "parse_full"

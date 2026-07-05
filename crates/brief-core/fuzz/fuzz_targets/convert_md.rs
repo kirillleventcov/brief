@@ -30,16 +30,11 @@ fuzz_target!(|data: &[u8]| {
     let (mut doc, _) = parser::parse(tokens, &src);
     let registry = Registry::with_builtins();
     let _ = resolve::resolve(&mut doc, &registry);
-    let _ = validate::validate(&doc, &ValidateOpts::default());
+    let _ = validate::validate(&doc, &ValidateOpts::default(), &src);
     let _ = html::render(&doc, &registry);
     let _ = llm::render(
         &doc,
         &registry,
-        &llm::Opts {
-            strip_emphasis: false,
-            keep_table_rule: false,
-            keep_asset_urls: false,
-            keep_metadata: false,
-        },
+        &llm::Opts::default(),
     );
 });

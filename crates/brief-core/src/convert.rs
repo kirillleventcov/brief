@@ -1021,7 +1021,14 @@ impl<'a> Walker<'a> {
                 });
             }
             Event::End(TagEnd::DefinitionList) => {
-                let state = self.dl.take().expect("DefinitionList without state");
+                // Malformed Markdown can nest definition lists; `self.dl` is
+                // a single slot, so the inner `End` already consumed the
+                // state and the outer `End` arrives with none. The converter
+                // is lossy by design — drop the unmatched terminator instead
+                // of panicking.
+                let Some(state) = self.dl.take() else {
+                    return;
+                };
                 if !state.items.is_empty() {
                     self.out.push_str("@dl\n");
                     for (term, def) in &state.items {

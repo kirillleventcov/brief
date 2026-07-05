@@ -100,19 +100,33 @@ pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> (String, Vec<Strin
         emit_footnotes_section(&footnotes, reg, opts, &doc.resolved_refs, &mut out);
     }
     let warnings = ctx.warnings;
-    let mut collapsed = String::with_capacity(out.len());
-    let mut nl_run = 0;
-    for c in out.chars() {
-        if c == '\n' {
+    // Collapse runs of 3+ newlines down to 2. Copy unaffected stretches in
+    // bulk; `\n` is ASCII so scanning bytes is UTF-8 safe. Documents with no
+    // over-long newline run (the common case) are returned as-is.
+    let bytes = out.as_bytes();
+    let mut collapsed = String::new();
+    let mut copy_from = 0;
+    let mut nl_run = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
             nl_run += 1;
-            if nl_run <= 2 {
-                collapsed.push(c);
+            if nl_run == 3 {
+                // First excess newline: copy everything before it once.
+                collapsed.reserve(out.len() - collapsed.len());
+                collapsed.push_str(&out[copy_from..i]);
+                copy_from = i + 1;
+            } else if nl_run > 3 {
+                collapsed.push_str(&out[copy_from..i]);
+                copy_from = i + 1;
             }
         } else {
             nl_run = 0;
-            collapsed.push(c);
         }
     }
+    if copy_from == 0 {
+        return (out, warnings);
+    }
+    collapsed.push_str(&out[copy_from..]);
     (collapsed, warnings)
 }
 
@@ -146,12 +160,11 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String, indent: usize) {
         Block::List { ordered, items, .. } => {
             use crate::ast::TaskState;
             for (i, it) in items.iter().enumerate() {
-                let marker = if *ordered {
-                    format!("{}.", i + 1)
+                if *ordered {
+                    let _ = write!(out, "{}{}. ", pad, i + 1);
                 } else {
-                    "-".to_string()
-                };
-                let _ = write!(out, "{}{} ", pad, marker);
+                    let _ = write!(out, "{}- ", pad);
+                }
                 if let Some(state) = it.task {
                     out.push_str(match state {
                         TaskState::Done => "[x] ",
@@ -706,10 +719,15 @@ fn emit_footnotes_section(
 fn expand_template_llm(tpl: &str, args: &ShortArgs, content: &str) -> String {
     let mut out = String::new();
     let bytes = tpl.as_bytes();
+    let mut start = 0;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{') {
             if let Some(rel) = tpl[i + 2..].find("}}") {
+                // Literal text since the last placeholder is copied as a
+                // slice, which keeps multibyte UTF-8 intact (a byte-at-a-
+                // time `push(b as char)` would mangle it).
+                out.push_str(&tpl[start..i]);
                 let key = tpl[i + 2..i + 2 + rel].trim();
                 if key == "content" {
                     out.push_str(content);
@@ -719,12 +737,13 @@ fn expand_template_llm(tpl: &str, args: &ShortArgs, content: &str) -> String {
                     }
                 }
                 i = i + 2 + rel + 2;
+                start = i;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
         i += 1;
     }
+    out.push_str(&tpl[start..]);
     out
 }
 

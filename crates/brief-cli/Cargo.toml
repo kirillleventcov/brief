@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 clap       = { version = "4", features = ["derive"] }
 brief-core = { path = "../brief-core" }
+mimalloc   = "0.1"
 similar    = "2"
 
 [[bin]]

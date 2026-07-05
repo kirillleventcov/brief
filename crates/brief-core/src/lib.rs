@@ -14,6 +14,7 @@ pub mod shortcode;
 pub mod span;
 pub mod token;
 pub mod validate;
+#[cfg(feature = "watch")]
 pub mod watch;
 
 pub use diag::{Code, Diagnostic};

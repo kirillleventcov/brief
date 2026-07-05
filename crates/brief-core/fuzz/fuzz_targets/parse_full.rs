@@ -27,7 +27,7 @@ fuzz_target!(|data: &[u8]| {
     let (mut doc, _diags) = parser::parse(tokens, &src);
     let registry = Registry::with_builtins();
     let _ = resolve::resolve(&mut doc, &registry);
-    let _ = validate::validate(&doc, &ValidateOpts::default());
+    let _ = validate::validate(&doc, &ValidateOpts::default(), &src);
 
     // Emitters must not panic on any well-typed AST the parser produces, even
     // for inputs that produced diagnostics — diagnostics are non-fatal.
@@ -35,11 +35,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = llm::render(
         &doc,
         &registry,
-        &llm::Opts {
-            strip_emphasis: false,
-            keep_table_rule: false,
-            keep_asset_urls: false,
-            keep_metadata: false,
-        },
+        &llm::Opts::default(),
     );
 });

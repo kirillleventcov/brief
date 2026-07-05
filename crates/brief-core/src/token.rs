@@ -1,13 +1,16 @@
 use crate::span::Span;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Tokens are zero-copy: a `Line` token carries no text of its own. Its
+/// `span` points at the trimmed line inside the `SourceMap` the lexer ran
+/// over, and consumers slice the text back out via `span.range()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenKind {
-    Line(String),
+    Line,
     Blank,
     Eof,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,

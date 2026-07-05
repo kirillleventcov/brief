@@ -7,7 +7,7 @@ use crate::token::{Token, TokenKind};
 pub fn parse(tokens: Vec<Token>, src: &SourceMap) -> (Document, Vec<Diagnostic>) {
     let (metadata, fm_consumed, fm_diags) = parse_frontmatter(&tokens, src);
     let mut p = Parser {
-        _src: src,
+        src,
         toks: tokens,
         pos: fm_consumed,
         diags: fm_diags,
@@ -16,14 +16,14 @@ pub fn parse(tokens: Vec<Token>, src: &SourceMap) -> (Document, Vec<Diagnostic>)
     let mut blocks = p.parse_blocks(0, None);
     // Anything left after a top-level parse must be a stray `@end`.
     while !p.at_eof() {
-        let span = p.peek().span;
-        match &p.peek().kind {
+        let tok = *p.peek();
+        match tok.kind {
             TokenKind::Eof => break,
             TokenKind::Blank => {
                 p.pos += 1;
             }
-            TokenKind::Line(s) if s.trim() == "@end" => {
-                p.diags.push(Diagnostic::new(Code::StrayEnd, span));
+            TokenKind::Line if p.line(&tok).trim() == "@end" => {
+                p.diags.push(Diagnostic::new(Code::StrayEnd, tok.span));
                 p.pos += 1;
             }
             _ => {
@@ -56,8 +56,10 @@ fn parse_frontmatter(
         return (None, 0, Vec::new());
     }
     let first = &toks[0];
-    let opens = match &first.kind {
-        TokenKind::Line(s) => s == "+++" && first.indent == 0 && first.span.start == 0,
+    let opens = match first.kind {
+        TokenKind::Line => {
+            first.indent == 0 && first.span.start == 0 && &src.source[first.span.range()] == "+++"
+        }
         _ => false,
     };
     if !opens {
@@ -74,7 +76,7 @@ fn parse_frontmatter(
 
     let mut diags = Vec::new();
     while idx < toks.len() {
-        match &toks[idx].kind {
+        match toks[idx].kind {
             TokenKind::Eof => {
                 diags.push(
                     Diagnostic::new(Code::UnterminatedFrontmatter, first.span)
@@ -82,7 +84,9 @@ fn parse_frontmatter(
                 );
                 return (None, idx, diags);
             }
-            TokenKind::Line(s) if s == "+++" && toks[idx].indent == 0 => {
+            TokenKind::Line
+                if toks[idx].indent == 0 && &src.source[toks[idx].span.range()] == "+++" =>
+            {
                 let close = &toks[idx];
                 let body_end = close.span.start as usize;
                 let body = &src.source[body_start..body_end];
@@ -123,7 +127,7 @@ fn parse_frontmatter(
 const MAX_NESTING_DEPTH: usize = 64;
 
 struct Parser<'a> {
-    _src: &'a SourceMap,
+    src: &'a SourceMap,
     toks: Vec<Token>,
     pos: usize,
     diags: Vec<Diagnostic>,
@@ -133,6 +137,12 @@ struct Parser<'a> {
 impl<'a> Parser<'a> {
     fn peek(&self) -> &Token {
         &self.toks[self.pos]
+    }
+    /// Text of a `Line` token, sliced from the source. The returned slice
+    /// borrows from the `SourceMap` (lifetime `'a`), not from `self`, so it
+    /// stays valid across `&mut self` calls.
+    fn line(&self, tok: &Token) -> &'a str {
+        &self.src.source[tok.span.range()]
     }
     fn at_eof(&self) -> bool {
         matches!(self.peek().kind, TokenKind::Eof)
@@ -159,13 +169,14 @@ impl<'a> Parser<'a> {
     /// recursing, so callers past the depth ceiling still make progress.
     fn skip_overdeep_region(&mut self, base_indent: u16, end_at_indent_below: Option<u16>) {
         while !self.at_eof() {
-            match &self.peek().kind {
+            let tok = *self.peek();
+            match tok.kind {
                 TokenKind::Eof => break,
                 TokenKind::Blank => {
                     self.pos += 1;
                 }
-                TokenKind::Line(s) => {
-                    let indent = self.peek().indent;
+                TokenKind::Line => {
+                    let indent = tok.indent;
                     if indent < base_indent {
                         break;
                     }
@@ -174,7 +185,7 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    if s[indent as usize..].trim() == "@end" {
+                    if self.line(&tok)[indent as usize..].trim() == "@end" {
                         break;
                     }
                     self.pos += 1;
@@ -199,8 +210,9 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     continue;
                 }
-                TokenKind::Line(_) => {
-                    let indent = self.peek().indent;
+                TokenKind::Line => {
+                    let tok = *self.peek();
+                    let indent = tok.indent;
                     if indent < base_indent {
                         break;
                     }
@@ -209,12 +221,7 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    let line = if let TokenKind::Line(s) = &self.peek().kind {
-                        s.clone()
-                    } else {
-                        unreachable!()
-                    };
-                    let trimmed = line[indent as usize..].to_string();
+                    let trimmed = &self.line(&tok)[indent as usize..];
 
                     // `@end` is always a terminator for the parent block-shortcode;
                     // stop here so the caller can consume it. Stray @ends are
@@ -227,10 +234,10 @@ impl<'a> Parser<'a> {
                         continue;
                     }
                     if trimmed.starts_with("/*") {
-                        self.consume_block_comment(&trimmed);
+                        self.consume_block_comment(trimmed);
                         continue;
                     }
-                    if let Some(b) = self.try_block_at(&trimmed, indent) {
+                    if let Some(b) = self.try_block_at(trimmed, indent) {
                         out.push(b);
                     } else {
                         out.push(self.parse_paragraph(indent));
@@ -308,10 +315,11 @@ impl<'a> Parser<'a> {
         }
         self.pos += 1;
         loop {
-            match &self.peek().kind {
+            let tok = *self.peek();
+            match tok.kind {
                 TokenKind::Eof => {
                     self.diags.push(
-                        Diagnostic::new(Code::UnterminatedBlock, self.peek().span)
+                        Diagnostic::new(Code::UnterminatedBlock, tok.span)
                             .label("unterminated /* */ comment"),
                     );
                     return;
@@ -319,8 +327,8 @@ impl<'a> Parser<'a> {
                 TokenKind::Blank => {
                     self.pos += 1;
                 }
-                TokenKind::Line(s) => {
-                    let s = s.clone();
+                TokenKind::Line => {
+                    let s = self.line(&tok);
                     self.pos += 1;
                     if s.trim_end().ends_with("*/") {
                         return;
@@ -331,12 +339,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_heading(&mut self) -> Block {
-        let tok = self.peek().clone();
-        let line = if let TokenKind::Line(ref s) = tok.kind {
-            s.clone()
-        } else {
-            unreachable!()
-        };
+        let tok = *self.peek();
+        let line = self.line(&tok);
         self.pos += 1;
         let indent = tok.indent as usize;
         let s = &line[indent..];
@@ -401,41 +405,60 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_paragraph(&mut self, indent: u16) -> Block {
-        let first = self.peek().clone();
+        let first = *self.peek();
         let mut span = first.span;
         let mut text = String::new();
+        // Fast path: most paragraphs are a single line with no hard break.
+        // Hold the first line as a source slice and only spill into the
+        // owned `text` accumulator when a second line (or a hard break)
+        // makes joining unavoidable.
+        let mut single: Option<&'a str> = None;
         let mut hard_break_indices: Vec<usize> = Vec::new();
         let mut first_line = true;
         loop {
-            match &self.peek().kind {
-                TokenKind::Line(s) => {
-                    let tok_indent = self.peek().indent;
-                    if tok_indent != indent {
+            let tok = *self.peek();
+            match tok.kind {
+                TokenKind::Line => {
+                    if tok.indent != indent {
                         break;
                     }
-                    let trimmed = &s[indent as usize..];
+                    let trimmed = &self.line(&tok)[indent as usize..];
                     // The first paragraph line is always consumed: the dispatcher
                     // already decided this isn't a block. Subsequent continuation
                     // lines stop at any block-starting sigil.
                     if !first_line && leading_block_sigil(trimmed) {
                         break;
                     }
+                    let (line_text, hard) = match trimmed.strip_suffix('\\') {
+                        Some(rest) => (rest, true),
+                        None => (trimmed, false),
+                    };
+                    if first_line && !hard {
+                        single = Some(line_text);
+                    } else {
+                        if let Some(prev) = single.take() {
+                            text.push_str(prev);
+                        }
+                        if !text.is_empty() {
+                            text.push(' ');
+                        }
+                        if hard {
+                            hard_break_indices.push(text.len() + line_text.len());
+                        }
+                        text.push_str(line_text);
+                    }
                     first_line = false;
-                    if !text.is_empty() {
-                        text.push(' ');
-                    }
-                    let mut line_text = trimmed.to_string();
-                    let hard = line_text.ends_with('\\');
-                    if hard {
-                        line_text.pop();
-                        hard_break_indices.push(text.len() + line_text.len());
-                    }
-                    text.push_str(&line_text);
-                    span = span.join(self.peek().span);
+                    span = span.join(tok.span);
                     self.pos += 1;
                 }
                 _ => break,
             }
+        }
+        if let Some(s) = single {
+            let base = first.span.start + first.indent as u32;
+            let (content, d) = parse_inline(s, base);
+            self.diags.extend(d);
+            return Block::Paragraph { content, span };
         }
         let mut content: Vec<Inline> = Vec::new();
         let mut cursor = 0usize;
@@ -458,18 +481,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_hr(&mut self) -> Block {
-        let tok = self.peek().clone();
+        let tok = *self.peek();
         self.pos += 1;
         Block::HorizontalRule { span: tok.span }
     }
 
     fn parse_code_fence(&mut self) -> Block {
-        let open = self.peek().clone();
-        let line = if let TokenKind::Line(ref s) = open.kind {
-            s.clone()
-        } else {
-            unreachable!()
-        };
+        let open = *self.peek();
+        let line = self.line(&open);
         self.pos += 1;
         let indent = open.indent as usize;
         let after = &line[indent + 3..];
@@ -484,7 +503,8 @@ impl<'a> Parser<'a> {
         let mut body = String::new();
         let mut span = open.span;
         loop {
-            match &self.peek().kind {
+            let tok = *self.peek();
+            match tok.kind {
                 TokenKind::Eof => {
                     self.diags.push(
                         Diagnostic::new(Code::UnterminatedFence, open.span)
@@ -494,18 +514,19 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Blank => {
                     body.push('\n');
-                    span = span.join(self.peek().span);
+                    span = span.join(tok.span);
                     self.pos += 1;
                 }
-                TokenKind::Line(s) => {
+                TokenKind::Line => {
+                    let s = self.line(&tok);
                     if s.trim() == "```" {
-                        span = span.join(self.peek().span);
+                        span = span.join(tok.span);
                         self.pos += 1;
                         break;
                     }
                     body.push_str(s);
                     body.push('\n');
-                    span = span.join(self.peek().span);
+                    span = span.join(tok.span);
                     self.pos += 1;
                 }
             }
@@ -528,16 +549,14 @@ impl<'a> Parser<'a> {
             if self.at_eof() {
                 break;
             }
-            let tok = self.peek().clone();
-            let line = if let TokenKind::Line(ref s) = tok.kind {
-                s.clone()
-            } else {
+            let tok = *self.peek();
+            if !matches!(tok.kind, TokenKind::Line) {
                 break;
-            };
+            }
             if tok.indent != indent {
                 break;
             }
-            let trimmed = &line[indent as usize..];
+            let trimmed = &self.line(&tok)[indent as usize..];
             if !trimmed.starts_with("- ") {
                 break;
             }
@@ -561,10 +580,8 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let mut children: Vec<Block> = Vec::new();
             self.skip_blanks();
-            if let TokenKind::Line(_) = &self.peek().kind {
-                if self.peek().indent >= indent + 2 {
-                    children = self.parse_blocks(indent + 2, Some(indent + 2));
-                }
+            if matches!(self.peek().kind, TokenKind::Line) && self.peek().indent >= indent + 2 {
+                children = self.parse_blocks(indent + 2, Some(indent + 2));
             }
             items.push(ListItem {
                 content,
@@ -589,16 +606,14 @@ impl<'a> Parser<'a> {
             if self.at_eof() {
                 break;
             }
-            let tok = self.peek().clone();
-            let line = if let TokenKind::Line(ref s) = tok.kind {
-                s.clone()
-            } else {
+            let tok = *self.peek();
+            if !matches!(tok.kind, TokenKind::Line) {
                 break;
-            };
+            }
             if tok.indent != indent {
                 break;
             }
-            let trimmed = &line[indent as usize..];
+            let trimmed = &self.line(&tok)[indent as usize..];
             let Some((num, marker_len)) = leading_ordered_marker(trimmed) else {
                 break;
             };
@@ -631,10 +646,8 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let mut children: Vec<Block> = Vec::new();
             self.skip_blanks();
-            if let TokenKind::Line(_) = &self.peek().kind {
-                if self.peek().indent >= indent + 2 {
-                    children = self.parse_blocks(indent + 2, Some(indent + 2));
-                }
+            if matches!(self.peek().kind, TokenKind::Line) && self.peek().indent >= indent + 2 {
+                children = self.parse_blocks(indent + 2, Some(indent + 2));
             }
             items.push(ListItem {
                 content,
@@ -652,22 +665,20 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_blockquote(&mut self, indent: u16) -> Block {
-        let mut lines: Vec<(usize, String, Span)> = Vec::new();
+        let mut lines: Vec<(usize, &'a str, Span)> = Vec::new();
         let start = self.peek().span;
         loop {
             if self.at_eof() {
                 break;
             }
-            let tok = self.peek().clone();
-            let line = if let TokenKind::Line(ref s) = tok.kind {
-                s.clone()
-            } else {
+            let tok = *self.peek();
+            if !matches!(tok.kind, TokenKind::Line) {
                 break;
-            };
+            }
             if tok.indent != indent {
                 break;
             }
-            let trimmed = &line[indent as usize..];
+            let trimmed = &self.line(&tok)[indent as usize..];
             let mut depth: usize = 0;
             let mut idx = 0usize;
             let bytes = trimmed.as_bytes();
@@ -696,7 +707,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 break;
             }
-            let body = trimmed[idx + 1..].to_string();
+            let body = &trimmed[idx + 1..];
             lines.push((depth, body, tok.span));
             self.pos += 1;
         }
@@ -708,12 +719,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_table(&mut self, indent: u16) -> Block {
-        let directive = self.peek().clone();
-        let line = if let TokenKind::Line(ref s) = directive.kind {
-            s.clone()
-        } else {
-            unreachable!()
-        };
+        let directive = *self.peek();
+        let line = self.line(&directive);
         self.pos += 1;
         let trimmed = &line[indent as usize..];
         let mut cursor = 2usize;
@@ -733,12 +740,11 @@ impl<'a> Parser<'a> {
             if self.at_eof() {
                 break;
             }
-            let tok = self.peek().clone();
-            let row_line = if let TokenKind::Line(ref s) = tok.kind {
-                s.clone()
-            } else {
+            let tok = *self.peek();
+            if !matches!(tok.kind, TokenKind::Line) {
                 break;
-            };
+            }
+            let row_line = self.line(&tok);
             let trimmed = row_line.trim_start();
             if !trimmed.starts_with('|') {
                 break;
@@ -839,12 +845,8 @@ impl<'a> Parser<'a> {
 
     fn parse_definition_list(&mut self, indent: u16) -> Block {
         use crate::ast::DefinitionItem;
-        let directive = self.peek().clone();
-        let line = if let TokenKind::Line(ref s) = directive.kind {
-            s.clone()
-        } else {
-            unreachable!()
-        };
+        let directive = *self.peek();
+        let line = self.line(&directive);
         self.pos += 1;
         let trimmed = &line[indent as usize..];
         let mut cursor = 3usize;
@@ -899,7 +901,7 @@ impl<'a> Parser<'a> {
                 );
                 break;
             }
-            let tok = self.peek().clone();
+            let tok = *self.peek();
             match tok.kind {
                 TokenKind::Eof => {
                     self.diags.push(
@@ -918,7 +920,8 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     continue;
                 }
-                TokenKind::Line(ref s) => {
+                TokenKind::Line => {
+                    let s = self.line(&tok);
                     if let Some(pd) = pending_def.as_mut()
                         && tok.indent == cont_indent
                     {
@@ -1040,13 +1043,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_block_shortcode_or_inline(&mut self, indent: u16) -> Option<Block> {
-        let tok = self.peek().clone();
-        let line = if let TokenKind::Line(ref s) = tok.kind {
-            s.clone()
-        } else {
+        let tok = *self.peek();
+        if !matches!(tok.kind, TokenKind::Line) {
             return None;
-        };
-        let trimmed = &line[indent as usize..];
+        }
+        let trimmed = &self.line(&tok)[indent as usize..];
         let mut cursor = 1usize;
         let bytes = trimmed.as_bytes();
         if cursor >= bytes.len() || !bytes[cursor].is_ascii_alphabetic() {
@@ -1075,9 +1076,10 @@ impl<'a> Parser<'a> {
         }
         let children = self.parse_blocks(indent, Some(indent));
         let mut end_span = tok.span;
-        match &self.peek().kind {
-            TokenKind::Line(s) if s.trim() == "@end" && self.peek().indent == indent => {
-                end_span = self.peek().span;
+        let end_tok = *self.peek();
+        match end_tok.kind {
+            TokenKind::Line if end_tok.indent == indent && self.line(&end_tok).trim() == "@end" => {
+                end_span = end_tok.span;
                 self.pos += 1;
             }
             _ => {
@@ -1105,7 +1107,8 @@ impl<'a> Parser<'a> {
         let mut body = String::new();
         let mut span = open.span;
         loop {
-            match &self.peek().kind {
+            let tok = *self.peek();
+            match tok.kind {
                 TokenKind::Eof => {
                     self.diags.push(
                         Diagnostic::new(Code::UnterminatedBlock, open.span)
@@ -1115,18 +1118,19 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Blank => {
                     body.push('\n');
-                    span = span.join(self.peek().span);
+                    span = span.join(tok.span);
                     self.pos += 1;
                 }
-                TokenKind::Line(s) => {
-                    if s.trim() == "@end" && self.peek().indent == indent {
-                        span = span.join(self.peek().span);
+                TokenKind::Line => {
+                    let s = self.line(&tok);
+                    if s.trim() == "@end" && tok.indent == indent {
+                        span = span.join(tok.span);
                         self.pos += 1;
                         break;
                     }
                     body.push_str(s);
                     body.push('\n');
-                    span = span.join(self.peek().span);
+                    span = span.join(tok.span);
                     self.pos += 1;
                 }
             }
@@ -1202,7 +1206,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn build_blockquote(items: &[(usize, String, Span)], depth: usize) -> (Vec<Block>, Span) {
+fn build_blockquote(items: &[(usize, &str, Span)], depth: usize) -> (Vec<Block>, Span) {
     let mut paras: Vec<Block> = Vec::new();
     let mut full_span = Span::DUMMY;
     let mut i = 0;

@@ -13,4 +13,5 @@ tokio               = { version = "1", features = ["full"] }
 dashmap             = "6"
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
-brief-core          = { path = "../brief-core" }
+brief-core          = { path = "../brief-core", default-features = false }
+mimalloc            = "0.1"

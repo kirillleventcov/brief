@@ -6,18 +6,25 @@ pub fn lex(src: &SourceMap) -> Result<Vec<Token>, Vec<Diagnostic>> {
     let mut diags = Vec::new();
     let bytes = src.source.as_bytes();
 
-    for (i, w) in bytes.windows(3).enumerate() {
-        if i > 0 && w == [0xEF, 0xBB, 0xBF] {
-            diags.push(Diagnostic::new(Code::BomNotAtStart, Span::new(i, 3)));
+    // Both scans are gated behind `str::contains`, which uses the
+    // SIMD-accelerated substring search in std — clean documents (no BOM,
+    // no tabs, the overwhelmingly common case) skip the per-byte loops.
+    if src.source.contains('\u{FEFF}') {
+        for (i, w) in bytes.windows(3).enumerate() {
+            if i > 0 && w == [0xEF, 0xBB, 0xBF] {
+                diags.push(Diagnostic::new(Code::BomNotAtStart, Span::new(i, 3)));
+            }
         }
     }
 
-    for (i, b) in bytes.iter().enumerate() {
-        if *b == b'\t' {
-            diags.push(
-                Diagnostic::new(Code::TabCharacter, Span::new(i, 1))
-                    .help("tabs are forbidden; use two spaces per indent level"),
-            );
+    if src.source.contains('\t') {
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b'\t' {
+                diags.push(
+                    Diagnostic::new(Code::TabCharacter, Span::new(i, 1))
+                        .help("tabs are forbidden; use two spaces per indent level"),
+                );
+            }
         }
     }
 
@@ -43,7 +50,7 @@ pub fn lex(src: &SourceMap) -> Result<Vec<Token>, Vec<Diagnostic>> {
                 });
             } else {
                 tokens.push(Token {
-                    kind: TokenKind::Line(trimmed.to_string()),
+                    kind: TokenKind::Line,
                     span,
                     indent: indent as u16,
                 });
@@ -76,13 +83,19 @@ fn leading_spaces(s: &str) -> usize {
 mod tests {
     use super::*;
 
+    fn text<'a>(src: &'a SourceMap, t: &Token) -> &'a str {
+        &src.source[t.span.range()]
+    }
+
     #[test]
     fn lexes_simple_lines() {
         let src = SourceMap::new("doc.brf", "# Hello\n\nWorld\n");
         let toks = lex(&src).unwrap();
-        assert!(matches!(toks[0].kind, TokenKind::Line(ref s) if s == "# Hello"));
+        assert!(matches!(toks[0].kind, TokenKind::Line));
+        assert_eq!(text(&src, &toks[0]), "# Hello");
         assert!(matches!(toks[1].kind, TokenKind::Blank));
-        assert!(matches!(toks[2].kind, TokenKind::Line(ref s) if s == "World"));
+        assert!(matches!(toks[2].kind, TokenKind::Line));
+        assert_eq!(text(&src, &toks[2]), "World");
         assert!(matches!(toks[3].kind, TokenKind::Eof));
     }
 
@@ -97,23 +110,16 @@ mod tests {
     fn strips_trailing_whitespace() {
         let src = SourceMap::new("doc.brf", "hi   \n");
         let toks = lex(&src).unwrap();
-        assert!(matches!(toks[0].kind, TokenKind::Line(ref s) if s == "hi"));
+        assert!(matches!(toks[0].kind, TokenKind::Line));
+        assert_eq!(text(&src, &toks[0]), "hi");
     }
 
     #[test]
     fn normalizes_crlf() {
         let src = SourceMap::new("doc.brf", "a\r\nb\r\n");
         let toks = lex(&src).unwrap();
-        if let TokenKind::Line(s) = &toks[0].kind {
-            assert_eq!(s, "a");
-        } else {
-            panic!();
-        }
-        if let TokenKind::Line(s) = &toks[1].kind {
-            assert_eq!(s, "b");
-        } else {
-            panic!();
-        }
+        assert_eq!(text(&src, &toks[0]), "a");
+        assert_eq!(text(&src, &toks[1]), "b");
     }
 
     #[test]

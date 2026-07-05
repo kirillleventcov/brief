@@ -5,7 +5,8 @@ edition.workspace = true
 description = "Static-site generator for Brief documents (analogous to mdBook)."
 
 [dependencies]
-brief-core            = { path = "../brief-core" }
+brief-core            = { path = "../brief-core", default-features = false }
+mimalloc              = "0.1"
 clap                  = { version = "4", features = ["derive"] }
 serde                 = { version = "1", features = ["derive"] }
 toml                  = "0.8"

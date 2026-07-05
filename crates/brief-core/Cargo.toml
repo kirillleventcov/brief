@@ -17,10 +17,17 @@ serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml       = "0.8.23"
 pulldown-cmark = { version = "0.13", default-features = false }
-notify = "8"
-notify-debouncer-mini = { version = "0.7", default-features = false }
+notify = { version = "8", optional = true }
+notify-debouncer-mini = { version = "0.7", default-features = false, optional = true }
+
+[features]
+default = ["watch"]
+# File-watching (`brief watch`) support. Off saves the notify dependency
+# tree for consumers that never watch (e.g. the LSP server).
+watch = ["dep:notify", "dep:notify-debouncer-mini"]
 
 [dev-dependencies]
+mimalloc = "0.1.52"
 tempfile = "3"
 
 [lib]

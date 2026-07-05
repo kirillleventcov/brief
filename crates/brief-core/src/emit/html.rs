@@ -80,7 +80,7 @@ fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
                 }
                 None => out.push_str("<pre><code>"),
             }
-            out.push_str(&escape_html(body));
+            escape_html_into(out, body);
             out.push_str("</code></pre>\n");
         }
         Block::Table {
@@ -184,7 +184,7 @@ fn render_inline_seq(seq: &[Inline], ctx: &mut Ctx, out: &mut String) {
 
 fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
     match node {
-        Inline::Text { value, .. } => out.push_str(&escape_html(value)),
+        Inline::Text { value, .. } => escape_html_into(out, value),
         Inline::HardBreak { .. } => out.push_str("<br>"),
         Inline::Bold { content, .. } => {
             out.push_str("<strong>");
@@ -208,7 +208,7 @@ fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
         }
         Inline::InlineCode { value, .. } => {
             out.push_str("<code>");
-            out.push_str(&escape_html(value));
+            escape_html_into(out, value);
             out.push_str("</code>");
         }
         Inline::Shortcode {
@@ -517,39 +517,58 @@ fn emit_footnotes_section(
 fn expand_template(tpl: &str, args: &ShortArgs, content: &str) -> String {
     let mut out = String::new();
     let bytes = tpl.as_bytes();
+    let mut start = 0;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{') {
             if let Some(rel) = tpl[i + 2..].find("}}") {
+                // Literal text since the last placeholder is copied as a
+                // slice, which keeps multibyte UTF-8 intact (a byte-at-a-
+                // time `push(b as char)` would mangle it).
+                out.push_str(&tpl[start..i]);
                 let key = tpl[i + 2..i + 2 + rel].trim();
                 if key == "content" {
                     out.push_str(content);
                 } else if let Some(rest) = key.strip_prefix("args.") {
                     if let Some(v) = args.keyword.get(rest).and_then(|v| v.as_str()) {
-                        out.push_str(&escape_html(v));
+                        escape_html_into(&mut out, v);
                     }
                 }
                 i = i + 2 + rel + 2;
+                start = i;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
         i += 1;
     }
+    out.push_str(&tpl[start..]);
     out
+}
+
+/// Escape `s` directly into `out`: unescaped stretches are copied in bulk
+/// instead of char-by-char, and no intermediate String is allocated. The
+/// escaped bytes are all ASCII, so scanning bytes is UTF-8 safe.
+fn escape_html_into(out: &mut String, s: &str) {
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let rep = match b {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            b'"' => "&quot;",
+            _ => continue,
+        };
+        out.push_str(&s[start..i]);
+        out.push_str(rep);
+        start = i + 1;
+    }
+    out.push_str(&s[start..]);
 }
 
 fn escape_html(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => o.push_str("&amp;"),
-            '<' => o.push_str("&lt;"),
-            '>' => o.push_str("&gt;"),
-            '"' => o.push_str("&quot;"),
-            _ => o.push(c),
-        }
-    }
+    escape_html_into(&mut o, s);
     o
 }
 
