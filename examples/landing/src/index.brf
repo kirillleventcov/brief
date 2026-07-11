@@ -2,7 +2,7 @@
 A strict markup language for documents
 written by humans and consumed by humans _and_ LLMs.
 
-@cta(href: "https://github.com/kirillleventcov/brief", kind: primary)[View on GitHub] @cta(href: "https://github.com/kirillleventcov/brief/blob/main/LearnXinYminutes.brf", kind: secondary)[Read the spec]
+@cta(href: "https://docs.brief.kirillleventcov.com/", kind: primary)[Read the docs] @cta(href: "https://github.com/kirillleventcov/brief", kind: secondary)[View on GitHub] @cta(href: "https://github.com/kirillleventcov/brief/blob/main/LearnXinYminutes.brf", kind: secondary)[Read the spec]
 @end
 
 ## Why it exists

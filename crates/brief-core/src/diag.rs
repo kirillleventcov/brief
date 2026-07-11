@@ -186,6 +186,64 @@ impl Code {
             RefNoProject => "`@ref` requires a `brief.toml`-rooted project; none found",
         }
     }
+
+    /// Long-form explanation shown by `brief explain <CODE>` and in-editor
+    /// hovers. Exhaustive: a new variant will not compile until it has one.
+    pub fn explain(self) -> &'static str {
+        use Code::*;
+        match self {
+            InvalidUtf8 => "Brief sources must be valid UTF-8. Re-encode the file (e.g. `iconv -t UTF-8`) or find and fix the corrupt bytes at the reported offset.",
+            TabCharacter => "Tabs are forbidden in Brief sources. Configure your editor to insert two spaces.",
+            BomNotAtStart => "A UTF-8 byte-order mark is tolerated only as the very first bytes of the file. A BOM anywhere else is usually the result of concatenating files; delete it.",
+            UnexpectedChar => "The lexer found a character that cannot begin or continue any Brief construct at this position. Usually a control character or stray escape; delete or replace it.",
+            EmphasisSameMarker => "`*outer *inner* outer*` is ambiguous. Use a different marker for the inner span: `*outer _inner_ outer*`.",
+            EmphasisCrossLine => "Emphasis spans must open and close on the same source line. Close the span before the line break, or join the lines into one.",
+            DoubledEmphasis => "`**bold**`-style doubled markers are Markdown, not Brief. Brief uses single markers: `*bold*`, `_italic_`, `+underline+`, `~strike~`.",
+            UnterminatedEmph => "An emphasis marker opened a span that never closes on the same line. Close it, or escape the marker (`\\*`) if it's literal text.",
+            UnterminatedCode => "A backtick opened an inline code span that never closes on the same line. Close it, or use a double-backtick span (``` ``code with ` inside`` ```) when the code contains a backtick.",
+            HeadingTooDeep => "Brief supports six heading levels. `#######` and deeper are errors. Restructure the document or split it.",
+            HeadingNoSpace => "A heading marker is the `#`s followed by exactly one space: `# Title`. No space (or several) is an error so `#hashtag`-style text is never silently promoted to a heading.",
+            BadIndent => "Brief indentation is strict: two spaces per nesting level. An odd number of leading spaces (or a level skipped) cannot be interpreted unambiguously; re-indent to multiples of two.",
+            BadHorizontalRule => "A horizontal rule is exactly three dashes on their own line: `---`. Two dashes is too few; four or more is too many. This is strict so a typoed rule never silently becomes paragraph text.",
+            UnterminatedFence => "A ``` code fence was opened but never closed before end of file. Add the closing ``` line. To show fence syntax inside a code block, use the `@code ... @end` shortcode instead of nesting fences.",
+            UnterminatedBlock => "A block shortcode (`@details`, `@dl`, `@code`, a custom block) was never closed. Add `@end` at the same indentation as the opening line.",
+            InlineBlockComment => "`/* ... */` comments are block-level in Brief: they must start at the beginning of a line. For a comment after content on the same line there is no inline form — move it to its own line.",
+            BadListMarker => "Unordered list items are `- ` (dash, one space); ordered items are `1. ` (number, dot, one space). Markdown's `*` and `+` markers are not list markers in Brief.",
+            EmptyDocument => "The source contains no blocks — only whitespace or comments. Brief treats a document with nothing to render as an error rather than emitting an empty output file.",
+            BadBlockquote => "Blockquote markers are `>` (or `>>`, `>>>` for nesting) followed by exactly one space. `>text` without the space is rejected so accidental `>` characters are caught.",
+            StrayEnd => "`@end` closes a block shortcode, but no block shortcode is open here. Remove it, or check the indentation of the opening line — `@end` must sit at the same indent.",
+            StrayContent => "Content appears where the current construct does not allow it — most commonly a `|` row outside a `@t` table. Wrap table rows in `@t ... `(rows end at the first non-`|` line).",
+            UnterminatedFrontmatter => "A frontmatter block opened with `+++` was never closed. Add a closing `+++` line, or remove the opening if the document has no metadata.",
+            FrontmatterToml => "Frontmatter content must be valid TOML. Brief deliberately uses TOML (not YAML) to match `brief.toml`. Fix the TOML syntax in the `+++ ... +++` block.",
+            UnknownCodeAttribute => "Code-fence attributes are `@`-prefixed identifiers after the language tag (e.g. ```json @nominify). v0.4 recognizes `@nominify`, `@minify`, and `@minify-keep-comments`. Anything else is a compile error so typos are caught early.",
+            ConflictingCodeAttributes => "`@nominify` and `@minify` (or `@minify-keep-comments`) are mutually exclusive: one says \"never minify this block\" and the other says \"always minify this block.\" Drop one.",
+            BadHeadingAnchor => "A heading anchor is a trailing `{#name}` where name matches `[a-z0-9-]+`: `## Title {#title}`. Fix the anchor syntax or remove the braces.",
+            NestingTooDeep => "Blocks (lists, blockquotes, block shortcodes) nest at most 64 levels deep. Deeper nesting is almost always generated or accidental input; restructure the document.",
+            UnknownShortcode => "Shortcodes must be registered in `brief.toml` under `[shortcodes.<name>]` (or be a built-in: link, image, kbd, sub, sup, details, t, code, callout, math, footnote, ref). Note: `@br` is intentionally not a shortcode — use `\\` at end of line for a hard break.",
+            ArgTypeMismatch => "A shortcode argument has the wrong type — e.g. a bare identifier where a quoted string is declared, or an int where an array is expected. The declared type is in `brief.toml` under `[shortcodes.<name>.arguments]` (built-ins are documented in the reference).",
+            MissingArg => "A required shortcode argument was not supplied. Add it as `@name(arg: value)` or positionally if the argument declares a `position`.",
+            BadEnumValue => "The argument only accepts a fixed set of values (its `oneof` list). For example `@t(align: [...])` entries must be `left`, `right`, or `center`. Use one of the allowed values.",
+            FormMismatch => "The shortcode was used in the wrong form: a block shortcode invoked inline, or an inline shortcode used as a block with `@end`. Check the shortcode's declared `kind`.",
+            BadArgSyntax => "The argument list does not parse: unbalanced parentheses or brackets, a missing `:` after a keyword, an unterminated string, or an unclosed `(url)` in link sugar (percent-encode unmatched parens as %28/%29).",
+            DuplicateKwarg => "The same keyword argument is given more than once (possibly once positionally and once by name). Remove the duplicate.",
+            DeprecatedCalloutKind => "This callout kind is a deprecated alias. Use the GFM set: note, tip, important, warning, caution. This is the compiler's only deprecation warning; it compiles with exit 0.",
+            UnknownArg => "The shortcode does not declare an argument with this name. Check the spelling against the declared arguments (listed in the diagnostic's help text), or declare it in `brief.toml`.",
+            OrderedListSequence => "Ordered lists must number 1, 2, 3, ... renumbering by the renderer is forbidden. Either fix the source or convert to an unordered list.",
+            TableColumnMismatch => "Every row in a `@t` table must have the same number of cells as the header row. Add or remove cells until they match.",
+            HeadingMonotonic => "With `compile.strict_heading_levels = true`, heading levels may increase by at most one per step (`#` to `##`, never `#` to `###`). Restructure the outline or disable the option.",
+            AlignArrayLength => "`@t(align: [...])` must list exactly one alignment per table column. Add or remove entries until the array length matches the header's cell count.",
+            BadDefinitionList => "A `@dl` body alternates term lines and `: definition` lines — colon, exactly one space, definition. Terms without definitions, definitions without terms, multiple definitions per term, and extra or missing spaces after `:` are all rejected.",
+            DuplicateHeadingAnchor => "Two headings in this document declare the same `{#anchor}`. Anchors are `@ref` targets and must be unique within a file; rename one.",
+            RefMissingFile => "Brief verifies cross-document references at compile time. The file referenced by `@ref[path.brf]` was not found anywhere under the project root (the directory containing `brief.toml`). Either fix the path, create the missing file, or move the file into the project tree.",
+            RefMissingAnchor => "Brief verifies that the `#anchor` portion of `@ref[file.brf#anchor]` matches a heading anchor declared in the target file (e.g. `## Title {#anchor}`). The anchor was not found. The diagnostic's help text lists the anchors that *do* exist in the target file.",
+            RefBadTarget => "`@ref` targets are project-relative `.brf` paths, optionally suffixed with `#anchor`. Leading `/`, `..` segments, backslashes, missing `.brf` extension, and anchors not matching `[a-z0-9-]+` are rejected. Restate the target in canonical form.",
+            RefNoProject => "`@ref` only works inside a project rooted by a `brief.toml` file. The compiler walks up from the source file looking for one. Create a `brief.toml` (an empty file is fine) at the desired root, or remove the `@ref` invocation.",
+            MinifyFailed => "A code block is tagged with a minifiable language but does not lex in that language (e.g. an unterminated string, or pseudo-code tagged `json`). The block is emitted verbatim and compilation continues; fix the code or the language tag. Compiles with exit 0.",
+            CodeBlockLineCount => "A code block is being minified to a single (or near-single) line, but the original spanned more than 50 lines. After minification the LLM consumer cannot reference the original line numbers. Either accept this (silence with `@nominify`) or split the block into smaller pieces.",
+            LineCommentConverted => "`@minify-keep-comments` converts `//` line comments into `/* */` block form so they can survive on a single minified line. Any `*/` inside the comment text is rewritten to `* /` so the block cannot close early. Use `@nominify` to keep the source verbatim instead.",
+            RefusedLanguage => "Python, YAML, and Makefile use significant whitespace; minification cannot be performed safely without parsing the language. Such blocks are emitted verbatim and the LLM consumer pays full cost. Drop the `@minify` attribute or remove the language from `compile.llm.minify_languages`.",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

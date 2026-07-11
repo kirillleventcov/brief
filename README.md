@@ -41,6 +41,7 @@ The repo is a Cargo workspace. The crates are:
 
 - [`crates/brief-core`](./crates/brief-core) — the parser, AST, validators, HTML / LLM emitters, formatter, and Markdown→Brief converter, exposed as a library.
 - [`crates/brief-cli`](./crates/brief-cli) — the `brief` command-line binary used in the examples above.
+- [`crates/brief-lsp`](./crates/brief-lsp) — `brief-lsp`, a language server speaking LSP over stdio: project-aware diagnostics (same pipeline as `brief compile`, including `brief.toml` shortcodes and `@ref` validation), hover explanations, goto-definition/references for `@ref`, completion, document symbols, and formatting.
 - [`crates/brief-web`](./crates/brief-web) — `brief-web`, a static-site generator and dev server for `.brf` documents. See below.
 
 ## Web rendering (`brief-web`)

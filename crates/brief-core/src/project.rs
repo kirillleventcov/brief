@@ -106,7 +106,7 @@ pub fn build_index(root: &Path) -> (ProjectIndex, Vec<FileDiagnostics>) {
                 diagnostics: parse_diags,
             });
         }
-        let anchors = collect_doc_anchors(&doc);
+        let anchors = collect_anchors(&doc);
         idx.anchors.insert(rel, anchors);
     });
 
@@ -139,7 +139,12 @@ fn walk_brf_files(root: &Path, visit: &mut dyn FnMut(&Path)) {
     }
 }
 
-fn collect_doc_anchors(doc: &crate::ast::Document) -> BTreeSet<String> {
+/// Collect every heading anchor declared in `doc`, including headings
+/// nested in blockquotes, lists, and block shortcodes. This is the same
+/// set `build_index` records per file; exposed so callers holding an
+/// in-memory document (e.g. an editor buffer) can overlay a fresher
+/// anchor set over a disk-built index.
+pub fn collect_anchors(doc: &crate::ast::Document) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for b in &doc.blocks {
         collect_block_anchors(b, &mut out);

@@ -63,8 +63,17 @@ pub fn render_page(template: &str, ctx: &PageContext<'_>) -> String {
     let site_title = escape_text(ctx.site_title);
     let base_url = escape_text(ctx.base_url);
     let stylesheet = escape_text(ctx.stylesheet_path);
+    // Browser-tab title: "page — site", collapsed to just the site title
+    // when they are equal (the landing/index page) so tabs don't read
+    // "Brief — Brief".
+    let title_full = if ctx.title == ctx.site_title {
+        site_title.clone()
+    } else {
+        format!("{} — {}", title, site_title)
+    };
     let mut subs: BTreeMap<&str, &str> = BTreeMap::new();
     subs.insert("title", &title);
+    subs.insert("title_full", &title_full);
     subs.insert("description", &description);
     subs.insert("site_title", &site_title);
     subs.insert("content", ctx.content_html);

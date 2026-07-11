@@ -1,15 +1,15 @@
 # Command-line interface
 
 @lede
-Two binaries: `brief` (the compiler) and `brief-web` (the static-site
-generator). Everything else lives behind a subcommand.
+Three binaries: `brief` (the compiler), `brief-web` (the static-site
+generator), and `brief-lsp` (the language server). Everything else
+lives behind a subcommand.
 @end
 
 ## `brief`
 
 The compiler. Subcommands: `compile`, `convert`, `explain`, `fmt`,
-`watch`. There is also `brief-lsp`, a separate language-server binary
-for editor integration.
+`watch`.
 
 ### `brief compile`
 
@@ -108,6 +108,39 @@ brief watch doc.brf --target=llm --no-clear
 
 Accepts the same target and LLM-mode flags as `brief compile`, plus
 `--no-clear` to keep previous output on screen between runs.
+
+## `brief-lsp`
+
+The language server. No subcommands, no flags — editors spawn it over
+stdio.
+
+It runs the same pipeline as `brief compile`, project context included:
+`brief.toml` is discovered by walking up from each open file, custom
+shortcodes and `compile.strict_heading_levels` apply, and `@ref` targets
+are validated against a project-wide index. Unsaved buffers count —
+rename a heading anchor and every open document referencing it updates
+immediately, without saving.
+
+@dl
+Diagnostics
+: The full compile diagnostic set on open, change, and save. A broken
+  `brief.toml` is reported as an error pinned to the top of the file.
+Hover
+: The `brief explain` text for the diagnostic under the cursor.
+Goto definition
+: On a `@ref`, jump to the target heading (or the top of the target
+  file for whole-file references).
+Find references
+: On a heading anchor or a `@ref`, list every reference to that target
+  across the project.
+Completion
+: Shortcode names after `@`, project file paths inside `@ref[`, and
+  heading anchors after `#`.
+Document symbols
+: The heading outline, nested by level.
+Formatting
+: Whole-document `brief fmt`.
+@end
 
 ## `brief-web`
 
