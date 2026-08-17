@@ -59,22 +59,27 @@ enum Cmd {
     Explain {
         code: String,
     },
+    /// Convert between Markdown and Brief. Direction is chosen by
+    /// extension: `.md` inputs convert to Brief, `.brf` inputs convert to
+    /// Markdown.
     Convert {
-        /// One or more Markdown input files.
+        /// One or more input files (`.md` → Brief, `.brf` → Markdown).
         inputs: Vec<PathBuf>,
         /// Override output path. Single-input only.
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Write Brief to stdout instead of a file. Single-input only.
+        /// Write converted output to stdout instead of a file.
+        /// Single-input only.
         #[arg(long)]
         stdout: bool,
         /// Overwrite existing destination files.
         #[arg(long)]
         force: bool,
         /// Disable the post-convert self-test. By default, `brief convert`
-        /// pipes its output through the Brief compiler and refuses to write
-        /// the `.brf` if the output does not compile. Pass `--no-strict` to
-        /// write the (possibly broken) output regardless.
+        /// checks its own output: converted Brief must compile, and
+        /// converted Markdown must survive a round-trip back through the
+        /// Markdown→Brief converter. Pass `--no-strict` to write the
+        /// (possibly broken) output regardless.
         #[arg(long)]
         no_strict: bool,
     },
@@ -320,33 +325,9 @@ fn run_compile(
     };
 
     let abs_input = input.canonicalize().unwrap_or_else(|_| input.clone());
-    let project_root = brief::project::discover_root(&abs_input);
-    let project_index = match &project_root {
-        Some(root) => {
-            let (idx, prepass_diags) = brief::project::build_index(root);
-            // Surface lex/parse errors from the pre-pass; each set of
-            // diagnostics is rendered against its own SourceMap so that
-            // line numbers and source excerpts refer to the correct file.
-            let mut has_err = false;
-            for fd in &prepass_diags {
-                if fd.diagnostics.is_empty() {
-                    continue;
-                }
-                if fd
-                    .diagnostics
-                    .iter()
-                    .any(|d| d.severity == brief::diag::Severity::Error)
-                {
-                    has_err = true;
-                }
-                eprint!("{}", brief::diag::render_all(&fd.diagnostics, &fd.source));
-            }
-            if has_err {
-                return ExitCode::from(1);
-            }
-            Some(idx)
-        }
-        None => None,
+    let project = match discover_project(&abs_input) {
+        Ok(p) => p,
+        Err(()) => return ExitCode::from(1),
     };
 
     let tokens = match lexer::lex(&src) {
@@ -357,16 +338,13 @@ fn run_compile(
         }
     };
     let (mut doc, mut diags) = parser::parse(tokens, &src);
-    let resolve_project = match (&project_root, &project_index) {
-        (Some(root), Some(idx)) => {
-            let rel = abs_input
-                .strip_prefix(root)
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|_| input.clone());
-            Some((idx, rel))
-        }
-        _ => None,
-    };
+    let resolve_project = project.as_ref().map(|(root, idx)| {
+        let rel = abs_input
+            .strip_prefix(root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| input.clone());
+        (idx, rel)
+    });
     let project_ref = resolve_project
         .as_ref()
         .map(|(idx, rel)| brief::resolve::ResolveProject {
@@ -460,6 +438,35 @@ fn run_compile(
     ExitCode::SUCCESS
 }
 
+/// Discover the project root above `abs_input` and build its index,
+/// surfacing lex/parse errors from the pre-pass. Each set of diagnostics is
+/// rendered against its own SourceMap so that line numbers and source
+/// excerpts refer to the correct file. `Err(())` means an indexed file
+/// failed to lex/parse (already rendered to stderr).
+fn discover_project(
+    abs_input: &std::path::Path,
+) -> Result<Option<(PathBuf, brief::project::ProjectIndex)>, ()> {
+    let Some(root) = brief::project::discover_root(abs_input) else {
+        return Ok(None);
+    };
+    let (idx, prepass_diags) = brief::project::build_index(&root);
+    let mut has_err = false;
+    for fd in &prepass_diags {
+        if fd.diagnostics.is_empty() {
+            continue;
+        }
+        if fd.diagnostics.iter().any(|d| d.severity == Severity::Error) {
+            has_err = true;
+        }
+        eprint!("{}", render_all(&fd.diagnostics, &fd.source));
+    }
+    if has_err {
+        Err(())
+    } else {
+        Ok(Some((root, idx)))
+    }
+}
+
 fn compile_output_path(input: &std::path::Path, target: &str) -> PathBuf {
     let ext = match target {
         "html" => "html",
@@ -513,7 +520,7 @@ fn run_convert(
     let multi = inputs.len() > 1;
 
     for input in &inputs {
-        let src = match std::fs::read_to_string(input) {
+        let raw = match std::fs::read_to_string(input) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
@@ -525,25 +532,55 @@ fn run_convert(
                 continue;
             }
         };
-        let result = brief::convert::convert(&src, &input.to_string_lossy());
 
-        // Strict-by-default: pipe through the lex + parse self-test.
-        // Skipped on --no-strict.
-        if !no_strict {
-            if let Err(rendered) = strict_self_test(&result.brief_source, &input.to_string_lossy())
-            {
-                eprintln!(
-                    "brief: {} → FAILED: --strict self-test rejected the converted output:",
-                    input.display()
-                );
-                eprint!("{}", rendered);
-                eprintln!(
-                    "brief: pass --no-strict to write the broken output anyway, or fix the converter."
-                );
-                failed += 1;
-                continue;
+        // Direction is chosen by extension: `.brf` exports to Markdown,
+        // anything else migrates to Brief.
+        let is_reverse = input.extension().and_then(|s| s.to_str()) == Some("brf");
+        let (converted, notes) = if is_reverse {
+            match convert_reverse(input, &raw, no_strict) {
+                Ok(v) => v,
+                Err(()) => {
+                    failed += 1;
+                    continue;
+                }
             }
-        }
+        } else {
+            let result = brief::convert::convert(&raw, &input.to_string_lossy());
+
+            // Strict-by-default: pipe through the lex + parse self-test.
+            // Skipped on --no-strict.
+            if !no_strict {
+                if let Err(rendered) =
+                    strict_self_test(&result.brief_source, &input.to_string_lossy())
+                {
+                    eprintln!(
+                        "brief: {} → FAILED: --strict self-test rejected the converted output:",
+                        input.display()
+                    );
+                    eprint!("{}", rendered);
+                    eprintln!(
+                        "brief: pass --no-strict to write the broken output anyway, or fix the converter."
+                    );
+                    failed += 1;
+                    continue;
+                }
+            }
+            let notes = result
+                .diagnostics
+                .iter()
+                .map(|d| {
+                    format!(
+                        "  note[{}]: {}:{}:{}: {}",
+                        d.hole.slug(),
+                        input.display(),
+                        d.line,
+                        d.col,
+                        d.note
+                    )
+                })
+                .collect();
+            (result.brief_source, notes)
+        };
 
         let dest = if use_stdout {
             None
@@ -555,7 +592,7 @@ fn run_convert(
 
         match dest {
             None => {
-                print!("{}", result.brief_source);
+                print!("{}", converted);
             }
             Some(path) => {
                 if path.exists() && !force {
@@ -567,7 +604,7 @@ fn run_convert(
                     failed += 1;
                     continue;
                 }
-                if let Err(e) = std::fs::write(&path, &result.brief_source) {
+                if let Err(e) = std::fs::write(&path, &converted) {
                     eprintln!(
                         "brief: {} → FAILED: cannot write {}: {}",
                         input.display(),
@@ -577,7 +614,7 @@ fn run_convert(
                     failed += 1;
                     continue;
                 }
-                let n = result.diagnostics.len();
+                let n = notes.len();
                 if n == 0 {
                     eprintln!("brief: {} → {} (clean)", input.display(), path.display());
                 } else {
@@ -592,17 +629,10 @@ fn run_convert(
             }
         }
 
-        for d in &result.diagnostics {
-            eprintln!(
-                "  note[{}]: {}:{}:{}: {}",
-                d.hole.slug(),
-                input.display(),
-                d.line,
-                d.col,
-                d.note
-            );
+        for note in &notes {
+            eprintln!("{}", note);
         }
-        total_holes += result.diagnostics.len();
+        total_holes += notes.len();
     }
 
     if multi {
@@ -708,15 +738,136 @@ fn run_fmt(inputs: Vec<PathBuf>, check: bool, write: bool, sort_frontmatter: boo
 }
 
 fn default_output_path(input: &std::path::Path) -> PathBuf {
-    if input.extension().and_then(|s| s.to_str()) == Some("md") {
-        input.with_extension("brf")
-    } else {
-        let mut p = input.to_path_buf();
-        let mut name = p.file_name().unwrap_or_default().to_os_string();
-        name.push(".brf");
-        p.set_file_name(name);
-        p
+    match input.extension().and_then(|s| s.to_str()) {
+        Some("md") => input.with_extension("brf"),
+        Some("brf") => input.with_extension("md"),
+        _ => {
+            let mut p = input.to_path_buf();
+            let mut name = p.file_name().unwrap_or_default().to_os_string();
+            name.push(".brf");
+            p.set_file_name(name);
+            p
+        }
     }
+}
+
+/// Convert one `.brf` input to Markdown.
+///
+/// Runs the full compile front-end (lex → parse → resolve → validate) so
+/// `@ref` targets and shortcode arguments obey the same rules as
+/// `brief compile`, then emits Markdown. Prints failure details to stderr
+/// and returns `Err(())` when the source does not compile or the strict
+/// round-trip self-test rejects the output.
+fn convert_reverse(
+    input: &std::path::Path,
+    raw: &str,
+    no_strict: bool,
+) -> Result<(String, Vec<String>), ()> {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let src = SourceMap::new(input.to_string_lossy(), raw.to_string());
+
+    // Same config fallback as `run_compile` with no `--config`: a brief.toml
+    // in the working directory, else defaults. Custom shortcodes need their
+    // `template_html` for the Markdown fallback expansion.
+    let cfg = {
+        let candidate = std::path::Path::new("brief.toml");
+        if candidate.exists() {
+            match config::load(candidate) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("brief: {} → FAILED: bad brief.toml: {}", input.display(), e);
+                    return Err(());
+                }
+            }
+        } else {
+            config::Config::default()
+        }
+    };
+    let registry = config::registry_from(&cfg);
+
+    let abs_input = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
+    let project = match discover_project(&abs_input) {
+        Ok(p) => p,
+        Err(()) => {
+            eprintln!(
+                "brief: {} → FAILED: project pre-pass reported errors",
+                input.display()
+            );
+            return Err(());
+        }
+    };
+
+    let tokens = match lexer::lex(&src) {
+        Ok(t) => t,
+        Err(d) => {
+            eprintln!("brief: {} → FAILED:", input.display());
+            eprint!("{}", render_all(&d, &src));
+            return Err(());
+        }
+    };
+    let (mut doc, mut diags) = parser::parse(tokens, &src);
+    let resolve_project = project.as_ref().map(|(root, idx)| {
+        let rel = abs_input
+            .strip_prefix(root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| input.to_path_buf());
+        (idx, rel)
+    });
+    let project_ref = resolve_project
+        .as_ref()
+        .map(|(idx, rel)| brief::resolve::ResolveProject {
+            index: idx,
+            current: rel.as_path(),
+        });
+    diags.extend(brief::resolve::resolve_with_project(
+        &mut doc,
+        &registry,
+        project_ref.as_ref(),
+    ));
+    let opts = validate::ValidateOpts {
+        strict_heading_levels: cfg.compile.strict_heading_levels,
+    };
+    diags.extend(validate::validate(&doc, &opts, &src));
+    if diags.iter().any(|d| d.severity == Severity::Error) {
+        eprintln!("brief: {} → FAILED:", input.display());
+        eprint!("{}", render_all(&diags, &src));
+        return Err(());
+    } else if !diags.is_empty() {
+        eprint!("{}", render_all(&diags, &src));
+    }
+
+    let result = brief::convert::to_markdown(&doc, &registry, &src);
+
+    // Strict-by-default: the emitted Markdown must survive the forward
+    // converter and compile back to valid Brief. Skipped on --no-strict.
+    if !no_strict {
+        let back = brief::convert::convert(&result.markdown, &input.to_string_lossy());
+        if let Err(rendered) = strict_self_test(&back.brief_source, &input.to_string_lossy()) {
+            eprintln!(
+                "brief: {} → FAILED: --strict round-trip self-test rejected the converted Markdown:",
+                input.display()
+            );
+            eprint!("{}", rendered);
+            eprintln!("brief: pass --no-strict to write the output anyway, or fix the converter.");
+            return Err(());
+        }
+    }
+
+    let notes = result
+        .diagnostics
+        .iter()
+        .map(|d| {
+            format!(
+                "  note[{}]: {}:{}:{}: {}",
+                d.hole.slug(),
+                input.display(),
+                d.line,
+                d.col,
+                d.note
+            )
+        })
+        .collect();
+    Ok((result.markdown, notes))
 }
 
 /// Result of running the strict self-test against converted Brief.

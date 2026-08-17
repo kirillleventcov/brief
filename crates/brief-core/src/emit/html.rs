@@ -514,7 +514,7 @@ fn emit_footnotes_section(
     out.push_str("</ol>\n");
 }
 
-fn expand_template(tpl: &str, args: &ShortArgs, content: &str) -> String {
+pub(crate) fn expand_template(tpl: &str, args: &ShortArgs, content: &str) -> String {
     let mut out = String::new();
     let bytes = tpl.as_bytes();
     let mut start = 0;
@@ -548,7 +548,7 @@ fn expand_template(tpl: &str, args: &ShortArgs, content: &str) -> String {
 /// Escape `s` directly into `out`: unescaped stretches are copied in bulk
 /// instead of char-by-char, and no intermediate String is allocated. The
 /// escaped bytes are all ASCII, so scanning bytes is UTF-8 safe.
-fn escape_html_into(out: &mut String, s: &str) {
+pub(crate) fn escape_html_into(out: &mut String, s: &str) {
     let bytes = s.as_bytes();
     let mut start = 0;
     for (i, &b) in bytes.iter().enumerate() {

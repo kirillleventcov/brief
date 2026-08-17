@@ -54,19 +54,31 @@ Exit codes:
 
 ### `brief convert`
 
-Convert a Markdown document to Brief.
+Convert between Markdown and Brief. Direction comes from the input
+extension: `.md` converts to Brief, `.brf` exports to Markdown.
 
 ```bash
 brief convert notes.md                      # writes notes.brf
 brief convert notes.md -o renamed.brf       # rename single output
 brief convert notes.md --stdout             # pipe to stdout
 brief convert *.md                          # batch
+brief convert notes.brf                     # reverse: writes notes.md
+brief convert docs/*.brf                    # batch export to Markdown
 ```
 
-The converter is *lossy by design*. Constructs without a clean Brief
-equivalent are flagged as design holes — written to stderr and inserted
-into the output as `// TODO[B-hole:...]` comments. Inline HTML, raw HTML
-blocks, and YAML frontmatter are the most common holes.
+Both directions are *lossy by design*. Constructs without a clean
+equivalent on the other side are flagged as design holes and written to
+stderr. Converting to Brief also inserts `// TODO[B-hole:...]` comments
+at the source location; inline HTML, raw HTML blocks, and YAML
+frontmatter are the most common holes. Exporting to Markdown flags
+underline (emitted as `<u>`), comments (dropped), custom shortcodes
+(expanded via their `template_html`), and code-fence attributes
+(dropped).
+
+Converted output checks itself before it is written: Brief output must
+compile, and Markdown output must survive a round-trip back through the
+Markdown→Brief converter. `--no-strict` opts out. A `.brf` input that
+does not compile fails the conversion — fix the source first.
 
 Per-file failures in batch mode do not abort the run; each file is
 converted independently.

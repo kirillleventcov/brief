@@ -1,17 +1,22 @@
 # Markdown converter
 
 @lede
-`brief convert` turns Markdown into Brief. Lossy by design; gaps are
-documented as you go.
+`brief convert` translates between Markdown and Brief: `.md` in,
+canonical Brief out — and `.brf` in, GFM Markdown out. Lossy by design
+in both directions; gaps are documented as you go.
 @end
 
 ## The command
+
+Direction comes from the input extension.
 
 ```bash
 brief convert notes.md                      # writes notes.brf next to input
 brief convert notes.md -o renamed.brf       # rename single output
 brief convert notes.md --stdout             # pipe to stdout
 brief convert *.md                          # batch; per-file failures don't abort
+brief convert notes.brf                     # reverse: writes notes.md
+brief convert docs/*.brf                    # batch export to Markdown
 ```
 
 Per-file failures in batch mode do not abort the run. Each file is
@@ -92,9 +97,33 @@ heavily on inline HTML, custom HTML blocks, or YAML frontmatter will
 need targeted edits anyway — converting first and patching second is
 usually faster than rewriting from scratch, but only just.
 
-## Round-trip claim
+## The reverse direction
 
-The converter does *not* round-trip. There is no `brief convert
---reverse` to turn Brief back into Markdown, and there will not be one.
-Brief is the canonical form; Markdown is the legacy format you are
-moving away from.
+`brief convert doc.brf` exports Brief back to GFM Markdown. It is an
+exit ramp for toolchains that only read Markdown — a README that must
+render on a forge, a corpus moving into another generator. Brief stays
+the canonical form; the `.md` output is a build artifact, not a second
+home for your documents.
+
+Wherever GFM offers a syntax the forward converter already reads, the
+exporter picks that spelling, so `brf → md → brf` re-converts cleanly:
+TOML `+++` frontmatter, `{#anchor}` heading attributes, `> [!NOTE]`
+alerts, `term` / `: definition` lists, and footnotes hoisted to `[^n]`
+definitions. `@ref[a.brf](title)` becomes `[title](a.md)` — same
+relative path, rewritten extension — so a tree exported wholesale keeps
+its internal links.
+
+The reverse direction has its own design holes, reported the same way
+on stderr; nothing is silently dropped:
+
+@t
+| Brief | Markdown | Hole
+| `+underline+` | `<u>underline</u>` | `underline-html`
+| `//` and `/* */` comments | dropped | `comment-dropped`
+| Custom shortcodes | `template_html` expansion, or unwrapped | `custom-shortcode`
+| `@nominify` / `@minify` fence attributes | dropped | `code-attrs-dropped`
+
+Strictness is symmetric: the emitted Markdown is fed back through the
+Markdown→Brief converter and must compile, or the file is not written.
+`--no-strict` opts out. A `.brf` input that does not compile fails the
+conversion outright — fix the source first.

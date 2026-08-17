@@ -418,3 +418,125 @@ fn explain_covers_every_diagnostic_code() {
         );
     }
 }
+
+// ------------------------------------------------- reverse: Brief → Markdown
+
+#[test]
+fn reverse_single_file_default_output() {
+    let dir = temp_dir("rev_single_default");
+    let input = dir.join("note.brf");
+    std::fs::write(&input, "# Hello\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("convert")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let md = std::fs::read_to_string(dir.join("note.md")).unwrap();
+    assert_eq!(md, "# Hello\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("(clean)"), "stderr: {}", stderr);
+}
+
+#[test]
+fn reverse_stdout_mode() {
+    let dir = temp_dir("rev_stdout");
+    let input = dir.join("note.brf");
+    std::fs::write(&input, "a *b* c\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("convert")
+        .arg(&input)
+        .arg("--stdout")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a **b** c\n");
+}
+
+#[test]
+fn reverse_reports_underline_hole() {
+    let dir = temp_dir("rev_underline");
+    let input = dir.join("note.brf");
+    std::fs::write(&input, "a +u+ b\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("convert")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let md = std::fs::read_to_string(dir.join("note.md")).unwrap();
+    assert_eq!(md, "a <u>u</u> b\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("note[underline-html]"),
+        "stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn reverse_invalid_brief_fails() {
+    let dir = temp_dir("rev_invalid");
+    let input = dir.join("broken.brf");
+    std::fs::write(&input, "@details(summary: \"x\")\nnever closed\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("convert")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("FAILED"), "stderr: {}", stderr);
+    assert!(!dir.join("broken.md").exists());
+}
+
+#[test]
+fn reverse_refuses_overwrite_without_force() {
+    let dir = temp_dir("rev_no_overwrite");
+    let input = dir.join("note.brf");
+    std::fs::write(&input, "# Hello\n").unwrap();
+    std::fs::write(dir.join("note.md"), "existing").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("convert")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("note.md")).unwrap(),
+        "existing"
+    );
+}
+
+#[test]
+fn reverse_ref_resolves_in_project() {
+    let dir = temp_dir("rev_ref_project");
+    std::fs::write(dir.join("brief.toml"), "").unwrap();
+    std::fs::write(dir.join("b.brf"), "# Top {#top}\n\nbody.\n").unwrap();
+    let input = dir.join("a.brf");
+    std::fs::write(&input, "See @ref[b.brf#top](Anchor).\n").unwrap();
+    let out = Command::new(brief_bin())
+        .arg("convert")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let md = std::fs::read_to_string(dir.join("a.md")).unwrap();
+    assert_eq!(md, "See [Anchor](b.md#top).\n");
+}

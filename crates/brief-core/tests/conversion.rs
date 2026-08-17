@@ -862,3 +862,47 @@ fn link_url_unbalanced_paren_percent_encoded() {
     let (out, _) = run("[x](https://e.com/a\\)b)\n");
     assert_eq!(out, "@link[x](https://e.com/a%29b)\n");
 }
+
+// ------------------------------------------ multi-line list items (indent)
+
+#[test]
+fn list_item_soft_continuation_indented() {
+    let (out, holes) = run("1. first item\n   soft continuation\n2. second\n");
+    assert_eq!(out, "1. first item\n   soft continuation\n2. second\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn loose_list_child_paragraph_indented() {
+    let (out, holes) = run("1. first item.\n\n   child para.\n2. second.\n");
+    assert_eq!(out, "1. first item.\n   child para.\n2. second.\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn unordered_soft_continuation_indented() {
+    let (out, holes) = run("- a\n  cont line\n- b\n");
+    assert_eq!(out, "- a\n  cont line\n- b\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn hole_comment_inside_list_item_is_indented() {
+    // An unindented `//` line would terminate the Brief list at the comment,
+    // splitting one list into several (B0501 on the next item).
+    let (out, holes) = run("1. **bold** item.\n\n   child.\n2. second.\n");
+    assert_eq!(
+        out,
+        "1. *bold* item.\n   // TODO[B-hole:double-emphasis]: doubled emphasis marker rewritten to single `*`\n   child.\n2. second.\n"
+    );
+    assert_eq!(holes, vec![Hole::DoubleEmphasis]);
+}
+
+#[test]
+fn inline_code_with_backtick_value_space_padded() {
+    // Without padding the inner backtick merges with the `` delimiter and
+    // the Brief span never closes.
+    let (out, holes) = run("`` `code` ``\n");
+    assert_eq!(out, "`` `code` ``\n");
+    assert!(holes.is_empty(), "{:?}", holes);
+}

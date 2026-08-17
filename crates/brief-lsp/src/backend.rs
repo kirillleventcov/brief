@@ -88,7 +88,12 @@ struct DocState {
 
 /// (buffer text, filesystem path, project snapshot, pipeline result) for
 /// one open document — what every request handler starts from.
-type AnalyzedDoc = (String, Option<PathBuf>, Option<Arc<ProjectSnapshot>>, Analysis);
+type AnalyzedDoc = (
+    String,
+    Option<PathBuf>,
+    Option<Arc<ProjectSnapshot>>,
+    Analysis,
+);
 
 #[derive(Debug)]
 pub struct Backend {
@@ -116,9 +121,7 @@ impl Backend {
     /// when `refresh` is set or nothing is cached yet.
     fn snapshot_for(&self, path: &Path, refresh: bool) -> Option<Arc<ProjectSnapshot>> {
         let root = brief::project::discover_root(path)?;
-        if !refresh
-            && let Some(s) = self.snapshots.get(&root)
-        {
+        if !refresh && let Some(s) = self.snapshots.get(&root) {
             return Some(s.clone());
         }
         let snap = Arc::new(analysis::load_snapshot(&root));
@@ -491,20 +494,19 @@ impl LanguageServer for Backend {
 
         // The symbol under the cursor: either a @ref (its target) or an
         // anchored heading (all refs pointing at it).
-        let (target_path, target_anchor) =
-            if let Some(site) = analysis::ref_at(doc, cursor_byte) {
-                analysis::split_target(&site.target)
-            } else if let Some((_, anchor)) = analysis::heading_anchor_at(doc, cursor_byte) {
-                let Some(rel) = path
-                    .as_deref()
-                    .and_then(|p| analysis::rel_path(&snapshot.root, p))
-                else {
-                    return Ok(None);
-                };
-                (rel, Some(anchor))
-            } else {
+        let (target_path, target_anchor) = if let Some(site) = analysis::ref_at(doc, cursor_byte) {
+            analysis::split_target(&site.target)
+        } else if let Some((_, anchor)) = analysis::heading_anchor_at(doc, cursor_byte) {
+            let Some(rel) = path
+                .as_deref()
+                .and_then(|p| analysis::rel_path(&snapshot.root, p))
+            else {
                 return Ok(None);
             };
+            (rel, Some(anchor))
+        } else {
+            return Ok(None);
+        };
 
         // Every project file the index knows about, plus any open buffers
         // under the root the disk walk could not see yet.
@@ -587,18 +589,19 @@ impl LanguageServer for Backend {
             start: byte_offset_to_lsp_position(&text, cursor_byte - prefix_len),
             end: byte_offset_to_lsp_position(&text, cursor_byte),
         };
-        let item = |name: &str, kind: CompletionItemKind, detail: Option<String>, prefix_len: usize| {
-            CompletionItem {
-                label: name.to_string(),
-                kind: Some(kind),
-                detail,
-                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                    range: edit_range(prefix_len),
-                    new_text: name.to_string(),
-                })),
-                ..Default::default()
-            }
-        };
+        let item =
+            |name: &str, kind: CompletionItemKind, detail: Option<String>, prefix_len: usize| {
+                CompletionItem {
+                    label: name.to_string(),
+                    kind: Some(kind),
+                    detail,
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                        range: edit_range(prefix_len),
+                        new_text: name.to_string(),
+                    })),
+                    ..Default::default()
+                }
+            };
 
         let items: Vec<CompletionItem> = match ctx {
             CompletionCtx::ShortcodeName { prefix } => {
@@ -633,8 +636,7 @@ impl LanguageServer for Backend {
                 let Some(snapshot) = &snapshot else {
                     return Ok(None);
                 };
-                let mut paths: BTreeSet<String> =
-                    snapshot.index.anchors.keys().cloned().collect();
+                let mut paths: BTreeSet<String> = snapshot.index.anchors.keys().cloned().collect();
                 for entry in self.docs.iter() {
                     if let Some(p) = &entry.value().path
                         && let Some(rel) = analysis::rel_path(&snapshot.root, p)
@@ -648,7 +650,10 @@ impl LanguageServer for Backend {
                     .map(|p| item(p, CompletionItemKind::FILE, None, prefix.len()))
                     .collect()
             }
-            CompletionCtx::RefAnchor { path: target, prefix } => {
+            CompletionCtx::RefAnchor {
+                path: target,
+                prefix,
+            } => {
                 let Some(snapshot) = &snapshot else {
                     return Ok(None);
                 };
@@ -852,23 +857,35 @@ mod tests {
         // byte → position
         assert_eq!(
             byte_offset_to_lsp_position(text, 0),
-            Position { line: 0, character: 0 }
+            Position {
+                line: 0,
+                character: 0
+            }
         );
         // after "aé" = 3 bytes → col 2
         assert_eq!(
             byte_offset_to_lsp_position(text, 3),
-            Position { line: 0, character: 2 }
+            Position {
+                line: 0,
+                character: 2
+            }
         );
         // after "aé😀" = 7 bytes → col 4 (emoji is 2 units)
         assert_eq!(
             byte_offset_to_lsp_position(text, 7),
-            Position { line: 0, character: 4 }
+            Position {
+                line: 0,
+                character: 4
+            }
         );
         // start of line 1
         let second_start = text.find("second").unwrap();
         assert_eq!(
             byte_offset_to_lsp_position(text, second_start),
-            Position { line: 1, character: 0 }
+            Position {
+                line: 1,
+                character: 0
+            }
         );
 
         // position → byte round-trips

@@ -39,7 +39,7 @@ brief explain <CODE> # Explain compilation error
 
 The repo is a Cargo workspace. The crates are:
 
-- [`crates/brief-core`](./crates/brief-core) — the parser, AST, validators, HTML / LLM emitters, formatter, and Markdown→Brief converter, exposed as a library.
+- [`crates/brief-core`](./crates/brief-core) — the parser, AST, validators, HTML / LLM emitters, formatter, and Markdown ↔ Brief converters, exposed as a library.
 - [`crates/brief-cli`](./crates/brief-cli) — the `brief` command-line binary used in the examples above.
 - [`crates/brief-lsp`](./crates/brief-lsp) — `brief-lsp`, a language server speaking LSP over stdio: project-aware diagnostics (same pipeline as `brief compile`, including `brief.toml` shortcodes and `@ref` validation), hover explanations, goto-definition/references for `@ref`, completion, document symbols, and formatting.
 - [`crates/brief-web`](./crates/brief-web) — `brief-web`, a static-site generator and dev server for `.brf` documents. See below.
@@ -119,15 +119,19 @@ cannot be safely minified. If a `python` / `py` / `yaml` / `yml` /
 by adding the tag to `minify_languages`), the compiler emits a `B0704`
 error to stderr and falls back to verbatim emission.
 
-## Convert from Markdown
+## Convert to and from Markdown
 
 > For best results it's better to hand re-write Markdown to Brief. For quick wins Markdown converter might be sufficient.
+
+Direction comes from the input extension: `.md` converts to Brief,
+`.brf` exports to GFM Markdown.
 
 ```
 brief convert notes.md                      # writes notes.brf next to input
 brief convert notes.md -o renamed.brf       # rename single output
 brief convert notes.md --stdout             # pipe to stdout
 brief convert *.md                          # batch; per-file failures don't abort
+brief convert notes.brf                     # reverse: writes notes.md
 ```
 
 The converter is lossy by design: every Markdown construct without a clean
@@ -136,10 +140,17 @@ Hole markers are also injected into the output as `// TODO[B-hole:...]`
 comments where applicable (inline HTML, HTML blocks, frontmatter), so they
 remain greppable in the converted corpus.
 
-By default, `brief convert` runs the converted Brief through the
-compiler before writing and refuses to write any file that does not
-compile (the "strict" self-test). Pass `--no-strict` to disable the
-self-test and write whatever the converter produced.
+The reverse direction is lossy the same way: underline (emitted as
+`<u>`), comments (dropped), custom shortcodes (expanded via their
+`template_html`), and code-fence attributes (dropped) are reported as
+holes on stderr. Brief stays the canonical form; the `.md` output is a
+build artifact for toolchains that only read Markdown.
+
+By default, `brief convert` checks its own output before writing:
+converted Brief must compile, and converted Markdown must survive a
+round-trip back through the Markdown→Brief converter (the "strict"
+self-test). Pass `--no-strict` to disable the self-test and write
+whatever the converter produced.
 
 ## Fuzzing
 

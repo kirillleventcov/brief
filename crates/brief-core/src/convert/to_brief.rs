@@ -352,6 +352,20 @@ impl<'a> Walker<'a> {
             self.out.push(c);
         }
     }
+    /// After a line break inside a tight list item's text, align the next
+    /// line under the item marker — an unindented continuation line would
+    /// terminate the Brief list. Loose items route their text through
+    /// Paragraph buffers, which realign at `End(TagEnd::Paragraph)` instead.
+    fn write_item_continuation_indent(&mut self) {
+        if self.in_paragraph {
+            return;
+        }
+        if let Some(frame) = self.list_stack.last() {
+            let indent = " ".repeat(frame.item_content_col.saturating_sub(1));
+            self.write(&indent);
+        }
+    }
+
     fn current_ends_with(&self, c: char) -> bool {
         if let Some(d) = self.dl.as_ref() {
             if d.in_term {
@@ -516,12 +530,22 @@ impl<'a> Walker<'a> {
                 self.in_paragraph = false;
                 let body = self.out_stack.pop().expect("paragraph buffer");
                 let _ = self.container_stack.pop();
-                self.write(&body);
-                if self.list_stack.is_empty() {
-                    self.write_char('\n');
+                if let Some(frame) = self.list_stack.last() {
+                    // Continuation lines of an item paragraph must align
+                    // under the item marker or the Brief list terminates at
+                    // the unindented line. A loose item's second-and-later
+                    // paragraphs start on a fresh line, so their first line
+                    // needs the same alignment.
+                    let indent = " ".repeat(frame.item_content_col.saturating_sub(1));
+                    if self.current_ends_with('\n') {
+                        self.write(&indent);
+                    }
+                    let realigned = body.replace('\n', &format!("\n{}", indent));
+                    self.write(&realigned);
                     self.write_char('\n');
                 } else {
-                    // Inside a list item — no trailing blank line.
+                    self.write(&body);
+                    self.write_char('\n');
                     self.write_char('\n');
                 }
             }
@@ -621,8 +645,19 @@ impl<'a> Walker<'a> {
             }
             Event::Code(s) => {
                 if s.contains('`') {
+                    // Brief's widest inline-code delimiter is the double
+                    // backtick; pad with spaces when the value begins or
+                    // ends with a backtick so the delimiter does not merge
+                    // with the content and leave the span unterminated.
+                    let pad = s.starts_with('`') || s.ends_with('`');
                     self.write("``");
+                    if pad {
+                        self.write_char(' ');
+                    }
                     self.write(&s);
+                    if pad {
+                        self.write_char(' ');
+                    }
                     self.write("``");
                 } else {
                     self.write_char('`');
@@ -1222,10 +1257,12 @@ impl<'a> Walker<'a> {
             }
             Event::SoftBreak => {
                 self.write_char('\n');
+                self.write_item_continuation_indent();
             }
             Event::HardBreak => {
                 self.write_char('\\');
                 self.write_char('\n');
+                self.write_item_continuation_indent();
             }
             Event::InlineMath(s) => {
                 self.write("@math[");
@@ -1298,12 +1335,20 @@ impl<'a> Walker<'a> {
     }
 
     fn flush_pending_hole_comments(&mut self) {
+        // Inside a list item, comment lines must align under the item
+        // marker: an unindented `//` line terminates the Brief list.
+        let indent = match self.list_stack.last() {
+            Some(f) if f.item_content_col > 0 => " ".repeat(f.item_content_col - 1),
+            _ => String::new(),
+        };
         for c in std::mem::take(&mut self.pending_hole_comments) {
             // Write to top buffer (or `out`).
             if let Some(buf) = self.out_stack.last_mut() {
+                buf.push_str(&indent);
                 buf.push_str(&c);
                 buf.push('\n');
             } else {
+                self.out.push_str(&indent);
                 self.out.push_str(&c);
                 self.out.push('\n');
             }
