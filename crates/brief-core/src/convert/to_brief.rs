@@ -44,6 +44,7 @@ pub enum Hole {
     BlockquoteParagraphSplit,
     TableCellPipeEscape,
     EmptyTableCell,
+    NestedDefinitionList,
 }
 
 impl Hole {
@@ -73,6 +74,7 @@ impl Hole {
             Hole::BlockquoteParagraphSplit => "blockquote-paragraph-split",
             Hole::TableCellPipeEscape => "table-cell-pipe-escape",
             Hole::EmptyTableCell => "empty-table-cell",
+            Hole::NestedDefinitionList => "nested-definition-list",
         }
     }
 
@@ -108,6 +110,9 @@ impl Hole {
             }
             Hole::TableCellPipeEscape => "`|` inside table cell escaped to `\\|`",
             Hole::EmptyTableCell => "empty Markdown table cell padded with em-dash",
+            Hole::NestedDefinitionList => {
+                "nested definition list flattened into a sibling `@dl` block"
+            }
         }
     }
 }
@@ -158,6 +163,7 @@ pub fn convert(input: &str, source_path: &str) -> ConvertResult {
                         for (e, r) in current_events.drain(..) {
                             sub.visit(e, r);
                         }
+                        sub.drain_open_containers();
                         let body = sub.out.trim().to_string();
                         footnote_diags.append(&mut sub.diags);
                         footnote_defs.insert(label, body);
@@ -219,6 +225,8 @@ struct Walker<'a> {
     table: Option<TableState>,
     /// Active definition-list accumulator.
     dl: Option<DefinitionListState>,
+    /// Outer definition lists suspended while a nested one is open.
+    dl_stack: Vec<DefinitionListState>,
     /// Stack of (dest_url, optional diagnostic to emit on End) for active links/images.
     link_stack: Vec<(String, Option<(Hole, String)>)>,
     /// Footnote labels → body text (rendered as a flat string).
@@ -256,6 +264,9 @@ struct DefinitionListState {
     defs_for_current_term: usize,
     in_term: bool,
     in_def: bool,
+    /// The current definition was interrupted by a nested definition list,
+    /// and its content up to there already emitted.
+    def_split: bool,
 }
 
 struct ListFrame {
@@ -283,8 +294,12 @@ enum Container {
     /// blank lines split markdown content out of the surrounding HtmlBlock).
     /// The `summary` is captured when we open; on the closing `</details>`
     /// HtmlBlock we pop and emit `@details(summary: "..")\n[body]\n@end`.
+    /// `opener` (the raw opening HTML) and `range` are kept for the
+    /// fallback when no `</details>` ever arrives.
     Details {
         summary: String,
+        opener: String,
+        range: std::ops::Range<usize>,
     },
 }
 
@@ -401,6 +416,7 @@ impl<'a> Walker<'a> {
             container_stack: Vec::new(),
             table: None,
             dl: None,
+            dl_stack: Vec::new(),
             link_stack: Vec::new(),
             footnote_defs: std::collections::BTreeMap::new(),
             pending_hole_comments: Vec::new(),
@@ -528,8 +544,9 @@ impl<'a> Walker<'a> {
             }
             Event::End(TagEnd::Paragraph) => {
                 self.in_paragraph = false;
-                let body = self.out_stack.pop().expect("paragraph buffer");
-                let _ = self.container_stack.pop();
+                let (body, _) = self
+                    .pop_container(|c| matches!(c, Container::Paragraph))
+                    .expect("paragraph buffer");
                 if let Some(frame) = self.list_stack.last() {
                     // Continuation lines of an item paragraph must align
                     // under the item marker or the Brief list terminates at
@@ -786,11 +803,12 @@ impl<'a> Walker<'a> {
                 self.container_stack.push(container);
             }
             Event::End(TagEnd::BlockQuote(_)) => {
-                let inner = self.out_stack.pop().expect("unbalanced quote stack");
-                let container = self
-                    .container_stack
-                    .pop()
-                    .expect("unbalanced container stack");
+                // A `<details>` opened inside the quote and never closed
+                // there sits above it on the stack; `pop_container` drains
+                // it into the quote first.
+                let (inner, container) = self
+                    .pop_container(|c| matches!(c, Container::Quote | Container::Alert(..)))
+                    .expect("unbalanced quote stack");
                 let trimmed = inner.trim_end_matches('\n');
                 match container {
                     Container::Quote => {
@@ -927,8 +945,9 @@ impl<'a> Walker<'a> {
                 self.container_stack.push(Container::LinkPending);
             }
             Event::End(TagEnd::Link) => {
-                let text = self.out_stack.pop().expect("link buffer");
-                let _ = self.container_stack.pop();
+                let (text, _) = self
+                    .pop_container(|c| matches!(c, Container::LinkPending))
+                    .expect("link buffer");
                 let (url_with_title, diag) = self.link_stack.pop().expect("link stack");
                 // Split url and optional title.
                 let (url, opt_title) = if let Some(idx) = url_with_title.find('\x00') {
@@ -979,8 +998,9 @@ impl<'a> Walker<'a> {
                 self.container_stack.push(Container::ImagePending);
             }
             Event::End(TagEnd::Image) => {
-                let alt = self.out_stack.pop().expect("image buffer");
-                let _ = self.container_stack.pop();
+                let (alt, _) = self
+                    .pop_container(|c| matches!(c, Container::ImagePending))
+                    .expect("image buffer");
                 let (src, diag) = self.link_stack.pop().expect("link stack");
                 if let Some((hole, note)) = diag {
                     self.diags.push(Diag {
@@ -1038,13 +1058,36 @@ impl<'a> Walker<'a> {
             }
             Event::Start(Tag::DefinitionList) => {
                 self.flush_pending_hole_comments();
-                // Ensure preceding blank line, same convention as paragraphs
-                // and lists.
-                if !self.out.is_empty() && !self.out.ends_with("\n\n") {
-                    if !self.out.ends_with('\n') {
-                        self.out.push('\n');
+                if let Some(mut outer) = self.dl.take() {
+                    // A list nested in a definition. Brief's `@dl` cannot
+                    // nest: emit the outer list up to here, then the inner
+                    // one as a sibling, and resume the outer after it.
+                    if outer.in_def {
+                        let def = std::mem::take(&mut outer.current_def);
+                        if !def.trim().is_empty() {
+                            outer.items.push((outer.current_term.clone(), def));
+                        }
+                        outer.def_split = true;
                     }
-                    self.out.push('\n');
+                    let items = std::mem::take(&mut outer.items);
+                    self.write_dl(&items);
+                    self.dl_stack.push(outer);
+                    self.push_diag(
+                        Hole::NestedDefinitionList,
+                        range.clone(),
+                        "nested definition list flattened into a sibling `@dl` block".into(),
+                    );
+                }
+                // Ensure preceding blank line, same convention as paragraphs
+                // and lists. Written to the innermost open container, not
+                // `out`, so a definition list inside a quote or `<details>`
+                // stays inside it.
+                let buf = self.top_buf();
+                if !buf.is_empty() && !buf.ends_with("\n\n") {
+                    if !buf.ends_with('\n') {
+                        buf.push('\n');
+                    }
+                    buf.push('\n');
                 }
                 self.dl = Some(DefinitionListState {
                     items: Vec::new(),
@@ -1053,28 +1096,15 @@ impl<'a> Walker<'a> {
                     defs_for_current_term: 0,
                     in_term: false,
                     in_def: false,
+                    def_split: false,
                 });
             }
             Event::End(TagEnd::DefinitionList) => {
-                // Malformed Markdown can nest definition lists; `self.dl` is
-                // a single slot, so the inner `End` already consumed the
-                // state and the outer `End` arrives with none. The converter
-                // is lossy by design — drop the unmatched terminator instead
-                // of panicking.
                 let Some(state) = self.dl.take() else {
                     return;
                 };
-                if !state.items.is_empty() {
-                    self.out.push_str("@dl\n");
-                    for (term, def) in &state.items {
-                        self.out.push_str(term.trim_end());
-                        self.out.push('\n');
-                        self.out.push_str(": ");
-                        self.out.push_str(def.trim_end());
-                        self.out.push('\n');
-                    }
-                    self.out.push_str("@end\n\n");
-                }
+                self.write_dl(&state.items);
+                self.dl = self.dl_stack.pop();
             }
             Event::Start(Tag::DefinitionListTitle) => {
                 if let Some(d) = self.dl.as_mut() {
@@ -1091,6 +1121,7 @@ impl<'a> Walker<'a> {
             Event::Start(Tag::DefinitionListDefinition) => {
                 if let Some(d) = self.dl.as_mut() {
                     d.in_def = true;
+                    d.def_split = false;
                     d.current_def.clear();
                     d.defs_for_current_term += 1;
                 }
@@ -1113,7 +1144,11 @@ impl<'a> Walker<'a> {
                     d.in_def = false;
                     let term = d.current_term.clone();
                     let def = std::mem::take(&mut d.current_def);
-                    d.items.push((term, def));
+                    // A definition split by a nested list was emitted up to
+                    // the split; only content after the nested list is new.
+                    if !(d.def_split && def.trim().is_empty()) {
+                        d.items.push((term, def));
+                    }
                 }
             }
             Event::Start(Tag::MetadataBlock(kind)) => {
@@ -1157,56 +1192,10 @@ impl<'a> Walker<'a> {
                 self.container_stack.push(Container::HtmlBlock);
             }
             Event::End(TagEnd::HtmlBlock) => {
-                let buf = self.out_stack.pop().expect("html block buffer");
-                let _ = self.container_stack.pop();
-                match classify_details_block(&buf) {
-                    DetailsShape::Closed { summary, body } => {
-                        self.write("@details(summary: \"");
-                        self.write(&escape_brief_string(&summary));
-                        self.write("\")\n");
-                        let body = body.trim_matches('\n');
-                        if !body.is_empty() {
-                            self.write(body);
-                            self.write_char('\n');
-                        }
-                        self.write("@end\n\n");
-                    }
-                    DetailsShape::Open { summary } => {
-                        // The `</details>` will arrive in a later HtmlBlock.
-                        // Stage a Details container that captures any
-                        // blocks rendered in between.
-                        self.out_stack.push(String::new());
-                        self.container_stack.push(Container::Details { summary });
-                    }
-                    DetailsShape::Close => {
-                        // Pop the matching Details container, if any.
-                        let mut closed = false;
-                        if matches!(self.container_stack.last(), Some(Container::Details { .. })) {
-                            let body = self.out_stack.pop().expect("details body buffer");
-                            let container = self.container_stack.pop().expect("details container");
-                            if let Container::Details { summary } = container {
-                                self.write("@details(summary: \"");
-                                self.write(&escape_brief_string(&summary));
-                                self.write("\")\n");
-                                let body = body.trim_matches('\n');
-                                if !body.is_empty() {
-                                    self.write(body);
-                                    self.write_char('\n');
-                                }
-                                self.write("@end\n\n");
-                                closed = true;
-                            }
-                        }
-                        if !closed {
-                            // Stray `</details>` with no opener on the
-                            // stack — fall back to the comment form.
-                            self.fallback_html_block(range.clone(), &buf);
-                        }
-                    }
-                    DetailsShape::Unknown => {
-                        self.fallback_html_block(range.clone(), &buf);
-                    }
-                }
+                let (buf, _) = self
+                    .pop_container(|c| matches!(c, Container::HtmlBlock))
+                    .expect("html block buffer");
+                self.emit_html_block(range, &buf);
             }
             Event::Html(s) => {
                 // Block-level HTML content (between Start/End of HtmlBlock).
@@ -1283,6 +1272,7 @@ impl<'a> Walker<'a> {
     }
 
     fn finish(mut self) -> ConvertResult {
+        self.drain_open_containers();
         // Drain any TODO comments queued by the last block — there's no
         // subsequent Start event to flush them.
         self.flush_pending_hole_comments();
@@ -1297,6 +1287,146 @@ impl<'a> Walker<'a> {
             brief_source: self.out,
             diagnostics: self.diags,
         }
+    }
+
+    /// Where block output currently lands: the innermost open container's
+    /// buffer, else `out`. Unlike `write`, ignores table-cell and
+    /// definition-list redirection.
+    fn top_buf(&mut self) -> &mut String {
+        match self.out_stack.last_mut() {
+            Some(buf) => buf,
+            None => &mut self.out,
+        }
+    }
+
+    /// Pop the innermost container matching `is_kind` with its buffer.
+    /// Only a `<details>` can be left open across a pulldown-cmark End
+    /// event (its close tag is ours to find, not the parser's), so anything
+    /// above the match is drained into its parent first instead of being
+    /// popped in the match's place.
+    fn pop_container(&mut self, is_kind: fn(&Container) -> bool) -> Option<(String, Container)> {
+        if !self.container_stack.iter().any(is_kind) {
+            return None;
+        }
+        while !self.container_stack.last().is_some_and(is_kind) {
+            self.drain_top_container();
+        }
+        let buf = self.out_stack.pop()?;
+        let container = self.container_stack.pop()?;
+        Some((buf, container))
+    }
+
+    /// Close every container still open at the end of the input.
+    fn drain_open_containers(&mut self) {
+        while !self.container_stack.is_empty() {
+            self.drain_top_container();
+        }
+    }
+
+    /// Pop the innermost container and write its buffered content into the
+    /// parent. An unclosed `<details>` keeps its opening HTML as a reported
+    /// HTML-block hole and its content as plain Brief. Other containers are
+    /// always closed by their End event; if one were not, its content is
+    /// still written through rather than dropped.
+    fn drain_top_container(&mut self) {
+        // Holes queued inside the container belong with its content.
+        self.flush_pending_hole_comments();
+        let (Some(buf), Some(container)) = (self.out_stack.pop(), self.container_stack.pop())
+        else {
+            return;
+        };
+        if let Container::Details { opener, range, .. } = container {
+            self.html_block_comment(
+                range,
+                &opener,
+                "unclosed `<details>`: opening HTML preserved inside Brief block comment, content kept as plain Brief".into(),
+            );
+        }
+        self.write(&buf);
+    }
+
+    /// Emit a buffered HTML block: a recognizable `<details>` shape becomes
+    /// `@details`, or opens/closes a multi-event `Details` container;
+    /// anything else takes the TODO + `/* */` comment fallback.
+    fn emit_html_block(&mut self, range: std::ops::Range<usize>, buf: &str) {
+        match classify_details_block(buf) {
+            DetailsShape::Closed {
+                summary,
+                body,
+                rest,
+            } => {
+                self.write_details(&summary, &body);
+                if !rest.is_empty() {
+                    self.emit_html_block(range, &rest);
+                }
+            }
+            DetailsShape::Open {
+                summary,
+                opener,
+                mut body,
+            } => {
+                // The `</details>` will arrive in a later HtmlBlock. Stage a
+                // Details container that captures any blocks rendered in
+                // between, starting with whatever followed the summary here.
+                if !body.is_empty() {
+                    body.push_str("\n\n");
+                }
+                self.out_stack.push(body);
+                self.container_stack.push(Container::Details {
+                    summary,
+                    opener,
+                    range,
+                });
+            }
+            DetailsShape::Close { tag, rest } => {
+                if matches!(self.container_stack.last(), Some(Container::Details { .. })) {
+                    let body = self.out_stack.pop().expect("details body buffer");
+                    if let Some(Container::Details { summary, .. }) = self.container_stack.pop() {
+                        self.write_details(&summary, &body);
+                    }
+                } else {
+                    // Stray `</details>` with no opener on the stack — fall
+                    // back to the comment form.
+                    self.fallback_html_block(range.clone(), &tag);
+                }
+                // Adjacent close tags (`</details></details>` closing nested
+                // blocks) arrive in one HtmlBlock.
+                if !rest.is_empty() {
+                    self.emit_html_block(range, &rest);
+                }
+            }
+            DetailsShape::Unknown => {
+                self.fallback_html_block(range, buf);
+            }
+        }
+    }
+
+    fn write_dl(&mut self, items: &[(String, String)]) {
+        if items.is_empty() {
+            return;
+        }
+        let buf = self.top_buf();
+        buf.push_str("@dl\n");
+        for (term, def) in items {
+            buf.push_str(term.trim_end());
+            buf.push('\n');
+            buf.push_str(": ");
+            buf.push_str(def.trim_end());
+            buf.push('\n');
+        }
+        buf.push_str("@end\n\n");
+    }
+
+    fn write_details(&mut self, summary: &str, body: &str) {
+        self.write("@details(summary: \"");
+        self.write(&escape_brief_string(summary));
+        self.write("\")\n");
+        let body = body.trim_matches('\n');
+        if !body.is_empty() {
+            self.write(body);
+            self.write_char('\n');
+        }
+        self.write("@end\n\n");
     }
 
     /// Convert a byte offset into 1-indexed (line, column).
@@ -1358,11 +1488,15 @@ impl<'a> Walker<'a> {
     /// Emit a buffered HTML block as the existing TODO + `/* */` comment
     /// fallback. Used when the block isn't a recognizable `<details>`.
     fn fallback_html_block(&mut self, range: std::ops::Range<usize>, buf: &str) {
-        self.push_diag(
-            Hole::HtmlBlock,
+        self.html_block_comment(
             range,
+            buf,
             "HTML block preserved inside Brief block comment".into(),
         );
+    }
+
+    fn html_block_comment(&mut self, range: std::ops::Range<usize>, buf: &str, note: String) {
+        self.push_diag(Hole::HtmlBlock, range, note);
         // Flush the pending hole comment (just pushed by push_diag) so it
         // appears immediately before the block comment, not deferred.
         self.flush_pending_hole_comments();
@@ -1535,18 +1669,25 @@ fn escape_brief_string(s: &str) -> String {
 /// Returns `DetailsShape::Closed` when the buffer fully wraps a
 /// `<details>...</details>` block; `DetailsShape::Open` when the buffer
 /// is the *opening* fragment of a multi-event `<details>` block (the
-/// closing `</details>` will arrive in a later HtmlBlock); `Unknown`
-/// otherwise.
+/// closing `</details>` will arrive in a later HtmlBlock); `Close` for a
+/// fragment that starts with `</details>`; `Unknown` otherwise. Every byte
+/// of the fragment outside the recognized tags lands in a returned body or
+/// `rest`, so nothing is dropped.
 fn classify_details_block(buf: &str) -> DetailsShape {
+    const CLOSE: &str = "</details>";
     let trimmed = buf.trim();
     let lower = trimmed.to_ascii_lowercase();
     let starts_open = lower.starts_with("<details>")
         || lower.starts_with("<details ")
         || lower.starts_with("<details\n");
-    let only_close = lower == "</details>" || lower.starts_with("</details>");
-    if only_close && !starts_open {
-        // Bare close fragment; caller will pop a Details container.
-        return DetailsShape::Close;
+    if lower.starts_with(CLOSE) {
+        // Bare close fragment; caller will pop a Details container. ASCII
+        // lowercasing keeps byte offsets, so the tag length indexes
+        // `trimmed` too.
+        return DetailsShape::Close {
+            tag: trimmed[..CLOSE.len()].to_string(),
+            rest: trimmed[CLOSE.len()..].trim().to_string(),
+        };
     }
     if !starts_open {
         return DetailsShape::Unknown;
@@ -1559,33 +1700,59 @@ fn classify_details_block(buf: &str) -> DetailsShape {
     // Strip a single optional leading newline.
     let inner = inner.strip_prefix('\n').unwrap_or(inner);
     let summary = extract_summary(inner);
-    let body_start = match summary.as_ref() {
-        Some((_, end)) => *end,
-        None => 0,
+    // Text between `<details>` and `<summary>` is body content too.
+    let (summary_text, before_summary, after_summary) = match summary {
+        Some(((text, len), end)) => (text, inner[..end - len].trim(), &inner[end..]),
+        None => (String::new(), "", inner),
     };
-    let after_summary = &inner[body_start..];
+    let join_body = |main: &str| {
+        let main = main.trim_matches('\n');
+        if before_summary.is_empty() {
+            main.to_string()
+        } else if main.is_empty() {
+            before_summary.to_string()
+        } else {
+            format!("{}\n{}", before_summary, main)
+        }
+    };
     // Look for matching `</details>` at the end of the buffer (case-insensitive).
     let lower_after = after_summary.to_ascii_lowercase();
-    if let Some(close_idx) = lower_after.rfind("</details>") {
-        let body = after_summary[..close_idx].trim_matches('\n').to_string();
-        let summary_text = summary.map(|((s, _), _)| s).unwrap_or_default();
+    if let Some(close_idx) = lower_after.rfind(CLOSE) {
         DetailsShape::Closed {
             summary: summary_text,
-            body,
+            body: join_body(&after_summary[..close_idx]),
+            rest: after_summary[close_idx + CLOSE.len()..].trim().to_string(),
         }
     } else {
         // Opener without close — defer body to a Details container.
-        let summary_text = summary.map(|((s, _), _)| s).unwrap_or_default();
+        let opener_len = trimmed.len() - after_summary.len();
         DetailsShape::Open {
             summary: summary_text,
+            opener: trimmed[..opener_len].to_string(),
+            body: join_body(after_summary),
         }
     }
 }
 
 enum DetailsShape {
-    Closed { summary: String, body: String },
-    Open { summary: String },
-    Close,
+    /// `rest` is whatever followed the closing tag in the same fragment.
+    Closed {
+        summary: String,
+        body: String,
+        rest: String,
+    },
+    /// `opener` is the raw HTML up to the end of the summary; `body` is the
+    /// content that followed it in the same fragment.
+    Open {
+        summary: String,
+        opener: String,
+        body: String,
+    },
+    /// `tag` is the close tag as written; `rest` is whatever followed it.
+    Close {
+        tag: String,
+        rest: String,
+    },
     Unknown,
 }
 

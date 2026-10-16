@@ -3,16 +3,17 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use brief::config;
+mod fmt_cmd;
+
+use brief::ast::Document;
 use brief::diag::{Severity, render_all};
 use brief::emit::{html, llm};
 use brief::lexer;
 use brief::parser;
-use brief::shortcode::Registry;
+use brief::project::{Project, read_source};
 use brief::span::SourceMap;
-use brief::validate;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -83,25 +84,10 @@ enum Cmd {
         #[arg(long)]
         no_strict: bool,
     },
-    /// Reformat Brief source(s) according to the canonical style.
+    /// Reformat Brief sources in place according to the canonical style.
     /// gofmt-doctrine: no config beyond an explicit opt-in for the
     /// controversial frontmatter sort.
-    Fmt {
-        /// One or more `.brf` inputs. With no inputs, reads from stdin and
-        /// writes formatted output to stdout.
-        inputs: Vec<PathBuf>,
-        /// Exit non-zero (and list affected paths to stderr) if any input
-        /// would be changed by formatting. Mutually exclusive with `--write`.
-        #[arg(long, conflicts_with = "write")]
-        check: bool,
-        /// Rewrite each input in place. Mutually exclusive with `--check`.
-        #[arg(long)]
-        write: bool,
-        /// Sort top-level frontmatter keys alphabetically. Off by default
-        /// — re-emitting the TOML loses comment positions.
-        #[arg(long)]
-        sort_frontmatter: bool,
-    },
+    Fmt(fmt_cmd::FmtArgs),
     /// Watch files/dirs and recompile on change. 100ms debounce. Whole-file
     /// recompile only.
     Watch {
@@ -163,12 +149,7 @@ fn main() -> ExitCode {
             force,
             no_strict,
         } => run_convert(inputs, output, stdout, force, no_strict),
-        Cmd::Fmt {
-            inputs,
-            check,
-            write,
-            sort_frontmatter,
-        } => run_fmt(inputs, check, write, sort_frontmatter),
+        Cmd::Fmt(args) => fmt_cmd::run(args),
         Cmd::Watch {
             paths,
             target,
@@ -202,23 +183,17 @@ fn run_watch(
     no_clear: bool,
 ) -> ExitCode {
     use brief::watch::{LlmOpts, Target as WatchTarget, WatchOpts};
-    let config_path = cfg_path.unwrap_or_else(|| PathBuf::from("brief.toml"));
+    // Without `--target`, each file takes its own project's
+    // `compile.default_target`, exactly as `brief compile` would.
     let target = match target {
-        Some(t) => t,
-        None => config::load(&config_path)
-            .ok()
-            .and_then(|c| c.compile.default_target)
-            .unwrap_or_else(|| "html".to_string()),
-    };
-    let target = match WatchTarget::parse(&target) {
-        Some(t) => t,
-        None => {
-            eprintln!(
-                "brief: unknown target `{}` (expected html, llm, json)",
-                target
-            );
-            return ExitCode::from(2);
-        }
+        None => None,
+        Some(t) => match WatchTarget::parse(&t) {
+            Some(t) => Some(t),
+            None => {
+                eprintln!("brief: unknown target `{}` (expected html, llm, json)", t);
+                return ExitCode::from(2);
+            }
+        },
     };
     let paths = if paths.is_empty() {
         vec![PathBuf::from(".")]
@@ -228,7 +203,7 @@ fn run_watch(
     let opts = WatchOpts {
         paths,
         target,
-        config_path,
+        config_override: cfg_path,
         llm_opts: LlmOpts {
             strip_emphasis,
             keep_table_rule,
@@ -257,14 +232,13 @@ fn run_compile(
     write: bool,
     output_path: Option<PathBuf>,
 ) -> ExitCode {
-    let raw = match std::fs::read_to_string(&input) {
+    let raw = match read_source(&input) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("brief: cannot read {}: {}", input.display(), e);
             return ExitCode::from(2);
         }
     };
-    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw).to_string();
 
     let is_markdown = input.extension().and_then(|s| s.to_str()) == Some("md");
 
@@ -293,80 +267,25 @@ fn run_compile(
 
     let src = SourceMap::new(input.to_string_lossy(), source);
 
-    let cfg = match cfg_path {
-        Some(p) => match config::load(&p) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("brief: bad config {}: {}", p.display(), e);
-                return ExitCode::from(2);
-            }
-        },
-        None => {
-            let candidate = std::path::Path::new("brief.toml");
-            if candidate.exists() {
-                match config::load(candidate) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("brief: bad brief.toml: {}", e);
-                        return ExitCode::from(2);
-                    }
-                }
-            } else {
-                config::Config::default()
-            }
+    let project = match Project::discover(&input, cfg_path.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("brief: {}", e);
+            return ExitCode::from(2);
         }
     };
-    let registry: Registry = config::registry_from(&cfg);
+    let cfg = &project.config;
+    let registry = &project.registry;
     let target = target
         .or_else(|| cfg.compile.default_target.clone())
         .unwrap_or_else(|| "html".to_string());
-    let opts = validate::ValidateOpts {
-        strict_heading_levels: cfg.compile.strict_heading_levels,
-    };
 
-    let abs_input = input.canonicalize().unwrap_or_else(|_| input.clone());
-    let project = match discover_project(&abs_input) {
-        Ok(p) => p,
-        Err(()) => return ExitCode::from(1),
-    };
-
-    let tokens = match lexer::lex(&src) {
-        Ok(t) => t,
-        Err(d) => {
-            eprint!("{}", render_all(&d, &src));
-            return ExitCode::from(1);
-        }
-    };
-    let (mut doc, mut diags) = parser::parse(tokens, &src);
-    let resolve_project = project.as_ref().map(|(root, idx)| {
-        let rel = abs_input
-            .strip_prefix(root)
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|_| input.clone());
-        (idx, rel)
-    });
-    let project_ref = resolve_project
-        .as_ref()
-        .map(|(idx, rel)| brief::resolve::ResolveProject {
-            index: idx,
-            current: rel.as_path(),
-        });
-    diags.extend(brief::resolve::resolve_with_project(
-        &mut doc,
-        &registry,
-        project_ref.as_ref(),
-    ));
-    diags.extend(validate::validate(&doc, &opts, &src));
-    let has_errors = diags.iter().any(|d| d.severity == Severity::Error);
-    if has_errors {
-        eprint!("{}", render_all(&diags, &src));
+    let Some(doc) = check_and_report(&project, &input, &src, || {}) else {
         return ExitCode::from(1);
-    } else if !diags.is_empty() {
-        eprint!("{}", render_all(&diags, &src));
-    }
+    };
 
     let output = match target.as_str() {
-        "html" => html::render(&doc, &registry),
+        "html" => html::render(&doc, registry),
         "llm" => {
             let lopts = llm::Opts {
                 strip_emphasis,
@@ -377,7 +296,7 @@ fn run_compile(
                 minify_languages: cfg.compile.llm.minify_languages.clone(),
                 preserve_code_fences: cfg.compile.llm.preserve_code_fences,
             };
-            let (out, warnings) = llm::render(&doc, &registry, &lopts);
+            let (out, warnings) = llm::render(&doc, registry, &lopts);
             for w in &warnings {
                 eprintln!("brief: {}", w);
             }
@@ -402,9 +321,7 @@ fn run_compile(
     };
 
     match &dst {
-        None => {
-            print!("{}", output);
-        }
+        None => write_stdout(&output),
         Some(path) => {
             // `-w` derives the output extension from the target (llm -> .txt),
             // so compiling a `.txt` input would silently replace the source.
@@ -438,32 +355,45 @@ fn run_compile(
     ExitCode::SUCCESS
 }
 
-/// Discover the project root above `abs_input` and build its index,
-/// surfacing lex/parse errors from the pre-pass. Each set of diagnostics is
-/// rendered against its own SourceMap so that line numbers and source
-/// excerpts refer to the correct file. `Err(())` means an indexed file
-/// failed to lex/parse (already rendered to stderr).
-fn discover_project(
-    abs_input: &std::path::Path,
-) -> Result<Option<(PathBuf, brief::project::ProjectIndex)>, ()> {
-    let Some(root) = brief::project::discover_root(abs_input) else {
-        return Ok(None);
+/// Run the shared front-end over `src` (the contents of `input`) in
+/// `project` and print its diagnostics to stderr. A broken file elsewhere in
+/// the project only matters when `src` `@ref`s it (B0605); its own
+/// diagnostics then follow, so the user sees why. Returns the checked
+/// document, or `None` after calling `on_errors` and printing the report.
+fn check_and_report(
+    project: &Project,
+    input: &Path,
+    src: &SourceMap,
+    on_errors: impl FnOnce(),
+) -> Option<Document> {
+    let index = project.index();
+    let (index, index_diags) = match &index {
+        Some((idx, diags)) => (Some(idx), diags.as_slice()),
+        None => (None, &[][..]),
     };
-    let (idx, prepass_diags) = brief::project::build_index(&root);
-    let mut has_err = false;
-    for fd in &prepass_diags {
-        if fd.diagnostics.is_empty() {
-            continue;
-        }
-        if fd.diagnostics.iter().any(|d| d.severity == Severity::Error) {
-            has_err = true;
-        }
-        eprint!("{}", render_all(&fd.diagnostics, &fd.source));
+    let checked = project.check(src, index, project.rel_path(input).as_deref());
+    let report = checked.render(src, index_diags);
+    if checked.has_errors() {
+        on_errors();
+        eprint!("{}", report);
+        return None;
     }
-    if has_err {
-        Err(())
-    } else {
-        Ok(Some((root, idx)))
+    eprint!("{}", report);
+    checked.doc
+}
+
+/// Write `text` to stdout. A closed pipe (`brief compile big.brf | head`)
+/// means the reader has all it wants, so exit 0 quietly rather than abort
+/// the way `print!` does. Any other write failure exits 2.
+fn write_stdout(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("brief: cannot write to stdout: {}", e);
+        std::process::exit(2);
     }
 }
 
@@ -520,7 +450,7 @@ fn run_convert(
     let multi = inputs.len() > 1;
 
     for input in &inputs {
-        let raw = match std::fs::read_to_string(input) {
+        let raw = match read_source(input) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
@@ -591,9 +521,7 @@ fn run_convert(
         };
 
         match dest {
-            None => {
-                print!("{}", converted);
-            }
+            None => write_stdout(&converted),
             Some(path) => {
                 if path.exists() && !force {
                     eprintln!(
@@ -652,91 +580,6 @@ fn run_convert(
     }
 }
 
-fn run_fmt(inputs: Vec<PathBuf>, check: bool, write: bool, sort_frontmatter: bool) -> ExitCode {
-    use brief::fmt;
-    use std::io::Read;
-
-    let opts = fmt::Opts { sort_frontmatter };
-
-    if inputs.is_empty() {
-        // Stdin → stdout. `--write` is meaningless here; `--check` is honored.
-        if write {
-            eprintln!("brief: --write requires at least one input file");
-            return ExitCode::from(2);
-        }
-        let mut buf = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-            eprintln!("brief: cannot read stdin: {}", e);
-            return ExitCode::from(2);
-        }
-        let formatted = fmt::format(&buf, &opts);
-        if check {
-            if formatted != buf {
-                eprintln!("brief: <stdin> would be reformatted");
-                return ExitCode::from(1);
-            }
-            return ExitCode::SUCCESS;
-        }
-        print!("{}", formatted);
-        return ExitCode::SUCCESS;
-    }
-
-    let multi = inputs.len() > 1;
-    let mut errors: usize = 0;
-    let mut would_change: usize = 0;
-
-    for input in &inputs {
-        let raw = match std::fs::read_to_string(input) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("brief: cannot read {}: {}", input.display(), e);
-                errors += 1;
-                continue;
-            }
-        };
-        let formatted = fmt::format(&raw, &opts);
-        if check {
-            if formatted != raw {
-                // Print a unified diff to stdout (matching gofmt's convention).
-                let diff = similar::TextDiff::from_lines(&raw, &formatted);
-                let mut udiff = diff.unified_diff();
-                udiff.header(
-                    &format!("{} (original)", input.display()),
-                    &format!("{} (formatted)", input.display()),
-                );
-                print!("{}", udiff);
-                would_change += 1;
-            }
-        } else if write {
-            if formatted == raw {
-                continue;
-            }
-            if let Err(e) = std::fs::write(input, &formatted) {
-                eprintln!("brief: cannot write {}: {}", input.display(), e);
-                errors += 1;
-            }
-        } else {
-            // Default mode: print to stdout. With multiple inputs that
-            // would interleave; refuse it the way gofmt does.
-            if multi {
-                eprintln!(
-                    "brief: refusing to print multiple files to stdout; pass --write or --check"
-                );
-                return ExitCode::from(2);
-            }
-            print!("{}", formatted);
-        }
-    }
-
-    if errors > 0 {
-        return ExitCode::from(2);
-    }
-    if check && would_change > 0 {
-        return ExitCode::from(1);
-    }
-    ExitCode::SUCCESS
-}
-
 fn default_output_path(input: &std::path::Path) -> PathBuf {
     match input.extension().and_then(|s| s.to_str()) {
         Some("md") => input.with_extension("brf"),
@@ -753,90 +596,30 @@ fn default_output_path(input: &std::path::Path) -> PathBuf {
 
 /// Convert one `.brf` input to Markdown.
 ///
-/// Runs the full compile front-end (lex → parse → resolve → validate) so
-/// `@ref` targets and shortcode arguments obey the same rules as
-/// `brief compile`, then emits Markdown. Prints failure details to stderr
-/// and returns `Err(())` when the source does not compile or the strict
-/// round-trip self-test rejects the output.
-fn convert_reverse(
-    input: &std::path::Path,
-    raw: &str,
-    no_strict: bool,
-) -> Result<(String, Vec<String>), ()> {
-    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+/// Runs the same front-end as `brief compile`, in the input's own project,
+/// so `@ref` targets and shortcode arguments obey the same rules, then
+/// emits Markdown. Prints failure details to stderr and returns `Err(())`
+/// when the source does not compile or the strict round-trip self-test
+/// rejects the output.
+fn convert_reverse(input: &Path, raw: &str, no_strict: bool) -> Result<(String, Vec<String>), ()> {
     let src = SourceMap::new(input.to_string_lossy(), raw.to_string());
 
-    // Same config fallback as `run_compile` with no `--config`: a brief.toml
-    // in the working directory, else defaults. Custom shortcodes need their
-    // `template_html` for the Markdown fallback expansion.
-    let cfg = {
-        let candidate = std::path::Path::new("brief.toml");
-        if candidate.exists() {
-            match config::load(candidate) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("brief: {} → FAILED: bad brief.toml: {}", input.display(), e);
-                    return Err(());
-                }
-            }
-        } else {
-            config::Config::default()
-        }
-    };
-    let registry = config::registry_from(&cfg);
-
-    let abs_input = input.canonicalize().unwrap_or_else(|_| input.to_path_buf());
-    let project = match discover_project(&abs_input) {
+    // Custom shortcodes need their `template_html` for the Markdown
+    // fallback expansion, so the project's config matters here too.
+    let project = match Project::discover(input, None) {
         Ok(p) => p,
-        Err(()) => {
-            eprintln!(
-                "brief: {} → FAILED: project pre-pass reported errors",
-                input.display()
-            );
+        Err(e) => {
+            eprintln!("brief: {} → FAILED: {}", input.display(), e);
             return Err(());
         }
     };
-
-    let tokens = match lexer::lex(&src) {
-        Ok(t) => t,
-        Err(d) => {
-            eprintln!("brief: {} → FAILED:", input.display());
-            eprint!("{}", render_all(&d, &src));
-            return Err(());
-        }
-    };
-    let (mut doc, mut diags) = parser::parse(tokens, &src);
-    let resolve_project = project.as_ref().map(|(root, idx)| {
-        let rel = abs_input
-            .strip_prefix(root)
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|_| input.to_path_buf());
-        (idx, rel)
-    });
-    let project_ref = resolve_project
-        .as_ref()
-        .map(|(idx, rel)| brief::resolve::ResolveProject {
-            index: idx,
-            current: rel.as_path(),
-        });
-    diags.extend(brief::resolve::resolve_with_project(
-        &mut doc,
-        &registry,
-        project_ref.as_ref(),
-    ));
-    let opts = validate::ValidateOpts {
-        strict_heading_levels: cfg.compile.strict_heading_levels,
-    };
-    diags.extend(validate::validate(&doc, &opts, &src));
-    if diags.iter().any(|d| d.severity == Severity::Error) {
-        eprintln!("brief: {} → FAILED:", input.display());
-        eprint!("{}", render_all(&diags, &src));
+    let Some(doc) = check_and_report(&project, input, &src, || {
+        eprintln!("brief: {} → FAILED:", input.display())
+    }) else {
         return Err(());
-    } else if !diags.is_empty() {
-        eprint!("{}", render_all(&diags, &src));
-    }
+    };
 
-    let result = brief::convert::to_markdown(&doc, &registry, &src);
+    let result = brief::convert::to_markdown(&doc, &project.registry, &src);
 
     // Strict-by-default: the emitted Markdown must survive the forward
     // converter and compile back to valid Brief. Skipped on --no-strict.

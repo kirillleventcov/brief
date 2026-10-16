@@ -352,7 +352,13 @@ fn compile_unknown_config_key_is_an_error() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("bad brief.toml"), "{}", stderr);
+    let cfg = dir.canonicalize().unwrap().join("brief.toml");
+    assert!(
+        stderr.starts_with(&format!("brief: bad config {}: ", cfg.display())),
+        "{}",
+        stderr
+    );
+    assert!(stderr.contains("typo_key"), "{}", stderr);
 }
 
 #[test]
@@ -374,7 +380,7 @@ fn compile_respects_default_target_from_config() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains("<h1>"),
+        !stdout.contains("<h1"),
         "llm target must not emit HTML: {}",
         stdout
     );
@@ -400,7 +406,7 @@ fn compile_explicit_target_overrides_config_default() {
         .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("<h1>"), "{}", stdout);
+    assert!(stdout.contains("<h1 id=\"hi\">Hi</h1>"), "{}", stdout);
 }
 
 #[test]
@@ -539,4 +545,56 @@ fn reverse_ref_resolves_in_project() {
     );
     let md = std::fs::read_to_string(dir.join("a.md")).unwrap();
     assert_eq!(md, "See [Anchor](b.md#top).\n");
+}
+
+// ------------------------------------------------------------- closed pipes
+
+/// Run `brief <args>` with stdout piped, read 10 bytes, then close the
+/// pipe, the way `| head -c 10` does.
+fn run_into_closed_pipe(args: &[&std::ffi::OsStr]) -> std::process::Output {
+    use std::io::Read;
+    let mut child = Command::new(brief_bin())
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut head = [0u8; 10];
+    child.stdout.take().unwrap().read_exact(&mut head).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// Far more output than a pipe buffers, so the writer must hit the
+/// closed pipe.
+fn big_doc(dir: &std::path::Path) -> PathBuf {
+    let input = dir.join("big.brf");
+    let mut src = String::from("# Big\n\n");
+    for i in 0..20_000 {
+        src.push_str(&format!("Paragraph number {} with some text.\n\n", i));
+    }
+    std::fs::write(&input, src).unwrap();
+    input
+}
+
+#[test]
+fn compile_into_closed_pipe_exits_quietly() {
+    let dir = temp_dir("closed_pipe_compile");
+    let input = big_doc(&dir);
+    let out = run_into_closed_pipe(&["compile".as_ref(), input.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}
+
+#[test]
+fn convert_stdout_into_closed_pipe_exits_quietly() {
+    let dir = temp_dir("closed_pipe_convert");
+    let input = big_doc(&dir);
+    let out = run_into_closed_pipe(&[
+        "convert".as_ref(),
+        input.as_os_str(),
+        "--stdout".as_ref(),
+        "--no-strict".as_ref(),
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
 }

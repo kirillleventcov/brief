@@ -1,17 +1,20 @@
 use crate::ast::{Block, CodeAttrs, Document, Inline, ListItem, Row, ShortArgs, TaskState};
 use crate::diag::{Code, Diagnostic};
-use crate::inline::{parse_args, parse_inline};
+use crate::inline::{Seg, parse_args, parse_inline, parse_inline_joined};
 use crate::span::{SourceMap, Span};
 use crate::token::{Token, TokenKind};
+use std::ops::Range;
 
 pub fn parse(tokens: Vec<Token>, src: &SourceMap) -> (Document, Vec<Diagnostic>) {
-    let (metadata, fm_consumed, fm_diags) = parse_frontmatter(&tokens, src);
+    let (metadata, fm_consumed, fm_body, fm_diags) = parse_frontmatter(&tokens, src);
     let mut p = Parser {
         src,
         toks: tokens,
         pos: fm_consumed,
         diags: fm_diags,
         depth: 0,
+        verbatim: fm_body.into_iter().collect(),
+        seg_buf: Vec::new(),
     };
     let mut blocks = p.parse_blocks(0, None);
     // Anything left after a top-level parse must be a stray `@end`.
@@ -31,21 +34,28 @@ pub fn parse(tokens: Vec<Token>, src: &SourceMap) -> (Document, Vec<Diagnostic>)
             }
         }
     }
+    let mut diags = p.tab_diagnostics();
+    diags.append(&mut p.diags);
     (
         Document {
             blocks,
             metadata,
             resolved_refs: Default::default(),
         },
-        p.diags,
+        diags,
     )
 }
 
 fn parse_frontmatter(
     toks: &[Token],
     src: &SourceMap,
-) -> (Option<toml::Table>, usize, Vec<Diagnostic>) {
-    // Returns (metadata, tokens_consumed, diagnostics).
+) -> (
+    Option<toml::Table>,
+    usize,
+    Option<Range<usize>>,
+    Vec<Diagnostic>,
+) {
+    // Returns (metadata, tokens_consumed, body_tokens, diagnostics).
     //
     // Frontmatter must be the very first content. We detect it by checking
     // that the first token is `Line("+++")` at byte offset 0 with indent 0.
@@ -53,7 +63,7 @@ fn parse_frontmatter(
     // or a non-`+++` line), there is no frontmatter and we return
     // (None, 0, empty).
     if toks.is_empty() {
-        return (None, 0, Vec::new());
+        return (None, 0, None, Vec::new());
     }
     let first = &toks[0];
     let opens = match first.kind {
@@ -63,7 +73,7 @@ fn parse_frontmatter(
         _ => false,
     };
     if !opens {
-        return (None, 0, Vec::new());
+        return (None, 0, None, Vec::new());
     }
 
     // Body starts at the first byte after `+++\n` (or `+++\r\n`).
@@ -82,7 +92,7 @@ fn parse_frontmatter(
                     Diagnostic::new(Code::UnterminatedFrontmatter, first.span)
                         .label("frontmatter opened with `+++` is never closed"),
                 );
-                return (None, idx, diags);
+                return (None, idx, None, diags);
             }
             TokenKind::Line
                 if toks[idx].indent == 0 && &src.source[toks[idx].span.range()] == "+++" =>
@@ -90,21 +100,32 @@ fn parse_frontmatter(
                 let close = &toks[idx];
                 let body_end = close.span.start as usize;
                 let body = &src.source[body_start..body_end];
+                // TOML is opaque to Brief: its tabs are not Brief's to ban.
+                let body_toks = Some(1..idx);
                 idx += 1; // consume the closing `+++`
                 match toml::from_str::<toml::Table>(body) {
-                    Ok(t) => return (Some(t), idx, diags),
+                    Ok(t) => return (Some(t), idx, body_toks, diags),
                     Err(e) => {
                         let (off, len) = match e.span() {
                             Some(r) => (body_start + r.start, r.end - r.start),
                             None => (body_start, body.len()),
                         };
-                        // `.max(1)` keeps the diagnostic caret renderable; a
-                        // zero-length span produces no caret in the error UI.
-                        let span = Span::new(off, len.max(1));
+                        // A zero-length span gets the width of the character
+                        // it points at so the caret renders without
+                        // splitting a multibyte character.
+                        let len = if len == 0 {
+                            src.source
+                                .get(off..)
+                                .and_then(|s| s.chars().next())
+                                .map_or(0, char::len_utf8)
+                        } else {
+                            len
+                        };
+                        let span = Span::new(off, len);
                         diags.push(
                             Diagnostic::new(Code::FrontmatterToml, span).label(e.to_string()),
                         );
-                        return (None, idx, diags);
+                        return (None, idx, body_toks, diags);
                     }
                 }
             }
@@ -117,14 +138,14 @@ fn parse_frontmatter(
         Diagnostic::new(Code::UnterminatedFrontmatter, first.span)
             .label("frontmatter opened with `+++` is never closed"),
     );
-    (None, idx, diags)
+    (None, idx, None, diags)
 }
 
 /// Blocks may nest via list children, block shortcodes, and blockquote
 /// markers. Each level recurses on the native stack, so nesting must be
 /// bounded or hostile/degenerate input aborts the process with a stack
 /// overflow instead of a diagnostic.
-const MAX_NESTING_DEPTH: usize = 64;
+pub(crate) const MAX_NESTING_DEPTH: usize = 64;
 
 struct Parser<'a> {
     src: &'a SourceMap,
@@ -132,6 +153,12 @@ struct Parser<'a> {
     pos: usize,
     diags: Vec<Diagnostic>,
     depth: usize,
+    /// Token ranges whose lines reach the output byte-for-byte (code fence
+    /// and `@code` bodies, frontmatter), in source order. Tabs are legal
+    /// there and trailing spaces are kept.
+    verbatim: Vec<Range<usize>>,
+    /// Scratch for `parse_paragraph`'s segment table.
+    seg_buf: Vec<Seg>,
 }
 
 impl<'a> Parser<'a> {
@@ -144,8 +171,60 @@ impl<'a> Parser<'a> {
     fn line(&self, tok: &Token) -> &'a str {
         &self.src.source[tok.span.range()]
     }
+    /// The whole source line of token `idx` with only its terminator (`\n`
+    /// or `\r\n`) removed: trailing spaces and tabs intact. Verbatim bodies
+    /// read this; everything else reads the lexer's trimmed `line`. The
+    /// lexer emits one token per line, so the next token starts right
+    /// after this line's newline.
+    fn raw_line(&self, idx: usize) -> &'a str {
+        let src = self.src.source.as_str();
+        let start = self.toks[idx].span.start as usize;
+        let next = self
+            .toks
+            .get(idx + 1)
+            .map_or(src.len(), |t| t.span.start as usize);
+        let line = &src[start..next];
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        line.strip_suffix('\r').unwrap_or(line)
+    }
     fn at_eof(&self) -> bool {
         matches!(self.peek().kind, TokenKind::Eof)
+    }
+
+    /// B0102 for every tab outside a verbatim region. This runs after the
+    /// parse because only the parser knows which lines are code: a tab in
+    /// a Go or Makefile fence is content, not indentation. Tokens carry no
+    /// tab flag (an extra field costs the lexer's push loop ~35%), so lines
+    /// are rescanned, but only in a document that holds a tab at all.
+    fn tab_diagnostics(&self) -> Vec<Diagnostic> {
+        let mut out = Vec::new();
+        if !self.src.source.contains('\t') {
+            return out;
+        }
+        let mut regions = self.verbatim.iter().peekable();
+        for (i, tok) in self.toks.iter().enumerate() {
+            if matches!(tok.kind, TokenKind::Eof) {
+                continue;
+            }
+            let raw = self.raw_line(i);
+            if !raw.as_bytes().contains(&b'\t') {
+                continue;
+            }
+            while regions.next_if(|r| r.end <= i).is_some() {}
+            if regions.peek().is_some_and(|r| r.contains(&i)) {
+                continue;
+            }
+            let start = tok.span.start as usize;
+            for (j, b) in raw.bytes().enumerate() {
+                if b == b'\t' {
+                    out.push(
+                        Diagnostic::new(Code::TabCharacter, Span::new(start + j, 1))
+                            .help("tabs are forbidden; use two spaces per indent level"),
+                    );
+                }
+            }
+        }
+        out
     }
 
     fn parse_blocks(&mut self, base_indent: u16, end_at_indent_below: Option<u16>) -> Vec<Block> {
@@ -233,7 +312,7 @@ impl<'a> Parser<'a> {
                         self.pos += 1;
                         continue;
                     }
-                    if trimmed.starts_with("/*") {
+                    if opens_block_comment(trimmed) {
                         self.consume_block_comment(trimmed);
                         continue;
                     }
@@ -313,14 +392,18 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             return;
         }
+        let open = *self.peek();
         self.pos += 1;
         loop {
             let tok = *self.peek();
             match tok.kind {
                 TokenKind::Eof => {
+                    // Point at the opener: that is the line to fix, and the
+                    // whole rest of the file hangs on it.
+                    let at = Span::new(open.span.start as usize + open.indent as usize, 2);
                     self.diags.push(
-                        Diagnostic::new(Code::UnterminatedBlock, tok.span)
-                            .label("unterminated /* */ comment"),
+                        Diagnostic::new(Code::UnterminatedComment, at)
+                            .label("comment opened here is never closed"),
                     );
                     return;
                 }
@@ -413,7 +496,15 @@ impl<'a> Parser<'a> {
         // owned `text` accumulator when a second line (or a hard break)
         // makes joining unavoidable.
         let mut single: Option<&'a str> = None;
-        let mut hard_break_indices: Vec<usize> = Vec::new();
+        // (end of the line's text in `text`, source offset of its `\`).
+        let mut hard_breaks: Vec<(usize, usize)> = Vec::new();
+        // Where each joined line starts in `text` and in the source. The
+        // buffer is reused across paragraphs to keep allocation off the
+        // common path.
+        let mut segs = std::mem::take(&mut self.seg_buf);
+        segs.clear();
+        // Source offset just past the previous line's hard-break `\`.
+        let mut after_backslash: Option<u32> = None;
         let mut first_line = true;
         loop {
             let tok = *self.peek();
@@ -433,21 +524,41 @@ impl<'a> Parser<'a> {
                         Some(rest) => (rest, true),
                         None => (trimmed, false),
                     };
+                    let source = tok.span.start + indent as u32;
                     if first_line && !hard {
                         single = Some(line_text);
                     } else {
                         if let Some(prev) = single.take() {
+                            segs.push(Seg {
+                                joined: 0,
+                                source: first.span.start + indent as u32,
+                            });
                             text.push_str(prev);
                         }
                         if !text.is_empty() {
+                            // The joining space stands for the line break.
+                            // After a plain line the previous segment already
+                            // maps it there; after a hard break the `\` sits
+                            // in between, so it needs a segment of its own.
+                            if let Some(source) = after_backslash {
+                                segs.push(Seg {
+                                    joined: text.len() as u32,
+                                    source,
+                                });
+                            }
                             text.push(' ');
                         }
+                        segs.push(Seg {
+                            joined: text.len() as u32,
+                            source,
+                        });
                         if hard {
-                            hard_break_indices.push(text.len() + line_text.len());
+                            hard_breaks.push((text.len() + line_text.len(), tok.span.end() - 1));
                         }
                         text.push_str(line_text);
                     }
                     first_line = false;
+                    after_backslash = hard.then(|| tok.span.end() as u32);
                     span = span.join(tok.span);
                     self.pos += 1;
                 }
@@ -455,6 +566,7 @@ impl<'a> Parser<'a> {
             }
         }
         if let Some(s) = single {
+            self.seg_buf = segs;
             let base = first.span.start + first.indent as u32;
             let (content, d) = parse_inline(s, base);
             self.diags.extend(d);
@@ -462,21 +574,21 @@ impl<'a> Parser<'a> {
         }
         let mut content: Vec<Inline> = Vec::new();
         let mut cursor = 0usize;
-        let base = first.span.start + first.indent as u32;
-        for hb in &hard_break_indices {
-            let chunk = &text[cursor..*hb];
-            let (mut inl, d) = parse_inline(chunk, base + cursor as u32);
+        for &(hb, backslash) in &hard_breaks {
+            let chunk = &text[cursor..hb];
+            let (mut inl, d) = parse_inline_joined(chunk, cursor, &segs);
             self.diags.extend(d);
             content.append(&mut inl);
             content.push(Inline::HardBreak {
-                span: Span::new(base as usize + *hb, 1),
+                span: Span::new(backslash, 1),
             });
-            cursor = *hb;
+            cursor = hb;
         }
         let chunk = &text[cursor..];
-        let (mut inl, d) = parse_inline(chunk, base + cursor as u32);
+        let (mut inl, d) = parse_inline_joined(chunk, cursor, &segs);
         self.diags.extend(d);
         content.append(&mut inl);
+        self.seg_buf = segs;
         Block::Paragraph { content, span }
     }
 
@@ -500,6 +612,7 @@ impl<'a> Parser<'a> {
         }
         let info_offset = open.span.start as usize + indent + 3;
         let (lang, attrs) = parse_fence_info(after, info_offset as u32, open.span, &mut self.diags);
+        let body_start = self.pos;
         let mut body = String::new();
         let mut span = open.span;
         loop {
@@ -510,21 +623,17 @@ impl<'a> Parser<'a> {
                         Diagnostic::new(Code::UnterminatedFence, open.span)
                             .label("fence opened here is never closed"),
                     );
+                    self.verbatim.push(body_start..self.pos);
                     break;
                 }
-                TokenKind::Blank => {
-                    body.push('\n');
+                TokenKind::Line if self.line(&tok).trim() == "```" => {
                     span = span.join(tok.span);
+                    self.verbatim.push(body_start..self.pos);
                     self.pos += 1;
+                    break;
                 }
-                TokenKind::Line => {
-                    let s = self.line(&tok);
-                    if s.trim() == "```" {
-                        span = span.join(tok.span);
-                        self.pos += 1;
-                        break;
-                    }
-                    body.push_str(s);
+                TokenKind::Line | TokenKind::Blank => {
+                    body.push_str(self.raw_line(self.pos));
                     body.push('\n');
                     span = span.join(tok.span);
                     self.pos += 1;
@@ -665,7 +774,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_blockquote(&mut self, indent: u16) -> Block {
-        let mut lines: Vec<(usize, &'a str, Span)> = Vec::new();
+        let mut lines: Vec<QuoteLine<'a>> = Vec::new();
         let start = self.peek().span;
         loop {
             if self.at_eof() {
@@ -707,11 +816,15 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 break;
             }
-            let body = &trimmed[idx + 1..];
-            lines.push((depth, body, tok.span));
+            lines.push(QuoteLine {
+                depth,
+                body: &trimmed[idx + 1..],
+                base: tok.span.start + indent as u32 + idx as u32 + 1,
+                span: tok.span,
+            });
             self.pos += 1;
         }
-        let (children, span) = build_blockquote(&lines, 1);
+        let (children, span) = build_blockquote(&lines, 1, &mut self.diags);
         Block::Blockquote {
             children,
             span: if span == Span::DUMMY { start } else { span },
@@ -725,7 +838,7 @@ impl<'a> Parser<'a> {
         let trimmed = &line[indent as usize..];
         let mut cursor = 2usize;
         let args = if trimmed.as_bytes().get(cursor) == Some(&b'(') {
-            match parse_args(trimmed, &mut cursor) {
+            match parse_args(trimmed, &mut cursor, directive.span.start + indent as u32) {
                 Ok(a) => a,
                 Err(d) => {
                     self.diags.push(d);
@@ -769,10 +882,10 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 continue;
             }
-            let cells = split.cells;
             let mut parsed_cells: Vec<Vec<Inline>> = Vec::new();
-            for c in cells {
-                let (inl, d) = parse_inline(c.trim(), tok.span.start);
+            for c in split.cells {
+                let base = tok.span.start as usize + subslice_offset(row_line, c);
+                let (inl, d) = parse_inline(c, base as u32);
                 self.diags.extend(d);
                 parsed_cells.push(inl);
             }
@@ -851,7 +964,7 @@ impl<'a> Parser<'a> {
         let trimmed = &line[indent as usize..];
         let mut cursor = 3usize;
         let args = if trimmed.as_bytes().get(cursor) == Some(&b'(') {
-            match parse_args(trimmed, &mut cursor) {
+            match parse_args(trimmed, &mut cursor, directive.span.start + indent as u32) {
                 Ok(a) => a,
                 Err(d) => {
                     self.diags.push(d);
@@ -864,20 +977,20 @@ impl<'a> Parser<'a> {
 
         let mut items: Vec<DefinitionItem> = Vec::new();
         let mut pending_term: Option<(Vec<Inline>, Span)> = None;
-        // (text accumulator, base offset of first line, span covering the
-        // definition's lines).
-        let mut pending_def: Option<(String, u32, Span)> = None;
+        // (text accumulator, where each joined line starts in it and in the
+        // source, span covering the definition's lines).
+        let mut pending_def: Option<(String, Vec<Seg>, Span)> = None;
         let cont_indent = indent + 2;
         let mut end_span = directive.span;
 
         // Closes any open definition into items, paired with the pending term.
         let finalize_def = |items: &mut Vec<DefinitionItem>,
                             pending_term: &mut Option<(Vec<Inline>, Span)>,
-                            pending_def: &mut Option<(String, u32, Span)>,
+                            pending_def: &mut Option<(String, Vec<Seg>, Span)>,
                             diags: &mut Vec<Diagnostic>| {
-            if let Some((text, base, span)) = pending_def.take() {
+            if let Some((text, segs, span)) = pending_def.take() {
                 let term_pair = pending_term.take();
-                let (def_inl, dd) = parse_inline(&text, base);
+                let (def_inl, dd) = parse_inline_joined(&text, 0, &segs);
                 diags.extend(dd);
                 if let Some((term, t_span)) = term_pair {
                     let pair_span = t_span.join(span);
@@ -928,15 +1041,32 @@ impl<'a> Parser<'a> {
                         // Continuation of the active definition.
                         let body = &s[cont_indent as usize..];
                         pd.0.push(' ');
+                        pd.1.push(Seg {
+                            joined: pd.0.len() as u32,
+                            source: tok.span.start + cont_indent as u32,
+                        });
                         pd.0.push_str(body);
                         pd.2 = pd.2.join(tok.span);
                         self.pos += 1;
                         continue;
                     }
+                    if tok.indent < indent {
+                        // Dedented past the directive: the `@end` is
+                        // missing. Leave the line to the enclosing block.
+                        self.diags.push(
+                            Diagnostic::new(Code::UnterminatedBlock, directive.span)
+                                .label("`@dl` block was never closed with `@end`"),
+                        );
+                        break;
+                    }
                     if tok.indent != indent {
-                        // Anything else not at @dl's indent inside a `@dl`
-                        // body is unexpected — skip it; subsequent tasks
-                        // refine error reporting.
+                        let label = if tok.indent == cont_indent {
+                            "continuation line without a definition to continue"
+                        } else {
+                            "line is at neither the `@dl` indent nor a definition's continuation indent"
+                        };
+                        self.diags
+                            .push(Diagnostic::new(Code::BadDefinitionList, tok.span).label(label));
                         self.pos += 1;
                         continue;
                     }
@@ -983,8 +1113,9 @@ impl<'a> Parser<'a> {
                             self.pos += 1;
                             continue;
                         }
-                        let base = tok.span.start + indent as u32 + 2;
-                        pending_def = Some((rest.to_string(), base, tok.span));
+                        let source = tok.span.start + indent as u32 + 2;
+                        pending_def =
+                            Some((rest.to_string(), vec![Seg { joined: 0, source }], tok.span));
                         self.pos += 1;
                     } else if body.starts_with(':') {
                         self.diags.push(
@@ -1061,18 +1192,31 @@ impl<'a> Parser<'a> {
         }
         let name = trimmed[name_start..cursor].to_string();
         let mut args = ShortArgs::default();
+        let mut arg_err = None;
         if bytes.get(cursor) == Some(&b'(') {
-            match parse_args(trimmed, &mut cursor) {
+            match parse_args(trimmed, &mut cursor, tok.span.start + indent as u32) {
                 Ok(a) => args = a,
-                Err(d) => self.diags.push(d),
+                Err(d) => {
+                    // Resume after the line's last `)` so a directive with a
+                    // bad argument still pairs with its `@end` instead of
+                    // degrading into a paragraph and a stray `@end`.
+                    cursor = trimmed.rfind(')').map_or(trimmed.len(), |i| i + 1);
+                    arg_err = Some(d);
+                }
             }
         }
         if !trimmed[cursor..].trim().is_empty() {
+            // Inline content: the paragraph parse reports any argument
+            // error, so it isn't pushed twice.
             return None;
         }
+        self.diags.extend(arg_err);
         self.pos += 1;
         if name == "code" {
             return Some(self.parse_code_shortcode_body(indent, &tok, args));
+        }
+        if name == "math" {
+            return Some(self.parse_math_block_body(indent, &tok, args));
         }
         let children = self.parse_blocks(indent, Some(indent));
         let mut end_span = tok.span;
@@ -1104,6 +1248,7 @@ impl<'a> Parser<'a> {
     /// double-escape the rest.
     fn parse_code_shortcode_body(&mut self, indent: u16, open: &Token, args: ShortArgs) -> Block {
         let lang = self.code_shortcode_lang(args, open.span);
+        let body_start = self.pos;
         let mut body = String::new();
         let mut span = open.span;
         loop {
@@ -1114,21 +1259,17 @@ impl<'a> Parser<'a> {
                         Diagnostic::new(Code::UnterminatedBlock, open.span)
                             .label("`@code` block was never closed with `@end`"),
                     );
+                    self.verbatim.push(body_start..self.pos);
                     break;
                 }
-                TokenKind::Blank => {
-                    body.push('\n');
+                TokenKind::Line if tok.indent == indent && self.line(&tok).trim() == "@end" => {
                     span = span.join(tok.span);
+                    self.verbatim.push(body_start..self.pos);
                     self.pos += 1;
+                    break;
                 }
-                TokenKind::Line => {
-                    let s = self.line(&tok);
-                    if s.trim() == "@end" && tok.indent == indent {
-                        span = span.join(tok.span);
-                        self.pos += 1;
-                        break;
-                    }
-                    body.push_str(s);
+                TokenKind::Line | TokenKind::Blank => {
+                    body.push_str(self.raw_line(self.pos));
                     body.push('\n');
                     span = span.join(tok.span);
                     self.pos += 1;
@@ -1143,6 +1284,56 @@ impl<'a> Parser<'a> {
             body,
             attrs: CodeAttrs::default(),
             span,
+        }
+    }
+
+    /// `@math` bodies are verbatim TeX, like `@code`: Brief's escapes and
+    /// markup would eat TeX's backslashes and `_`/`*`. The body becomes a
+    /// single text paragraph so emitters can recover the source exactly.
+    /// Trailing whitespace is dropped as on any Brief line; TeX ignores it.
+    fn parse_math_block_body(&mut self, indent: u16, open: &Token, args: ShortArgs) -> Block {
+        let mut body = String::new();
+        let mut body_span: Option<Span> = None;
+        let mut end_span = open.span;
+        loop {
+            let tok = *self.peek();
+            match tok.kind {
+                TokenKind::Eof => {
+                    self.diags.push(
+                        Diagnostic::new(Code::UnterminatedBlock, open.span)
+                            .label("`@math` block was never closed with `@end`"),
+                    );
+                    break;
+                }
+                TokenKind::Line if tok.indent == indent && self.line(&tok).trim() == "@end" => {
+                    end_span = tok.span;
+                    self.pos += 1;
+                    break;
+                }
+                TokenKind::Line | TokenKind::Blank => {
+                    body.push_str(self.line(&tok));
+                    body.push('\n');
+                    body_span = Some(body_span.map_or(tok.span, |s| s.join(tok.span)));
+                    self.pos += 1;
+                }
+            }
+        }
+        let body = body.trim_end_matches('\n');
+        let children = match body_span {
+            Some(span) if !body.is_empty() => vec![Block::Paragraph {
+                content: vec![Inline::Text {
+                    value: body.to_string(),
+                    span,
+                }],
+                span,
+            }],
+            _ => Vec::new(),
+        };
+        Block::BlockShortcode {
+            name: "math".to_string(),
+            args,
+            children,
+            span: open.span.join(end_span),
         }
     }
 
@@ -1206,33 +1397,49 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn build_blockquote(items: &[(usize, &str, Span)], depth: usize) -> (Vec<Block>, Span) {
+/// One `>` line: its nesting depth, the text after the markers, and that
+/// text's source offset.
+struct QuoteLine<'a> {
+    depth: usize,
+    body: &'a str,
+    base: u32,
+    span: Span,
+}
+
+fn build_blockquote(
+    items: &[QuoteLine],
+    depth: usize,
+    diags: &mut Vec<Diagnostic>,
+) -> (Vec<Block>, Span) {
     let mut paras: Vec<Block> = Vec::new();
     let mut full_span = Span::DUMMY;
     let mut i = 0;
     while i < items.len() {
-        let (d, body, span) = &items[i];
-        if *d < depth {
+        let QuoteLine {
+            depth: d,
+            body,
+            base,
+            span,
+        } = items[i];
+        if d < depth {
             break;
         }
         full_span = if full_span == Span::DUMMY {
-            *span
+            span
         } else {
-            full_span.join(*span)
+            full_span.join(span)
         };
-        if *d == depth {
-            let (content, _) = parse_inline(body, span.start);
-            paras.push(Block::Paragraph {
-                content,
-                span: *span,
-            });
+        if d == depth {
+            let (content, inline_diags) = parse_inline(body, base);
+            diags.extend(inline_diags);
+            paras.push(Block::Paragraph { content, span });
             i += 1;
         } else {
             let mut j = i;
-            while j < items.len() && items[j].0 > depth {
+            while j < items.len() && items[j].depth > depth {
                 j += 1;
             }
-            let (children, child_span) = build_blockquote(&items[i..j], depth + 1);
+            let (children, child_span) = build_blockquote(&items[i..j], depth + 1, diags);
             paras.push(Block::Blockquote {
                 children,
                 span: child_span,
@@ -1460,6 +1667,14 @@ fn parse_heading_anchor<'a>(
     (stripped, Some(name_part.to_string()))
 }
 
+/// A block comment opens only on a line that is exactly `/*` or starts with
+/// `/* `. Prose and paths that merely begin with the two characters
+/// (`/*.tmp files`, `/**`) stay text: an opener swallows every line up to
+/// the next `*/`, so a loose rule silently deletes content.
+pub(crate) fn opens_block_comment(trimmed: &str) -> bool {
+    trimmed == "/*" || trimmed.starts_with("/* ")
+}
+
 fn leading_block_sigil(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -1477,7 +1692,7 @@ fn leading_block_sigil(s: &str) -> bool {
     if leading_ordered_marker(s).is_some() {
         return true;
     }
-    if s.starts_with("//") || s.starts_with("/*") {
+    if s.starts_with("//") || opens_block_comment(s) {
         return true;
     }
     if s == "@end" || s.starts_with("@end ") {
@@ -1509,6 +1724,15 @@ fn leading_ordered_marker(s: &str) -> Option<(u32, usize)> {
     Some((n, i + 2))
 }
 
+/// Byte offset of `inner` within `outer`, which it must be a slice of.
+/// `split_cells` hands back trimmed slices of the row; this recovers where
+/// each cell sits so its spans point at the cell, not the row start.
+fn subslice_offset(outer: &str, inner: &str) -> usize {
+    let off = (inner.as_ptr() as usize).wrapping_sub(outer.as_ptr() as usize);
+    debug_assert!(off + inner.len() <= outer.len(), "not a subslice");
+    off
+}
+
 /// Outcome of splitting a table row.
 ///
 /// `cells` borrow from the slice that was passed in (the `line` argument
@@ -1516,18 +1740,18 @@ fn leading_ordered_marker(s: &str) -> Option<(u32, usize)> {
 /// in whatever frame it wants `unclosed_backtick_at` to be relative to —
 /// see the doc comment on that field.
 #[derive(Debug)]
-struct RowSplit<'a> {
-    cells: Vec<&'a str>,
+pub(crate) struct RowSplit<'a> {
+    pub(crate) cells: Vec<&'a str>,
     /// `Some(byte_offset)` if a backtick code span opened in this row
     /// and never closed. The offset is relative to **the input slice
     /// passed to `split_cells`** (i.e. the same `&str` whose address
     /// the cell slices are also relative to). Callers that need an
     /// absolute span into the source must add the offset of `line` from
     /// the source start themselves.
-    unclosed_backtick_at: Option<usize>,
+    pub(crate) unclosed_backtick_at: Option<usize>,
 }
 
-fn split_cells(line: &str) -> RowSplit<'_> {
+pub(crate) fn split_cells(line: &str) -> RowSplit<'_> {
     let bytes = line.as_bytes();
     // The leading `|` is the row-opener, not a cell separator.
     let body_start = if bytes.first() == Some(&b'|') { 1 } else { 0 };
@@ -2123,6 +2347,253 @@ mod tests {
             d.iter().any(|x| x.code == Code::BadDefinitionList),
             "{:?}",
             d
+        );
+    }
+
+    /// (code, line, column) of each diagnostic, in emission order.
+    fn at(s: &str) -> Vec<(Code, usize, usize)> {
+        let src = SourceMap::new("d.brf", s);
+        let (_, d) = parse(lex(&src).unwrap(), &src);
+        d.iter()
+            .map(|x| {
+                let (l, c) = src.line_col(x.span.start);
+                (x.code, l, c)
+            })
+            .collect()
+    }
+
+    fn code_body(doc: &Document) -> &str {
+        match &doc.blocks[0] {
+            Block::CodeBlock { body, .. } => body,
+            b => panic!("expected CodeBlock, got {:?}", b),
+        }
+    }
+
+    #[test]
+    fn line_starting_with_slash_star_is_not_a_comment() {
+        // This used to open a comment and delete everything up to the
+        // `End */` line with exit 0. The stars are now ordinary inline
+        // markers (unclosed, so B0207) and every block survives.
+        let (doc, d) =
+            p("Delete with:\n/*.tmp files are temp\n\nNext.\n\n## Section\n\nEnd */\n\nfinal\n");
+        assert_eq!(doc.blocks.len(), 5, "{:?}", doc.blocks);
+        assert!(matches!(doc.blocks[2], Block::Heading { level: 2, .. }));
+        let codes: Vec<_> = d.iter().map(|x| x.code).collect();
+        assert_eq!(codes, vec![Code::UnterminatedEmph, Code::UnterminatedEmph]);
+        assert_eq!(
+            at("Delete with:\n/*.tmp files are temp\n\nEnd */\n"),
+            vec![
+                (Code::UnterminatedEmph, 2, 2),
+                (Code::UnterminatedEmph, 4, 5)
+            ]
+        );
+
+        let (doc, d) = p("/** doc-comment style prose\n\n## Section\n");
+        assert!(d.is_empty(), "{:?}", d);
+        assert_eq!(doc.blocks.len(), 2);
+    }
+
+    #[test]
+    fn block_comment_opens_on_bare_or_spaced_marker() {
+        let (doc, d) = p("/*\nhidden\n*/\n/* one line */\n  /* indented\n  */\nshown\n");
+        assert!(d.is_empty(), "{:?}", d);
+        assert_eq!(doc.blocks.len(), 1);
+        match &doc.blocks[0] {
+            Block::Paragraph { content, .. } => {
+                assert!(matches!(&content[0], Inline::Text { value, .. } if value == "shown"));
+            }
+            b => panic!("{:?}", b),
+        }
+    }
+
+    #[test]
+    fn unterminated_comment_is_b0319_at_its_opener() {
+        assert_eq!(
+            at("a\n\n/* open\n\nmore\n"),
+            vec![(Code::UnterminatedComment, 3, 1)]
+        );
+        assert_eq!(at("- x\n\n  /*\n"), vec![(Code::UnterminatedComment, 3, 3)]);
+    }
+
+    #[test]
+    fn comment_opened_after_content_is_b0307() {
+        // A `/*` ending a content line does not open a comment, so the
+        // "hidden" text would be published; flag the pair instead.
+        assert_eq!(
+            at("text /*\nhidden\n*/\n"),
+            vec![(Code::InlineBlockComment, 1, 6)]
+        );
+    }
+
+    #[test]
+    fn dl_stray_indented_line_is_b0505() {
+        assert_eq!(
+            at("@dl\nTerm\n: def\n    weird indented\n@end\n"),
+            vec![(Code::BadDefinitionList, 4, 1)]
+        );
+        // Continuation indent with no definition to continue, before a
+        // definition and after a blank line ended one.
+        assert_eq!(
+            at("@dl\nTerm\n  orphan\n: def\n\n  more\n@end\n"),
+            vec![
+                (Code::BadDefinitionList, 3, 1),
+                (Code::BadDefinitionList, 6, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn dl_dedent_without_end_is_b0306_and_keeps_the_line() {
+        let src = "- item\n\n  @dl\n  T\n  : d\nafter\n";
+        assert_eq!(at(src), vec![(Code::UnterminatedBlock, 3, 1)]);
+        let (doc, _) = p(src);
+        assert_eq!(doc.blocks.len(), 2, "{:?}", doc.blocks);
+        assert!(matches!(doc.blocks[1], Block::Paragraph { .. }));
+    }
+
+    #[test]
+    fn code_fence_body_is_byte_exact() {
+        let (doc, d) = p("```go\nfunc main() {\n\tfmt.Println()  \n   \n}\n```\n");
+        assert!(d.is_empty(), "{:?}", d);
+        assert_eq!(code_body(&doc), "func main() {\n\tfmt.Println()  \n   \n}");
+
+        let (doc, d) = p("```\r\nx \t\r\n```\r\n");
+        assert!(d.is_empty(), "{:?}", d);
+        assert_eq!(code_body(&doc), "x \t");
+    }
+
+    #[test]
+    fn code_shortcode_body_is_byte_exact() {
+        let (doc, d) = p("@code(make)\nall:\n\tcc x.c \n@end\n");
+        assert!(d.is_empty(), "{:?}", d);
+        assert_eq!(code_body(&doc), "all:\n\tcc x.c ");
+    }
+
+    #[test]
+    fn tab_in_frontmatter_is_allowed() {
+        let (doc, d) = p("+++\ntitle =\t\"x\"\n+++\n# T\n");
+        assert!(d.is_empty(), "{:?}", d);
+        assert!(doc.metadata.is_some());
+    }
+
+    #[test]
+    fn tab_outside_verbatim_regions_is_b0102() {
+        assert_eq!(
+            at("# T\n\nsome\ttext\n\n```\n\tok\n```\n\n\tindented\n@code\n\tok\n@end\n"),
+            vec![(Code::TabCharacter, 3, 5), (Code::TabCharacter, 9, 1)]
+        );
+    }
+
+    #[test]
+    fn inline_arg_error_reports_its_real_position() {
+        // Was reported at 3:5: the offset within the line, used as an
+        // offset into the file.
+        assert_eq!(
+            at("# Title\n\nSome intro paragraph.\n\nPress @kbd(1 2)[x] now.\n"),
+            vec![(Code::BadArgSyntax, 5, 14)]
+        );
+    }
+
+    #[test]
+    fn joined_paragraph_spans_survive_crlf_indent_trailing_space_and_breaks() {
+        let src = "- item\n\n  first é  \r\n  second \\\r\n  third @kbd(1 2)[x]\n";
+        assert_eq!(at(src), vec![(Code::BadArgSyntax, 5, 16)]);
+        let (doc, _) = p(src);
+        let Block::List { items, .. } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks);
+        };
+        let Block::Paragraph { content, .. } = &items[0].children[0] else {
+            panic!("{:?}", items[0].children);
+        };
+        let slices: Vec<&str> = content
+            .iter()
+            .map(|n| match n {
+                Inline::Text { span, .. } | Inline::HardBreak { span } => &src[span.range()],
+                other => panic!("{:?}", other),
+            })
+            .collect();
+        assert_eq!(
+            slices,
+            vec![
+                "first é  \r\n  second ",
+                "\\",
+                "\r\n  third ",
+                "@kbd(1 ",
+                "2)[x]"
+            ]
+        );
+    }
+
+    #[test]
+    fn table_cell_spans_point_into_the_cell() {
+        let src = "@t\n| A | B\n| x | @kbd(é)[y]\n";
+        assert_eq!(at(src), vec![(Code::BadArgSyntax, 3, 12)]);
+        let s = SourceMap::new("d.brf", src);
+        let (_, d) = parse(lex(&s).unwrap(), &s);
+        assert_eq!(&src[d[0].span.range()], "é");
+    }
+
+    #[test]
+    fn blockquote_keeps_inline_diagnostics() {
+        let src = "> fine\n> *unclosed bold\n";
+        assert_eq!(at(src), vec![(Code::UnterminatedEmph, 2, 3)]);
+        let (doc, _) = p(src);
+        let Block::Blockquote { children, .. } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks);
+        };
+        let Block::Paragraph { content, .. } = &children[1] else {
+            panic!("{:?}", children);
+        };
+        let values: Vec<&str> = content
+            .iter()
+            .map(|n| match n {
+                Inline::Text { value, .. } => value.as_str(),
+                other => panic!("{:?}", other),
+            })
+            .collect();
+        assert_eq!(values, vec!["*", "unclosed bold"]);
+    }
+
+    #[test]
+    fn dl_continuation_spans_map_to_their_lines() {
+        assert_eq!(
+            at("@dl\nTerm\n: first line\n  second @kbd(1 2)[x]\n@end\n"),
+            vec![(Code::BadArgSyntax, 4, 17)]
+        );
+    }
+
+    #[test]
+    fn directive_arg_errors_are_absolute_and_whole_chars() {
+        let src = "# T\n\n@callout(kind: é)\nx\n@end\n";
+        assert_eq!(at(src), vec![(Code::BadArgSyntax, 3, 16)]);
+        let s = SourceMap::new("d.brf", src);
+        let (_, d) = parse(lex(&s).unwrap(), &s);
+        assert_eq!(&src[d[0].span.range()], "é");
+        assert_eq!(
+            at("x\n\n@t(align: é)\n| A\n"),
+            vec![(Code::BadArgSyntax, 3, 11)]
+        );
+        assert_eq!(
+            at("x\n\n@dl(a: 1, a: 2)\nT\n: d\n@end\n"),
+            vec![(Code::DuplicateKwarg, 3, 11)]
+        );
+    }
+
+    #[test]
+    fn block_math_body_is_verbatim_text() {
+        let (doc, d) = p("@math\n\\frac{a_1}{b} *x*\n\\\\ y\n@end\n");
+        assert!(d.is_empty(), "{:?}", d);
+        let Block::BlockShortcode { name, children, .. } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks);
+        };
+        assert_eq!(name, "math");
+        let [Block::Paragraph { content, .. }] = children.as_slice() else {
+            panic!("{:?}", children);
+        };
+        assert!(
+            matches!(content.as_slice(), [Inline::Text { value, .. }] if value == "\\frac{a_1}{b} *x*\n\\\\ y"),
+            "{:?}",
+            content
         );
     }
 

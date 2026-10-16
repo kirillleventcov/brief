@@ -1,63 +1,62 @@
 //! Project-aware analysis shared by every LSP handler.
 //!
-//! This module mirrors the `brief compile` pipeline — config discovery,
-//! shortcode registry, `@ref` index, lex → parse → resolve → validate —
-//! over in-memory editor buffers, so in-editor diagnostics never diverge
-//! from what the compiler reports. Everything here is pure with respect
-//! to the LSP transport (no `Client`), which is what makes it testable.
+//! Buffers go through the same `Project::check` front-end as `brief
+//! compile`, in the same project `Project::discover` finds for the CLI, so
+//! in-editor diagnostics never diverge from what the compiler reports. The
+//! one addition is the dirty-buffer overlay: open buffers stand in for their
+//! files in the `@ref` index. Everything here is pure with respect to the
+//! LSP transport (no `Client`), which is what makes it testable.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use brief::{
     ast::{Block, Document, Inline},
-    config::{self, Config},
-    diag::Diagnostic,
-    lexer, parser, project,
-    project::ProjectIndex,
-    resolve,
-    shortcode::Registry,
+    config::Config,
+    diag::{Diagnostic, Severity},
+    lexer, parser,
+    project::{self, Project, ProjectIndex},
     span::{SourceMap, Span},
-    validate,
 };
+
+pub use brief::project::{RefSite, collect_refs};
 
 // ---------------------------------------------------------------------------
 // Project snapshot
 // ---------------------------------------------------------------------------
 
-/// Cached per-root compile context: `brief.toml`, the shortcode registry
-/// derived from it, and the disk-built `@ref` index. Rebuilt on file open
-/// and save, reused across keystrokes.
+/// Cached per-root compile context: the project (config and shortcode
+/// registry) and its disk-built `@ref` index. Rebuilt on file open and
+/// save, reused across keystrokes.
 #[derive(Debug)]
 pub struct ProjectSnapshot {
     /// The directory containing `brief.toml`.
     pub root: PathBuf,
-    pub config: Config,
-    pub registry: Registry,
+    pub project: Project,
     pub index: ProjectIndex,
-    /// Set when `<root>/brief.toml` exists but fails to parse. Analysis
-    /// falls back to the default config so diagnostics keep flowing;
-    /// `brief compile` would exit 2, so the backend surfaces this as an
-    /// error diagnostic on every document under the root.
+    /// Set when `<root>/brief.toml` fails to load. Analysis falls back to
+    /// the default config so diagnostics keep flowing; `brief compile`
+    /// would exit 2 with this same message, so the backend surfaces it as
+    /// an error diagnostic on every document under the root.
     pub config_error: Option<String>,
 }
 
 /// Build a snapshot for a known project root (a directory that contains
-/// `brief.toml`). Pre-pass lex/parse diagnostics from sibling files are
-/// dropped here: the editor shows those when their own file is open, and
-/// `@ref`s into a file that fails to parse still surface as B0602 via its
-/// empty anchor set.
+/// `brief.toml`). Index diagnostics from other files are dropped here: the
+/// editor shows those when their own file is open, and a `@ref` into a
+/// broken file reports B0605 through the index's `broken` set.
 pub fn load_snapshot(root: &Path) -> ProjectSnapshot {
-    let (config, config_error) = match config::load(&root.join("brief.toml")) {
-        Ok(c) => (c, None),
-        Err(e) => (Config::default(), Some(e)),
+    let (project, config_error) = match Project::discover(root, None) {
+        Ok(p) => (p, None),
+        Err(e) => (
+            Project::from_config(Some(root.to_path_buf()), None, Config::default()),
+            Some(e),
+        ),
     };
-    let registry = config::registry_from(&config);
-    let (index, _prepass) = project::build_index(root);
+    let index = project::build_index(root).0;
     ProjectSnapshot {
         root: root.to_path_buf(),
-        config,
-        registry,
+        project,
         index,
         config_error,
     }
@@ -82,87 +81,84 @@ pub fn rel_path(root: &Path, doc_path: &Path) -> Option<String> {
 // Buffer analysis
 // ---------------------------------------------------------------------------
 
+/// What an open buffer contributes to the `@ref` index in place of its
+/// copy on disk, judged exactly as `build_index` judges a file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BufferEntry {
+    /// Heading anchors declared by the buffer.
+    pub anchors: BTreeSet<String>,
+    /// The buffer fails to lex or parse, so a `@ref` into it is B0605.
+    pub broken: bool,
+}
+
+impl BufferEntry {
+    fn of(src: &SourceMap) -> BufferEntry {
+        match lexer::lex(src) {
+            Err(_) => BufferEntry {
+                anchors: BTreeSet::new(),
+                broken: true,
+            },
+            Ok(tokens) => {
+                let (doc, diags) = parser::parse(tokens, src);
+                BufferEntry {
+                    anchors: project::collect_anchors(&doc),
+                    broken: diags.iter().any(|d| d.severity == Severity::Error),
+                }
+            }
+        }
+    }
+}
+
 /// Result of running the full pipeline over one buffer.
 pub struct Analysis {
     /// `None` when the buffer failed to lex.
     pub doc: Option<Document>,
     pub diagnostics: Vec<Diagnostic>,
-    /// Heading anchors declared by this buffer (empty on lex failure).
-    /// The backend caches these per open document to overlay unsaved
-    /// edits over the disk index.
-    pub anchors: BTreeSet<String>,
+    /// This buffer's own index entry. The backend caches it per open
+    /// document to overlay unsaved edits over the disk index.
+    pub entry: BufferEntry,
 }
 
-/// Run the `brief compile` pipeline over an in-memory buffer.
+/// Run the `brief compile` front-end over an in-memory buffer.
 ///
 /// `overlay` maps project-relative paths of *other* open buffers to their
-/// current anchor sets; they take precedence over the disk-built index so
-/// unsaved edits are seen immediately. The current buffer's own anchors
-/// are always overlaid last, so self-references resolve against what is
-/// on screen, not what is on disk.
+/// current index entries; they take precedence over the disk-built index
+/// (anchors and broken state both) so unsaved edits are seen immediately.
+/// The current buffer's own entry is always overlaid last, so
+/// self-references resolve against what is on screen, not what is on disk.
 pub fn analyze(
     doc_path: &Path,
     text: &str,
     snapshot: Option<&ProjectSnapshot>,
-    overlay: &BTreeMap<String, BTreeSet<String>>,
+    overlay: &BTreeMap<String, BufferEntry>,
 ) -> Analysis {
     let src = SourceMap::new(doc_path.to_string_lossy(), text.to_string());
-    let tokens = match lexer::lex(&src) {
-        Ok(t) => t,
-        Err(diagnostics) => {
-            return Analysis {
-                doc: None,
-                diagnostics,
-                anchors: BTreeSet::new(),
-            };
-        }
-    };
-    let (mut doc, mut diags) = parser::parse(tokens, &src);
-    let anchors = project::collect_anchors(&doc);
+    let entry = BufferEntry::of(&src);
 
-    let fallback_registry;
-    let registry = match snapshot {
-        Some(s) => &s.registry,
-        None => {
-            fallback_registry = Registry::with_builtins();
-            &fallback_registry
-        }
-    };
-
-    let resolve_diags = match snapshot {
+    let checked = match snapshot {
         Some(s) => {
             let rel = rel_path(&s.root, doc_path);
             let mut index = s.index.clone();
-            for (p, a) in overlay {
-                index.anchors.insert(p.clone(), a.clone());
+            let own = rel.as_ref().map(|r| (r, &entry));
+            for (p, e) in overlay.iter().chain(own) {
+                index.anchors.insert(p.clone(), e.anchors.clone());
+                if e.broken {
+                    index.broken.insert(p.clone());
+                } else {
+                    index.broken.remove(p);
+                }
             }
-            if let Some(rel) = &rel {
-                index.anchors.insert(rel.clone(), anchors.clone());
-            }
-            let current = PathBuf::from(rel.unwrap_or_default());
-            let project = resolve::ResolveProject {
-                index: &index,
-                current: &current,
-            };
-            resolve::resolve_with_project(&mut doc, registry, Some(&project))
+            s.project.check(&src, Some(&index), rel.as_deref())
         }
         // No `brief.toml` above the file: same as `brief compile` outside
         // a project — builtins only, `@ref` errors with B0604.
-        None => resolve::resolve(&mut doc, registry),
+        None => Project::standalone().check(&src, None, None),
     };
-    diags.extend(resolve_diags);
-
-    let opts = validate::ValidateOpts {
-        strict_heading_levels: snapshot
-            .map(|s| s.config.compile.strict_heading_levels)
-            .unwrap_or(false),
-    };
-    diags.extend(validate::validate(&doc, &opts, &src));
 
     Analysis {
-        doc: Some(doc),
-        diagnostics: diags,
-        anchors,
+        doc: checked.doc,
+        diagnostics: checked.diagnostics,
+        entry,
     }
 }
 
@@ -238,88 +234,6 @@ fn push_inline_text(nodes: &[Inline], out: &mut String) {
                     push_inline_text(c, out);
                 }
             }
-        }
-    }
-}
-
-/// A `@ref` invocation: its source span and the raw target text
-/// (`path.brf` or `path.brf#anchor`).
-pub struct RefSite {
-    pub span: Span,
-    pub target: String,
-}
-
-pub fn collect_refs(doc: &Document) -> Vec<RefSite> {
-    let mut out = Vec::new();
-    for b in &doc.blocks {
-        collect_refs_block(b, &mut out);
-    }
-    out
-}
-
-fn collect_refs_block(b: &Block, out: &mut Vec<RefSite>) {
-    match b {
-        Block::Heading { content, .. } | Block::Paragraph { content, .. } => {
-            collect_refs_inlines(content, out);
-        }
-        Block::List { items, .. } => {
-            for it in items {
-                collect_refs_inlines(&it.content, out);
-                for c in &it.children {
-                    collect_refs_block(c, out);
-                }
-            }
-        }
-        Block::Blockquote { children, .. } | Block::BlockShortcode { children, .. } => {
-            for c in children {
-                collect_refs_block(c, out);
-            }
-        }
-        Block::Table { header, rows, .. } => {
-            for cell in &header.cells {
-                collect_refs_inlines(cell, out);
-            }
-            for row in rows {
-                for cell in &row.cells {
-                    collect_refs_inlines(cell, out);
-                }
-            }
-        }
-        Block::DefinitionList { items, .. } => {
-            for it in items {
-                collect_refs_inlines(&it.term, out);
-                collect_refs_inlines(&it.definition, out);
-            }
-        }
-        Block::CodeBlock { .. } | Block::HorizontalRule { .. } => {}
-    }
-}
-
-fn collect_refs_inlines(nodes: &[Inline], out: &mut Vec<RefSite>) {
-    for n in nodes {
-        match n {
-            Inline::Bold { content, .. }
-            | Inline::Italic { content, .. }
-            | Inline::Underline { content, .. }
-            | Inline::Strike { content, .. } => collect_refs_inlines(content, out),
-            Inline::Shortcode {
-                name,
-                content,
-                span,
-                ..
-            } => {
-                if name == "ref" {
-                    if let Some([Inline::Text { value, .. }]) = content.as_deref() {
-                        out.push(RefSite {
-                            span: *span,
-                            target: value.clone(),
-                        });
-                    }
-                } else if let Some(c) = content {
-                    collect_refs_inlines(c, out);
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -493,7 +407,7 @@ mod tests {
         diags.iter().all(|d| d.severity != Severity::Error)
     }
 
-    fn empty_overlay() -> BTreeMap<String, BTreeSet<String>> {
+    fn empty_overlay() -> BTreeMap<String, BufferEntry> {
         BTreeMap::new()
     }
 
@@ -507,8 +421,11 @@ mod tests {
         );
         let snap = load_snapshot(&root);
         assert!(snap.config_error.is_none());
-        assert!(snap.registry.get("note").is_some());
-        assert!(snap.registry.get("callout").is_some(), "builtins retained");
+        assert!(snap.project.registry.get("note").is_some());
+        assert!(
+            snap.project.registry.get("callout").is_some(),
+            "builtins retained"
+        );
     }
 
     #[test]
@@ -629,7 +546,13 @@ mod tests {
         let snap = load_snapshot(&root);
         let path = root.join("cur.brf");
         let mut overlay = empty_overlay();
-        overlay.insert("other.brf".to_string(), BTreeSet::from(["new".to_string()]));
+        overlay.insert(
+            "other.brf".to_string(),
+            BufferEntry {
+                anchors: BTreeSet::from(["new".to_string()]),
+                broken: false,
+            },
+        );
 
         let stale = analyze(
             &path,
@@ -653,6 +576,112 @@ mod tests {
     }
 
     #[test]
+    fn bad_brief_toml_message_matches_the_cli() {
+        let (_td, root) = project("[compile]\nnope = 1\n", &[]);
+        let snap = load_snapshot(&root);
+        let err = snap.config_error.expect("bad config");
+        let prefix = format!("bad config {}: ", root.join("brief.toml").display());
+        assert!(err.starts_with(&prefix), "{}", err);
+    }
+
+    #[test]
+    fn ref_into_broken_file_is_b0605_not_b0602() {
+        // The draft's heading parsed, but the file as a whole does not
+        // compile. Before the shared front-end this reported "anchor not
+        // found" (B0602), pointing the user at the wrong problem.
+        let (_td, root) = project("", &[("draft.brf", "# D {#d}\n\n*unfinished\n")]);
+        let snap = load_snapshot(&root);
+        let a = analyze(
+            &root.join("cur.brf"),
+            "See @ref[draft.brf#d](the draft).\n",
+            Some(&snap),
+            &empty_overlay(),
+        );
+        let codes: Vec<Code> = a.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(codes, vec![Code::RefTargetBroken]);
+    }
+
+    #[test]
+    fn unrelated_broken_file_reports_nothing() {
+        let (_td, root) = project("", &[("draft.brf", "*unfinished\n")]);
+        let snap = load_snapshot(&root);
+        let a = analyze(
+            &root.join("cur.brf"),
+            "# Cur\n",
+            Some(&snap),
+            &empty_overlay(),
+        );
+        assert!(a.diagnostics.is_empty(), "{:?}", a.diagnostics);
+    }
+
+    #[test]
+    fn overlay_broken_state_beats_disk_index() {
+        let (_td, root) = project(
+            "",
+            &[
+                ("draft.brf", "# D {#d}\n\n*unfinished\n"),
+                ("clean.brf", "# C {#c}\n"),
+            ],
+        );
+        let snap = load_snapshot(&root);
+        let path = root.join("cur.brf");
+        let text = "See @ref[draft.brf#d](D) and @ref[clean.brf#c](C).\n";
+
+        // draft.brf is fixed in its (unsaved) buffer; clean.brf is broken
+        // in its buffer. The overlay decides, not the disk.
+        let mut overlay = empty_overlay();
+        overlay.insert(
+            "draft.brf".to_string(),
+            BufferEntry {
+                anchors: BTreeSet::from(["d".to_string()]),
+                broken: false,
+            },
+        );
+        overlay.insert(
+            "clean.brf".to_string(),
+            BufferEntry {
+                anchors: BTreeSet::from(["c".to_string()]),
+                broken: true,
+            },
+        );
+        let a = analyze(&path, text, Some(&snap), &overlay);
+        let broken: Vec<usize> = a
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == Code::RefTargetBroken)
+            .map(|d| d.span.start as usize)
+            .collect();
+        assert_eq!(broken, vec![text.find("@ref[clean").unwrap()]);
+        assert_eq!(a.diagnostics.len(), 1, "{:?}", a.diagnostics);
+    }
+
+    #[test]
+    fn buffer_entry_judges_like_the_indexer() {
+        let (_td, root) = project("", &[]);
+        let snap = load_snapshot(&root);
+        let path = root.join("cur.brf");
+        let ok = analyze(&path, "# T {#t}\n", Some(&snap), &empty_overlay());
+        assert_eq!(
+            ok.entry,
+            BufferEntry {
+                anchors: BTreeSet::from(["t".to_string()]),
+                broken: false,
+            }
+        );
+        let parse_err = analyze(&path, "# T {#t}\n\n*open\n", Some(&snap), &empty_overlay());
+        assert!(parse_err.entry.broken);
+        assert!(parse_err.entry.anchors.contains("t"));
+        let lex_err = analyze(&path, "a\tb\n", Some(&snap), &empty_overlay());
+        assert_eq!(
+            lex_err.entry,
+            BufferEntry {
+                anchors: BTreeSet::new(),
+                broken: true,
+            }
+        );
+    }
+
+    #[test]
     fn self_ref_resolves_against_buffer_not_disk() {
         // cur.brf does not exist on disk at all; the buffer declares the
         // anchor it references.
@@ -666,7 +695,7 @@ mod tests {
             &empty_overlay(),
         );
         assert!(no_errors(&a.diagnostics), "{:?}", a.diagnostics);
-        assert!(a.anchors.contains("top"));
+        assert!(a.entry.anchors.contains("top"));
     }
 
     // -- navigation helpers --------------------------------------------------

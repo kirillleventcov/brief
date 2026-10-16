@@ -1,12 +1,22 @@
 //! `brief fmt` — gofmt-doctrine formatter for Brief sources.
 //!
-//! Operates on the raw source as a sequence of lines. A region scanner
-//! identifies inviolate regions (frontmatter, code fences, block comments,
-//! tables) so per-line transforms never touch their internals. Emphasis
-//! markers, shortcode argument order, and inline content are preserved
-//! verbatim — the formatter never re-emits parsed AST.
+//! Operates on the raw source as a sequence of lines. Which lines are
+//! verbatim (frontmatter, fenced and `@code` bodies) and which are table
+//! rows is read off the real lexer and parser rather than a second copy of
+//! the grammar, so the formatter cannot disagree with the compiler about
+//! where a region starts or ends. What it does to the remaining lines —
+//! trailing whitespace, leading tabs, blank-line runs, table padding — is
+//! invisible to the parser. Emphasis markers, shortcode argument order, and
+//! inline content are preserved verbatim — the formatter never re-emits
+//! parsed AST.
 
+use crate::ast::Block;
+use crate::lexer;
+use crate::parser;
+use crate::span::SourceMap;
+use crate::token::{Token, TokenKind};
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 #[derive(Debug, Clone, Default)]
 pub struct Opts {
@@ -16,172 +26,278 @@ pub struct Opts {
     pub sort_frontmatter: bool,
 }
 
+/// What the formatter may do to one source line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Region {
-    Default,
-    FrontmatterOpen,
-    FrontmatterBody,
-    FrontmatterClose,
-    CodeFenceOpen,
-    CodeFenceBody,
-    CodeFenceClose,
-    BlockComment,
-    TableDirective,
-    TableRow,
-}
-
-impl Region {
-    /// True if blank lines in this region count as collapsible whitespace
-    /// for the global blank-collapse pass. Blanks inside structural regions
-    /// (code fences, comments, frontmatter) are part of the body and stay.
-    fn collapsible(self) -> bool {
-        matches!(self, Region::Default)
-    }
+enum Kind {
+    /// Ordinary Brief: leading tabs become two spaces, trailing whitespace
+    /// goes, and runs of blank lines collapse to one.
+    Brief,
+    /// Frontmatter or code-block body: emitted byte for byte.
+    Verbatim,
+    /// A `+++`, fence, `@code` or `@end` line delimiting a verbatim region:
+    /// trailing whitespace goes, nothing else.
+    Delimiter,
+    /// Row `row` of table `table`, realigned with its siblings.
+    TableRow { table: usize, row: usize },
 }
 
 pub fn format(source: &str, opts: &Opts) -> String {
     // Strip a leading UTF-8 BOM. fmt produces canonical sources; the BOM
     // is allowed by the lexer but adds no value.
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
-
-    if source.is_empty() {
-        return String::new();
-    }
-
-    // Normalize line endings: CRLF and bare CR → LF. Brief is LF-only.
-    let normalized = normalize_line_endings(source);
-
-    // Split into lines without trailing newline information; we re-emit
-    // with a single trailing `\n`.
-    let raw_lines: Vec<&str> = normalized.split('\n').collect();
-
-    // The final trailing element of split('\n') is always "" when the input
-    // ends with `\n`. Drop it so we don't carry a phantom blank line.
-    let lines: Vec<&str> = if raw_lines.last() == Some(&"") {
-        raw_lines[..raw_lines.len() - 1].to_vec()
-    } else {
-        raw_lines
-    };
-
+    let lines = split_lines(source);
     if lines.is_empty() {
         return String::new();
     }
 
-    let regions = scan_regions(&lines);
-    debug_assert_eq!(regions.len(), lines.len());
+    let Some(layout) = Layout::scan(&lines) else {
+        // Without tokens there is no telling verbatim lines from the rest,
+        // so normalize line endings and touch nothing else.
+        let mut out = lines.join("\n");
+        out.push('\n');
+        return out;
+    };
 
-    let transformed = apply_transforms(&lines, &regions, opts);
-    let collapsed = collapse_blanks(&transformed.lines, &transformed.regions);
-    let trimmed = trim_blank_edges(&collapsed.lines, &collapsed.regions);
+    let tables: Vec<Vec<String>> = layout
+        .tables
+        .iter()
+        .map(|rows| format_table(&rows.iter().map(|&k| lines[k]).collect::<Vec<_>>()))
+        .collect();
+    let sorted_frontmatter = match &layout.frontmatter {
+        Some(body) if opts.sort_frontmatter && !body.is_empty() => {
+            sort_frontmatter(&lines[body.clone()]).map(|sorted| (body.clone(), sorted))
+        }
+        _ => None,
+    };
 
-    if trimmed.is_empty() {
-        return String::new();
+    // Each output line, paired with whether it is a blank Brief line —
+    // the only kind blank-run collapsing and edge trimming may remove.
+    let mut out: Vec<(String, bool)> = Vec::with_capacity(lines.len());
+    let mut k = 0;
+    while k < lines.len() {
+        if let Some((body, sorted)) = &sorted_frontmatter
+            && k == body.start
+        {
+            out.extend(sorted.iter().map(|l| (l.clone(), false)));
+            k = body.end;
+            continue;
+        }
+        let line = lines[k];
+        out.push(match layout.kinds[k] {
+            Kind::Brief => {
+                let t = transform_brief_line(line);
+                let blank = t.is_empty();
+                (t, blank)
+            }
+            Kind::Verbatim => (line.to_string(), false),
+            Kind::Delimiter => (strip_trailing_ws(line).to_string(), false),
+            Kind::TableRow { table, row } => (tables[table][row].clone(), false),
+        });
+        k += 1;
     }
-    let mut out = trimmed.join("\n");
-    out.push('\n');
+    finish(out)
+}
+
+/// The source's lines without their terminators. The lexer splits on `\n`
+/// alone and drops trailing `\r`s, so CRLF becomes LF, but a bare `\r`
+/// anywhere else is line content to the compiler and stays.
+fn split_lines(source: &str) -> Vec<&str> {
+    if source.is_empty() {
+        return Vec::new();
+    }
+    let body = source.strip_suffix('\n').unwrap_or(source);
+    body.split('\n').map(|l| l.trim_end_matches('\r')).collect()
+}
+
+/// Collapse runs of blank lines, drop blanks from both ends, and join with
+/// a single trailing newline.
+fn finish(lines: Vec<(String, bool)>) -> String {
+    let mut kept: Vec<(String, bool)> = Vec::with_capacity(lines.len());
+    for (text, blank) in lines {
+        if blank && kept.last().is_some_and(|(_, prev_blank)| *prev_blank) {
+            continue;
+        }
+        kept.push((text, blank));
+    }
+    let Some(mut start) = kept.iter().position(|(_, blank)| !blank) else {
+        return String::new();
+    };
+    let end = kept
+        .iter()
+        .rposition(|(_, blank)| !blank)
+        .map_or(0, |i| i + 1);
+    // Frontmatter must open at byte 0. A `+++` line behind a leading blank
+    // is ordinary text; trimming that blank would turn it into frontmatter.
+    if start > 0 && kept[start].0 == "+++" {
+        start -= 1;
+    }
+    let mut out = String::with_capacity(kept[start..end].iter().map(|(t, _)| t.len() + 1).sum());
+    for (text, _) in &kept[start..end] {
+        out.push_str(text);
+        out.push('\n');
+    }
     out
 }
 
-fn normalize_line_endings(s: &str) -> String {
-    // Two-step: CRLF → LF, then bare CR → LF.
-    let step1 = s.replace("\r\n", "\n");
-    step1.replace('\r', "\n")
+/// The line structure the parser sees in a source.
+struct Layout {
+    kinds: Vec<Kind>,
+    /// Body lines of a closed frontmatter block.
+    frontmatter: Option<Range<usize>>,
+    /// Line indices of each table's rows, header first.
+    tables: Vec<Vec<usize>>,
 }
 
-fn scan_regions(lines: &[&str]) -> Vec<Region> {
-    let mut regions = vec![Region::Default; lines.len()];
-    let mut i = 0;
-
-    // Frontmatter is only legal at the very top of the document.
-    if !lines.is_empty() && lines[0].trim_end() == "+++" {
-        let mut close_idx = None;
-        for j in 1..lines.len() {
-            if lines[j].trim_end() == "+++" {
-                close_idx = Some(j);
-                break;
-            }
-        }
-        if let Some(j) = close_idx {
-            regions[0] = Region::FrontmatterOpen;
-            for k in 1..j {
-                regions[k] = Region::FrontmatterBody;
-            }
-            regions[j] = Region::FrontmatterClose;
-            i = j + 1;
-        }
-        // If unterminated, leave as Default — the parser will raise B0313 on
-        // the next compile and we shouldn't make it harder to spot.
-    }
-
-    while i < lines.len() {
-        let line = lines[i];
-        let (indent_len, _) = leading_indent(line);
-        let trimmed = &line[indent_len..];
-        let trimmed = trimmed.trim_end_matches(|c: char| c == ' ' || c == '\t');
-
-        if trimmed.starts_with("```") {
-            regions[i] = Region::CodeFenceOpen;
-            i += 1;
-            while i < lines.len() {
-                let inner = lines[i];
-                let (i_indent, _) = leading_indent(inner);
-                let inner_trim =
-                    inner[i_indent..].trim_end_matches(|c: char| c == ' ' || c == '\t');
-                if inner_trim == "```" {
-                    regions[i] = Region::CodeFenceClose;
-                    i += 1;
-                    break;
-                }
-                regions[i] = Region::CodeFenceBody;
-                i += 1;
-            }
-            continue;
-        }
-
-        if trimmed.starts_with("/*") {
-            regions[i] = Region::BlockComment;
-            // Single-line `/* ... */` — closes on the same line.
-            if trimmed.ends_with("*/") && trimmed.len() >= 4 {
-                i += 1;
-                continue;
-            }
-            i += 1;
-            while i < lines.len() {
-                regions[i] = Region::BlockComment;
-                let inner = lines[i].trim_end_matches(|c: char| c == ' ' || c == '\t');
-                if inner.ends_with("*/") {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-
-        if is_table_directive(trimmed) {
-            regions[i] = Region::TableDirective;
-            i += 1;
-            while i < lines.len() {
-                let (j_indent, _) = leading_indent(lines[i]);
-                let body = &lines[i][j_indent..];
-                if body.starts_with('|') {
-                    regions[i] = Region::TableRow;
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            continue;
-        }
-
-        i += 1;
-    }
-
-    regions
+/// A lexed copy of the source, for mapping parser spans back to lines.
+struct Scan<'a> {
+    src: &'a SourceMap,
+    toks: &'a [Token],
+    line_starts: &'a [usize],
 }
 
-fn is_table_directive(trimmed: &str) -> bool {
-    trimmed == "@t" || trimmed.starts_with("@t ") || trimmed.starts_with("@t(")
+impl Scan<'_> {
+    fn line_of(&self, offset: usize) -> usize {
+        self.line_starts.partition_point(|&s| s <= offset) - 1
+    }
+
+    /// Text and indent of line `k` as the lexer tokenized it. The lexer
+    /// emits exactly one token per line, so token `k` is line `k`.
+    fn line(&self, k: usize) -> (&str, u16) {
+        let tok = &self.toks[k];
+        debug_assert_eq!(
+            tok.span.start as usize, self.line_starts[k],
+            "the lexer no longer emits one token per line"
+        );
+        (&self.src.source[tok.span.range()], tok.indent)
+    }
+
+    /// Whether line `last`, the end of a code block's span, is the line
+    /// that closed the block rather than body running to end of file.
+    /// These are the parser's own close conditions, so a body line that
+    /// met them would have closed the block there.
+    fn closes(&self, open: usize, last: usize) -> bool {
+        let (open_text, open_indent) = self.line(open);
+        let (text, indent) = self.line(last);
+        if open_text[open_indent as usize..].starts_with("```") {
+            text.trim() == "```"
+        } else {
+            text.trim() == "@end" && indent == open_indent
+        }
+    }
+}
+
+impl Layout {
+    /// Lex and parse `lines` and record what the parser made of each one.
+    /// `None` if the lexer refuses the source even with tabs and stray BOMs
+    /// blanked out.
+    fn scan(lines: &[&str]) -> Option<Layout> {
+        // A tab or a BOM past byte 0 is a lex error that leaves no tokens at
+        // all, and repairing tab indentation is part of fmt's job. Blank
+        // each to spaces of the same byte length so offsets, line numbers
+        // and region boundaries all stay where they were.
+        let mut text = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+        let mut line_starts = Vec::with_capacity(lines.len());
+        for line in lines {
+            line_starts.push(text.len());
+            if line.contains(['\t', '\u{feff}']) {
+                for c in line.chars() {
+                    match c {
+                        '\t' => text.push(' '),
+                        '\u{feff}' => text.push_str("   "),
+                        c => text.push(c),
+                    }
+                }
+            } else {
+                text.push_str(line);
+            }
+            text.push('\n');
+        }
+        let src = SourceMap::new("<fmt>", text);
+        let toks = lexer::lex(&src).ok()?;
+        let scan = Scan {
+            src: &src,
+            toks: &toks,
+            line_starts: &line_starts,
+        };
+
+        let mut layout = Layout {
+            kinds: vec![Kind::Brief; lines.len()],
+            frontmatter: None,
+            tables: Vec::new(),
+        };
+        layout.mark_frontmatter(&scan);
+        let (doc, _) = parser::parse(toks.clone(), &src);
+        layout.mark_blocks(&doc.blocks, &scan);
+        Some(layout)
+    }
+
+    /// Frontmatter is consumed before the AST is built, so it is found by
+    /// the token test `parser::parse` applies: a `+++` line at byte 0,
+    /// closed by the next unindented `+++`. Left open, it runs to the end
+    /// of the file.
+    fn mark_frontmatter(&mut self, scan: &Scan) {
+        let is_fence = |t: &Token| {
+            t.kind == TokenKind::Line && t.indent == 0 && &scan.src.source[t.span.range()] == "+++"
+        };
+        if !scan
+            .toks
+            .first()
+            .is_some_and(|t| t.span.start == 0 && is_fence(t))
+        {
+            return;
+        }
+        self.kinds[0] = Kind::Delimiter;
+        let close = scan.toks[1..].iter().position(is_fence).map(|i| i + 1);
+        let body_end = close.unwrap_or(self.kinds.len());
+        for kind in &mut self.kinds[1..body_end] {
+            *kind = Kind::Verbatim;
+        }
+        if let Some(close) = close {
+            self.kinds[close] = Kind::Delimiter;
+            self.frontmatter = Some(1..close);
+        }
+    }
+
+    fn mark_blocks(&mut self, blocks: &[Block], scan: &Scan) {
+        for block in blocks {
+            match block {
+                Block::CodeBlock { span, .. } => {
+                    let open = scan.line_of(span.start as usize);
+                    let last = scan.line_of(span.end());
+                    self.kinds[open] = Kind::Delimiter;
+                    for kind in &mut self.kinds[open + 1..=last] {
+                        *kind = Kind::Verbatim;
+                    }
+                    if last > open && scan.closes(open, last) {
+                        self.kinds[last] = Kind::Delimiter;
+                    }
+                }
+                Block::Table { header, rows, .. } => {
+                    let table = self.tables.len();
+                    let lines: Vec<usize> = std::iter::once(header)
+                        .chain(rows)
+                        .map(|r| scan.line_of(r.span.start as usize))
+                        .collect();
+                    for (row, &k) in lines.iter().enumerate() {
+                        self.kinds[k] = Kind::TableRow { table, row };
+                    }
+                    self.tables.push(lines);
+                }
+                Block::List { items, .. } => {
+                    for item in items {
+                        self.mark_blocks(&item.children, scan);
+                    }
+                }
+                Block::Blockquote { children, .. } | Block::BlockShortcode { children, .. } => {
+                    self.mark_blocks(children, scan);
+                }
+                Block::Heading { .. }
+                | Block::Paragraph { .. }
+                | Block::DefinitionList { .. }
+                | Block::HorizontalRule { .. } => {}
+            }
+        }
+    }
 }
 
 /// Returns (byte length of leading-whitespace prefix, the prefix as a
@@ -194,105 +310,18 @@ fn leading_indent(line: &str) -> (usize, &str) {
     (n, &line[..n])
 }
 
-struct PassResult {
-    lines: Vec<String>,
-    regions: Vec<Region>,
-}
-
-fn apply_transforms(lines: &[&str], regions: &[Region], opts: &Opts) -> PassResult {
-    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
-    let mut out_regions: Vec<Region> = Vec::with_capacity(lines.len());
-
-    let mut i = 0;
-    while i < lines.len() {
-        match regions[i] {
-            Region::Default => {
-                out_lines.push(transform_brief_line(lines[i]));
-                out_regions.push(Region::Default);
-                i += 1;
-            }
-            Region::FrontmatterOpen => {
-                out_lines.push("+++".to_string());
-                out_regions.push(Region::FrontmatterOpen);
-                i += 1;
-            }
-            Region::FrontmatterClose => {
-                out_lines.push("+++".to_string());
-                out_regions.push(Region::FrontmatterClose);
-                i += 1;
-            }
-            Region::FrontmatterBody => {
-                let start = i;
-                while i < lines.len() && regions[i] == Region::FrontmatterBody {
-                    i += 1;
-                }
-                let body_slice = &lines[start..i];
-                let processed = process_frontmatter_body(body_slice, opts);
-                for l in processed {
-                    out_lines.push(l);
-                    out_regions.push(Region::FrontmatterBody);
-                }
-            }
-            Region::CodeFenceOpen => {
-                // Strip trailing whitespace from the fence line; never touch
-                // the language tag or attributes.
-                out_lines.push(strip_trailing_ws(lines[i]).to_string());
-                out_regions.push(Region::CodeFenceOpen);
-                i += 1;
-            }
-            Region::CodeFenceClose => {
-                out_lines.push(strip_trailing_ws(lines[i]).to_string());
-                out_regions.push(Region::CodeFenceClose);
-                i += 1;
-            }
-            Region::CodeFenceBody => {
-                // Verbatim: never alter code-block contents. The lexer
-                // strips trailing whitespace before tokenizing so we don't
-                // need to either.
-                out_lines.push(lines[i].to_string());
-                out_regions.push(Region::CodeFenceBody);
-                i += 1;
-            }
-            Region::BlockComment => {
-                // Strip trailing whitespace; otherwise verbatim.
-                out_lines.push(strip_trailing_ws(lines[i]).to_string());
-                out_regions.push(Region::BlockComment);
-                i += 1;
-            }
-            Region::TableDirective => {
-                out_lines.push(transform_brief_line(lines[i]));
-                out_regions.push(Region::TableDirective);
-                i += 1;
-            }
-            Region::TableRow => {
-                let start = i;
-                while i < lines.len() && regions[i] == Region::TableRow {
-                    i += 1;
-                }
-                let formatted = format_table(&lines[start..i]);
-                for l in formatted {
-                    out_lines.push(l);
-                    out_regions.push(Region::TableRow);
-                }
-            }
-        }
-    }
-
-    PassResult {
-        lines: out_lines,
-        regions: out_regions,
-    }
-}
-
-/// Transform a Brief region line: tabs in the leading indent become two
-/// spaces each, then trailing whitespace is stripped.
+/// Transform a Brief line: tabs in the leading indent become two spaces
+/// each, then trailing whitespace is stripped. A whitespace-only line
+/// becomes empty; the lexer reads both as blank.
 fn transform_brief_line(line: &str) -> String {
-    let stripped = strip_trailing_ws(line);
-    detab_indent(stripped)
+    if line.trim().is_empty() {
+        return String::new();
+    }
+    detab_indent(strip_trailing_ws(line))
 }
 
 fn strip_trailing_ws(line: &str) -> &str {
-    line.trim_end_matches(|c: char| c == ' ' || c == '\t' || c == '\r')
+    line.trim_end_matches([' ', '\t', '\r'])
 }
 
 /// Replace every leading tab with two spaces. Tabs after the first
@@ -300,46 +329,21 @@ fn strip_trailing_ws(line: &str) -> &str {
 /// presumably typed deliberately, and brief's lexer will surface them as
 /// B0102 errors so the user can address them directly.
 fn detab_indent(line: &str) -> String {
-    let (n, _) = leading_indent(line);
-    if n == 0 {
+    let (n, prefix) = leading_indent(line);
+    if !prefix.contains('\t') {
         return line.to_string();
     }
-    let prefix = &line[..n];
-    let rest = &line[n..];
-    let mut out = String::with_capacity(line.len() + 4);
-    for c in prefix.chars() {
-        if c == '\t' {
-            out.push(' ');
-            out.push(' ');
-        } else {
-            out.push(c);
-        }
-    }
-    out.push_str(rest);
+    let mut out = prefix.replace('\t', "  ");
+    out.push_str(&line[n..]);
     out
 }
 
-fn process_frontmatter_body(body_lines: &[&str], opts: &Opts) -> Vec<String> {
-    if !opts.sort_frontmatter {
-        return body_lines
-            .iter()
-            .map(|l| strip_trailing_ws(l).to_string())
-            .collect();
-    }
-
+/// Sort the top-level keys of a frontmatter body. `None` when the body is
+/// not valid TOML: the compiler reports that (B0314), and re-emitting it
+/// could drop data.
+fn sort_frontmatter(body_lines: &[&str]) -> Option<Vec<String>> {
     let body: String = body_lines.join("\n");
-    let parsed: Result<toml::Table, _> = toml::from_str(&body);
-    let table = match parsed {
-        Ok(t) => t,
-        Err(_) => {
-            // Bad TOML: don't risk dropping data. Leave the body alone (the
-            // compiler will surface B0314 on next compile).
-            return body_lines
-                .iter()
-                .map(|l| strip_trailing_ws(l).to_string())
-                .collect();
-        }
-    };
+    let table: toml::Table = toml::from_str(&body).ok()?;
 
     // Convert through a BTreeMap to guarantee alphabetical ordering of
     // top-level keys. Subkeys within nested tables are not reordered here
@@ -350,144 +354,77 @@ fn process_frontmatter_body(body_lines: &[&str], opts: &Opts) -> Vec<String> {
     for (k, v) in sorted {
         wrap.insert(k, v);
     }
-    let serialized = match toml::to_string(&wrap) {
-        Ok(s) => s,
-        Err(_) => {
-            return body_lines
-                .iter()
-                .map(|l| strip_trailing_ws(l).to_string())
-                .collect();
-        }
-    };
+    let serialized = toml::to_string(&wrap).ok()?;
 
     // Strip the trailing newline `to_string` always appends.
     let trimmed = serialized.trim_end_matches('\n');
-    trimmed.split('\n').map(|s| s.to_string()).collect()
+    Some(trimmed.split('\n').map(|s| s.to_string()).collect())
 }
 
+/// Realign a table so its `|` separators line up. Cells come from
+/// `parser::split_cells`, the splitter the parser itself uses, so an
+/// escaped `\|` or a pipe inside a code span stays inside its cell.
 fn format_table(rows: &[&str]) -> Vec<String> {
-    if rows.is_empty() {
-        return Vec::new();
-    }
-
-    struct Parsed {
-        indent: String,
-        cells: Vec<String>,
-    }
-
-    let parsed: Vec<Parsed> = rows
+    let split: Vec<Option<(String, Vec<&str>)>> = rows
         .iter()
         .map(|line| {
-            let stripped = strip_trailing_ws(line);
-            let (n, _) = leading_indent(stripped);
-            let indent_raw = &stripped[..n];
+            let line = strip_trailing_ws(line);
+            let body = line.trim_start();
+            let cells = parser::split_cells(body);
+            if cells.unclosed_backtick_at.is_some() {
+                return None;
+            }
             // Tabs in the indent of a table row → two spaces, same rule as
             // the rest of brief.
-            let indent: String = indent_raw
-                .chars()
-                .flat_map(|c| {
-                    if c == '\t' {
-                        vec![' ', ' '].into_iter()
-                    } else {
-                        vec![c].into_iter()
-                    }
-                })
-                .collect();
-            let body = &stripped[n..];
-            let cells = parse_table_cells(body);
-            Parsed { indent, cells }
+            let indent = line[..line.len() - body.len()].replace('\t', "  ");
+            Some((indent, cells.cells))
         })
         .collect();
 
-    let max_cols = parsed.iter().map(|p| p.cells.len()).max().unwrap_or(0);
-    if max_cols == 0 {
-        return parsed.iter().map(|p| format!("{}|", p.indent)).collect();
-    }
-
-    let mut widths = vec![0usize; max_cols];
-    for p in &parsed {
-        for (i, cell) in p.cells.iter().enumerate() {
+    let mut widths: Vec<usize> = Vec::new();
+    for (_, cells) in split.iter().flatten() {
+        for (i, cell) in cells.iter().enumerate() {
             let w = cell.chars().count();
-            if w > widths[i] {
-                widths[i] = w;
+            match widths.get_mut(i) {
+                Some(max) => *max = (*max).max(w),
+                None => widths.push(w),
             }
         }
     }
 
-    parsed
-        .iter()
-        .map(|p| {
-            let mut out = p.indent.clone();
-            out.push('|');
-            for (idx, cell) in p.cells.iter().enumerate() {
-                out.push(' ');
-                out.push_str(cell);
-                let pad = widths[idx].saturating_sub(cell.chars().count());
-                if idx + 1 < p.cells.len() {
-                    for _ in 0..pad {
-                        out.push(' ');
-                    }
-                    out.push(' ');
-                    out.push('|');
-                }
-                // Last cell: no trailing pad and no trailing `|` — matches
-                // brief table convention (cf. parser::split_cells, which
-                // tolerates either form on input).
-            }
-            out
+    rows.iter()
+        .zip(&split)
+        .map(|(line, split)| match split {
+            Some((indent, cells)) => render_row(indent, cells, &widths),
+            // The parser drops a row with an unclosed code span (B0208);
+            // leave it for the user to fix.
+            None => transform_brief_line(line),
         })
         .collect()
 }
 
-fn parse_table_cells(body: &str) -> Vec<String> {
-    // Mirrors parser::split_cells: tolerate optional trailing `|`, strip
-    // leading `|`, split on `|`, trim each cell.
-    let trimmed = body.trim_end_matches(|c: char| c == ' ' || c == '\t');
-    let trimmed = trimmed.trim_end_matches('|');
-    let inner = if let Some(rest) = trimmed.strip_prefix('|') {
-        rest
-    } else {
-        trimmed
-    };
-    inner.split('|').map(|s| s.trim().to_string()).collect()
-}
-
-fn collapse_blanks(lines: &[String], regions: &[Region]) -> PassResult {
-    let mut out_lines = Vec::with_capacity(lines.len());
-    let mut out_regions = Vec::with_capacity(lines.len());
-    let mut prev_was_blank = false;
-    for (line, region) in lines.iter().zip(regions.iter()) {
-        let is_blank = line.trim().is_empty();
-        if is_blank && region.collapsible() {
-            if prev_was_blank {
-                continue;
-            }
-            prev_was_blank = true;
-            // Canonical blank line: literally empty.
-            out_lines.push(String::new());
-            out_regions.push(*region);
-        } else {
-            prev_was_blank = false;
-            out_lines.push(line.clone());
-            out_regions.push(*region);
+fn render_row(indent: &str, cells: &[&str], widths: &[usize]) -> String {
+    let mut out = String::from(indent);
+    out.push('|');
+    for (i, cell) in cells.iter().enumerate() {
+        if i + 1 < cells.len() {
+            out.push(' ');
+            out.push_str(cell);
+            let pad = widths[i].saturating_sub(cell.chars().count());
+            out.extend(std::iter::repeat_n(' ', pad));
+            out.push_str(" |");
+        } else if !cell.is_empty() {
+            // Last cell: no trailing pad and no trailing `|` — the brief
+            // table convention.
+            out.push(' ');
+            out.push_str(cell);
+        } else if i > 0 {
+            // An empty last cell keeps its closing `|`: without one,
+            // split_cells reads the row as a column short.
+            out.push_str(" |");
         }
     }
-    PassResult {
-        lines: out_lines,
-        regions: out_regions,
-    }
-}
-
-fn trim_blank_edges(lines: &[String], regions: &[Region]) -> Vec<String> {
-    let mut start = 0;
-    while start < lines.len() && lines[start].trim().is_empty() && regions[start].collapsible() {
-        start += 1;
-    }
-    let mut end = lines.len();
-    while end > start && lines[end - 1].trim().is_empty() && regions[end - 1].collapsible() {
-        end -= 1;
-    }
-    lines[start..end].to_vec()
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,8 +480,12 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_bare_cr_to_lf() {
-        assert_eq!(fmt("a\rb\r"), "a\nb\n");
+    fn bare_cr_is_content_not_a_line_break() {
+        // The lexer splits lines on `\n` only, so `a\rb` is one line to the
+        // compiler; turning the `\r` into `\n` would change the document.
+        // A `\r` at the end of a line is CRLF residue and goes.
+        assert_eq!(fmt("a\rb\r"), "a\rb\n");
+        assert_eq!(fmt("# a\rb\r\r\nc\r\n"), "# a\rb\nc\n");
     }
 
     #[test]
@@ -740,12 +681,8 @@ mod tests {
 
     #[test]
     fn empty_table_row_handled() {
-        let src = "@t\n|\n";
-        let out = fmt(src);
-        // Single empty cell: `|` followed by ` ` then nothing (last cell),
-        // so we render `| ` — but since the cell is empty and is the last
-        // column, no trailing pad. `|` alone with one space.
-        assert!(out.starts_with("@t\n|"));
+        // A single empty cell renders as a bare `|`, with no trailing space.
+        assert_eq!(fmt("@t\n|  \n"), "@t\n|\n");
     }
 
     #[test]
@@ -780,5 +717,141 @@ mod tests {
         assert_eq!(once, twice, "fmt is not idempotent on @dl");
         // Canonical input shouldn't be rewritten.
         assert_eq!(once, src, "fmt rewrote canonical @dl source");
+    }
+
+    #[test]
+    fn table_escaped_pipe_stays_inside_its_cell() {
+        // FMT-01: splitting on every `|` turned `a \| b` into two cells and
+        // the row into a B0502 column mismatch.
+        let src = "@t\n| a \\| b | c\n| d | e\n";
+        assert_eq!(fmt(src), "@t\n| a \\| b | c\n| d      | e\n");
+    }
+
+    #[test]
+    fn table_pipe_inside_code_span_stays_inside_its_cell() {
+        let src = "@t\n| `a|b` | c\n| d | e\n| ``x|y`` | f\n";
+        let expected = "@t\n| `a|b`   | c\n| d       | e\n| ``x|y`` | f\n";
+        assert_eq!(fmt(src), expected);
+    }
+
+    #[test]
+    fn table_empty_last_cell_keeps_its_closing_pipe() {
+        // `| a | |` is two cells; dropping the final `|` would leave one.
+        let src = "@t\n| a |  |\n| bb | c\n";
+        assert_eq!(fmt(src), "@t\n| a  | |\n| bb | c\n");
+    }
+
+    #[test]
+    fn table_trailing_pipe_dropped_and_ragged_rows_padded() {
+        let src = "@t\n| a | b |\n| ccc |\n";
+        assert_eq!(fmt(src), "@t\n| a   | b\n| ccc\n");
+    }
+
+    #[test]
+    fn table_row_with_unclosed_code_span_left_alone() {
+        // The parser drops this row (B0208); it takes no part in alignment.
+        let src = "@t\n| a | b\n| `x | y   \n| longer | c\n";
+        assert_eq!(fmt(src), "@t\n| a      | b\n| `x | y\n| longer | c\n");
+    }
+
+    #[test]
+    fn code_shortcode_body_is_verbatim() {
+        // FMT-02: blank runs, tables and trailing whitespace inside `@code`
+        // are code, not Brief.
+        let src = "@code(brief)\n@t\n| a | b\n| longer | c\n\n\n\nx   \n@end\n";
+        assert_eq!(fmt(src), src);
+    }
+
+    #[test]
+    fn lone_fence_inside_code_shortcode_does_not_open_a_fence() {
+        // A ``` line inside `@code` is body text. Reading it as a fence
+        // opener used to flip every later region inside out.
+        let src = "@code\n```\n@end\n\n\n\npara   \n\n```\nkeep   \n\n\n```\n";
+        let expected = "@code\n```\n@end\n\npara\n\n```\nkeep   \n\n\n```\n";
+        assert_eq!(fmt(src), expected);
+    }
+
+    #[test]
+    fn code_shortcode_delimiters_lose_trailing_whitespace_only() {
+        let src = "  @code(rust)   \n  let x = 1;  \n  @end  \n";
+        assert_eq!(fmt(src), "  @code(rust)\n  let x = 1;  \n  @end\n");
+    }
+
+    #[test]
+    fn code_shortcode_end_at_other_indent_is_body() {
+        // `@end` closes `@code` only at the opener's indent.
+        let src = "@code\n  @end   \n@end\n";
+        assert_eq!(fmt(src), src);
+    }
+
+    #[test]
+    fn tabs_inside_code_bodies_are_not_expanded() {
+        let src = "```make\nall:\n\tcc -o x x.c\t\n```\n@code\n\tx\n@end\n";
+        assert_eq!(fmt(src), src);
+    }
+
+    #[test]
+    fn tab_indent_outside_code_is_expanded() {
+        let src = "- a\n\t- b\t\n```\n\tbody\n```\n";
+        assert_eq!(fmt(src), "- a\n  - b\n```\n\tbody\n```\n");
+    }
+
+    #[test]
+    fn code_fence_inside_list_item_is_verbatim() {
+        let src = "- item\n\n  ```\n  a   \n\n\n  ```\n";
+        assert_eq!(fmt(src), src);
+    }
+
+    #[test]
+    fn code_fence_delimiters_lose_trailing_whitespace() {
+        assert_eq!(fmt("```rust   \nx\n```   \n"), "```rust\nx\n```\n");
+    }
+
+    #[test]
+    fn unterminated_code_fence_runs_to_eof_untouched() {
+        // The parser reads everything after an unclosed fence as its body,
+        // trailing blank lines included.
+        let src = "para  \n```\ncode   \n\n\n";
+        assert_eq!(fmt(src), "para\n```\ncode   \n\n\n");
+    }
+
+    #[test]
+    fn fence_lookalikes_inside_block_comment_do_not_open_regions() {
+        let src = "/*\n```\n*/\npara   \n";
+        assert_eq!(fmt(src), "/*\n```\n*/\npara\n");
+    }
+
+    #[test]
+    fn frontmatter_body_is_verbatim() {
+        let src = "+++   \ntitle = \"\"\"\nkeep   \n\n\n\"\"\"\n+++\nbody   \n";
+        let expected = "+++\ntitle = \"\"\"\nkeep   \n\n\n\"\"\"\n+++\nbody\n";
+        assert_eq!(fmt(src), expected);
+    }
+
+    #[test]
+    fn plus_line_behind_leading_blank_is_not_promoted_to_frontmatter() {
+        // Frontmatter must start at byte 0; trimming the blank would make
+        // the parser read these lines as TOML.
+        assert_eq!(fmt("\n\n+++\nx\n+++\n"), "\n+++\nx\n+++\n");
+        assert_eq!(fmt("\n\nhello\n"), "hello\n");
+    }
+
+    #[test]
+    fn idempotent_on_adversarial_inputs() {
+        let inputs = [
+            "@t\n| a \\| b | c\n| d | e\n",
+            "@code(brief)\n@t\n| a | b\n\n\n@end\n",
+            "@code\n```\n@end\n\n\n\npara   \n",
+            "\n\n+++\nx\n+++\n",
+            "```\ncode   \n\n\n",
+            "@t\n| a |  |\n| bb | c\n",
+            "\t```\n\tx\n\t```\n",
+            "a\r\r\nb\r",
+        ];
+        for src in &inputs {
+            let once = fmt(src);
+            let twice = fmt(&once);
+            assert_eq!(once, twice, "not idempotent for: {:?}", src);
+        }
     }
 }

@@ -6,7 +6,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use brief_web::scaffold::ScaffoldOpts;
 use brief_web::server::{ReloadBroadcaster, ReloadEvent, ServerOptions};
 use brief_web::watch::{default_watch_paths, watch};
-use brief_web::{Builder, scaffold, server};
+use brief_web::{BuildError, BuildOutcome, Builder, scaffold, server};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -38,6 +38,9 @@ enum Cmd {
         /// Project directory.
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Fail the build on warnings as well as errors.
+        #[arg(long)]
+        deny_warnings: bool,
     },
     /// Build, then serve the site with live reload.
     Serve {
@@ -53,6 +56,9 @@ enum Cmd {
         /// Skip the watcher; serve the existing `dist/` as-is.
         #[arg(long)]
         no_watch: bool,
+        /// Fail builds on warnings as well as errors.
+        #[arg(long)]
+        deny_warnings: bool,
     },
 }
 
@@ -60,13 +66,17 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Init { path, multi, force } => init(path, multi, force),
-        Cmd::Build { path } => build(path),
+        Cmd::Build {
+            path,
+            deny_warnings,
+        } => build(path, deny_warnings),
         Cmd::Serve {
             path,
             host,
             port,
             no_watch,
-        } => serve(path, host, port, no_watch),
+            deny_warnings,
+        } => serve(path, host, port, no_watch, deny_warnings),
     }
 }
 
@@ -94,19 +104,18 @@ fn init(path: PathBuf, multi: bool, force: bool) -> ExitCode {
     }
 }
 
-fn build(path: PathBuf) -> ExitCode {
-    let builder = match Builder::new(&path) {
+fn build(path: PathBuf, deny_warnings: bool) -> ExitCode {
+    let mut builder = match Builder::new(&path) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("brief-web: {}", e);
             return ExitCode::from(2);
         }
     };
+    builder.deny_warnings = deny_warnings;
     match builder.build() {
         Ok(o) => {
-            for w in &o.warnings {
-                eprintln!("brief-web: warning: {}", w);
-            }
+            print_warnings(&o);
             eprintln!(
                 "brief-web: built {} page{} → {}",
                 o.pages_built,
@@ -116,9 +125,22 @@ fn build(path: PathBuf) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("brief-web: build failed:\n{}", e);
+            print_report(&e);
+            eprintln!("brief-web: build failed: {}", e.message);
             ExitCode::from(1)
         }
+    }
+}
+
+fn print_warnings(o: &BuildOutcome) {
+    if !o.warnings.is_empty() {
+        eprintln!("{}", o.warnings.join("\n"));
+    }
+}
+
+fn print_report(e: &BuildError) {
+    if !e.report.is_empty() {
+        eprintln!("{}", e.report);
     }
 }
 
@@ -127,6 +149,7 @@ fn serve(
     host_override: Option<String>,
     port_override: Option<u16>,
     no_watch: bool,
+    deny_warnings: bool,
 ) -> ExitCode {
     let mut builder = match Builder::new(&path) {
         Ok(b) => b,
@@ -136,17 +159,17 @@ fn serve(
         }
     };
     builder.inject_reload = !no_watch;
+    builder.deny_warnings = deny_warnings;
 
     let initial = match builder.build() {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("brief-web: initial build failed:\n{}", e);
+            print_report(&e);
+            eprintln!("brief-web: initial build failed: {}", e.message);
             return ExitCode::from(1);
         }
     };
-    for w in &initial.warnings {
-        eprintln!("brief-web: warning: {}", w);
-    }
+    print_warnings(&initial);
     eprintln!(
         "brief-web: built {} page{} for serve",
         initial.pages_built,
@@ -169,15 +192,16 @@ fn serve(
             let b = shared.lock().unwrap();
             match b.build() {
                 Ok(o) => {
-                    for w in &o.warnings {
-                        eprintln!("brief-web: warning: {}", w);
-                    }
+                    print_warnings(&o);
                     eprintln!("brief-web: rebuilt {} pages", o.pages_built);
                     bcast_for_watch.broadcast(ReloadEvent::Reload);
                 }
+                // The builder writes nothing until every page is clean, so
+                // the server keeps serving the last good output.
                 Err(e) => {
-                    eprintln!("brief-web: rebuild failed:\n{}", e);
-                    bcast_for_watch.broadcast(ReloadEvent::BuildError(e));
+                    print_report(&e);
+                    eprintln!("brief-web: rebuild failed: {}", e.message);
+                    bcast_for_watch.broadcast(ReloadEvent::BuildError(e.message));
                 }
             }
         });

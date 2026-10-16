@@ -531,9 +531,8 @@ fn render_inline_shortcode(
             let _ = write!(out, "[^{}]", ctx.footnotes.len());
         }
         "ref" => {
-            let display = ctx
-                .resolved_refs
-                .get(&span)
+            let resolved = ctx.resolved_refs.get(&span);
+            let display = resolved
                 .map(|r| r.display.clone())
                 .or_else(|| {
                     args.keyword
@@ -548,9 +547,18 @@ fn render_inline_shortcode(
                         .map(String::from)
                 })
                 .unwrap_or_default();
-            // Use the target as the author wrote it (relative to this file)
-            // rather than the project-relative resolved path, so links keep
-            // working when a whole tree is converted in place.
+            // `@ref` targets are project-relative; the resolver has already
+            // rewritten them relative to this file, so links keep working
+            // when a whole tree is converted in place.
+            if let Some(r) = resolved {
+                out.push('[');
+                render_text(&display, out, false);
+                out.push_str("](");
+                out.push_str(&r.href("md"));
+                out.push(')');
+                return;
+            }
+            // Unresolved (no project): fall back to the target as written.
             let target: String = content
                 .map(|c| {
                     let mut s = String::new();

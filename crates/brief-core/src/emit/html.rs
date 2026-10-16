@@ -35,11 +35,8 @@ fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
             anchor,
             ..
         } => {
-            if let Some(a) = anchor {
-                let _ = write!(out, "<h{} id=\"{}\">", level, escape_attr(a));
-            } else {
-                let _ = write!(out, "<h{}>", level);
-            }
+            let id = crate::slug::heading_id(content, anchor.as_deref());
+            let _ = write!(out, "<h{} id=\"{}\">", level, escape_attr(&id));
             render_inline_seq(content, ctx, out);
             let _ = writeln!(out, "</h{}>", level);
         }
@@ -100,6 +97,14 @@ fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
             out.push_str("</dl>\n");
         }
         Block::HorizontalRule { .. } => out.push_str("<hr>\n"),
+        Block::BlockShortcode {
+            name,
+            args,
+            children,
+            ..
+        } if name == "math" => {
+            render_math(true, args, &super::math_block_source(children), ctx, out);
+        }
         Block::BlockShortcode {
             name,
             args,
@@ -230,26 +235,25 @@ fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
                 .or(title_pos)
                 .unwrap_or("");
             if let Some(r) = resolved {
-                let mut url = r.target_path.clone();
-                debug_assert!(
-                    url.ends_with(".brf"),
-                    "ResolvedRef.target_path must end in .brf"
-                );
-                url.replace_range(url.len() - 4.., ".html");
-                if let Some(a) = &r.target_anchor {
-                    url.push('#');
-                    url.push_str(a);
-                }
                 let _ = write!(
                     out,
                     "<a href=\"{}\">{}</a>",
-                    escape_attr(&url),
+                    escape_attr(&r.href("html")),
                     escape_html(display_text)
                 );
             } else {
                 // No project context — emit display text only, no anchor.
                 let _ = write!(out, "{}", escape_html(display_text));
             }
+        }
+        Inline::Shortcode {
+            name,
+            args,
+            content,
+            ..
+        } if name == "math" => {
+            let tex = super::math_source(content.as_deref().unwrap_or_default());
+            render_math(false, args, &tex, ctx, out);
         }
         Inline::Shortcode {
             name,
@@ -313,6 +317,12 @@ fn render_shortcode_html(
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("#");
+            // Resolve rejects these with B0410; a caller that renders
+            // anyway still must not get a script-carrying href.
+            if crate::resolve::disallowed_scheme(url).is_some() {
+                out.push_str(inner.unwrap_or(""));
+                return;
+            }
             let title = args.keyword.get("title").and_then(|v| v.as_str());
             if let Some(t) = title {
                 let _ = write!(
@@ -342,6 +352,11 @@ fn render_shortcode_html(
                 .get("alt")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let src = if crate::resolve::disallowed_scheme(src).is_some() {
+                ""
+            } else {
+                src
+            };
             let _ = write!(
                 out,
                 "<img src=\"{}\" alt=\"{}\">",
@@ -384,12 +399,9 @@ fn render_shortcode_html(
                 inner.unwrap_or("")
             );
         }
-        "math" => {
-            let raw = inner.unwrap_or("");
-            let _ = write!(out, "<span class=\"math\">{}</span>", escape_html(raw));
-        }
         // `@code` never reaches the emitter as a shortcode: the parser turns
-        // it into a `Block::CodeBlock` so the body stays verbatim.
+        // it into a `Block::CodeBlock` so the body stays verbatim. `@math`
+        // goes through `render_math` for the same reason.
         _ => {
             let _ = write!(
                 out,
@@ -398,6 +410,21 @@ fn render_shortcode_html(
                 inner.unwrap_or("")
             );
         }
+    }
+}
+
+/// `@math` bodies are raw TeX: escaped exactly once, never rendered as
+/// Brief inline content or wrapped in `<p>`.
+fn render_math(display: bool, args: &ShortArgs, tex: &str, ctx: &Ctx, out: &mut String) {
+    let tex = escape_html(tex);
+    if let Some(t) = ctx.reg.get("math").and_then(|sc| sc.template_html.as_ref()) {
+        out.push_str(&expand_template(t, args, &tex));
+        return;
+    }
+    if display {
+        let _ = writeln!(out, "<div class=\"math math-display\">{}</div>", tex);
+    } else {
+        let _ = write!(out, "<span class=\"math math-inline\">{}</span>", tex);
     }
 }
 
@@ -597,7 +624,7 @@ mod tests {
         let out = render_html("+++\ntitle = \"hi\"\n+++\n# Doc\n");
         assert!(!out.contains("+++"), "{}", out);
         assert!(!out.contains("title"), "{}", out);
-        assert!(out.contains("<h1>Doc</h1>"));
+        assert!(out.contains("<h1 id=\"doc\">Doc</h1>"), "{}", out);
     }
 
     fn parse_doc(s: &str) -> crate::ast::Document {
@@ -658,6 +685,100 @@ mod tests {
             "got: {}",
             html
         );
+    }
+
+    #[test]
+    fn every_heading_gets_an_id() {
+        let out = render_html(concat!(
+            "# Install Steps\n\n",
+            "## Linux {#linux-setup}\n\n",
+            "### *Café* and `x_y()`\n\n",
+            "#### ???\n"
+        ));
+        assert_eq!(
+            out,
+            concat!(
+                "<h1 id=\"install-steps\">Install Steps</h1>\n",
+                "<h2 id=\"linux-setup\">Linux</h2>\n",
+                "<h3 id=\"café-and-x_y\"><strong>Café</strong> and <code>x_y()</code></h3>\n",
+                "<h4 id=\"section\">???</h4>\n"
+            )
+        );
+    }
+
+    fn render_ref_from(current: &str, src: &str, files: &[(&str, &[&str])]) -> String {
+        use crate::project::ProjectIndex;
+        use crate::resolve::{ResolveProject, resolve_with_project};
+        use std::path::PathBuf;
+        let mut doc = parse_doc(src);
+        let mut idx = ProjectIndex::default();
+        for (path, anchors) in files {
+            idx.anchors.insert(
+                path.to_string(),
+                anchors.iter().map(|s| s.to_string()).collect(),
+            );
+        }
+        let p = ResolveProject {
+            index: &idx,
+            current: &PathBuf::from(current),
+        };
+        let reg = crate::shortcode::Registry::with_builtins();
+        let diags = resolve_with_project(&mut doc, &reg, Some(&p));
+        assert!(diags.is_empty(), "{:?}", diags);
+        render(&doc, &reg)
+    }
+
+    #[test]
+    fn ref_href_is_relative_to_the_current_page() {
+        let files: &[(&str, &[&str])] = &[
+            ("guide.brf", &["x"]),
+            ("sub/a.brf", &["top"]),
+            ("sub/b.brf", &[]),
+        ];
+        let html = render_ref_from(
+            "sub/a.brf",
+            "@ref[guide.brf#x](G) @ref[sub/b.brf](B) @ref[sub/a.brf#top](T)\n",
+            files,
+        );
+        assert_eq!(
+            html,
+            "<p><a href=\"../guide.html#x\">G</a> <a href=\"b.html\">B</a> <a href=\"#top\">T</a></p>\n"
+        );
+    }
+
+    #[test]
+    fn link_and_image_urls_are_attribute_escaped() {
+        let doc = {
+            let mut d = parse_doc(
+                "x @link[q](https://e.com/?a=1&b=\"2\"<i>) @image(src: \"a&b.png\", alt: \"<\\\"\")\n",
+            );
+            let reg = Registry::with_builtins();
+            let diags = crate::resolve::resolve(&mut d, &reg);
+            assert!(diags.is_empty(), "{:?}", diags);
+            d
+        };
+        let out = render(&doc, &Registry::with_builtins());
+        assert_eq!(
+            out,
+            "<p>x <a href=\"https://e.com/?a=1&amp;b=&quot;2&quot;&lt;i&gt;\">q</a> <img src=\"a&amp;b.png\" alt=\"&lt;&quot;\"></p>\n"
+        );
+    }
+
+    #[test]
+    fn unsafe_urls_never_reach_href_or_src() {
+        // Resolve reports B0410; a caller that renders anyway gets no link.
+        let mut doc =
+            parse_doc("x @link[me](JavaScript:alert(1)) @image(src: \"data:x\", alt: \"a\")\n");
+        let reg = Registry::with_builtins();
+        let codes: Vec<_> = crate::resolve::resolve(&mut doc, &reg)
+            .iter()
+            .map(|d| d.code)
+            .collect();
+        assert_eq!(
+            codes,
+            [crate::diag::Code::UnsafeUrl, crate::diag::Code::UnsafeUrl]
+        );
+        assert_eq!(render(&doc, &reg), "<p>x me <img src=\"\" alt=\"a\"></p>\n");
     }
 
     #[test]

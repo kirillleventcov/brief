@@ -15,23 +15,39 @@
 use brief::lexer;
 use brief::parser;
 use brief::span::SourceMap;
+use std::path::Path;
+
+/// What the compiler front-end makes of `source`: the span-stripped AST
+/// and the diagnostic codes, in order. `None` if the source does not lex.
+fn parse_summary(source: &str) -> Option<(String, Vec<brief::Code>)> {
+    // Every tool reads sources through `read_source`, which drops a BOM.
+    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let src = SourceMap::new("t.brf", source.to_string());
+    let toks = lexer::lex(&src).ok()?;
+    let (doc, diags) = parser::parse(toks, &src);
+    // Tabs and stray BOMs outside verbatim regions are what fmt exists to
+    // repair, so fixing them is allowed to change the parse.
+    if diags.iter().any(|d| {
+        matches!(
+            d.code,
+            brief::Code::TabCharacter | brief::Code::BomNotAtStart
+        )
+    }) {
+        return None;
+    }
+    let codes = diags.iter().map(|d| d.code).collect();
+    Some((strip_spans(&format!("{:#?}", doc)), codes))
+}
 
 fn parse_doc_string(source: &str) -> String {
-    let src = SourceMap::new("t.brf", source.to_string());
-    let toks = lexer::lex(&src).expect("lex must succeed for fixture inputs");
-    let (doc, diags) = parser::parse(toks, &src);
-    let errs: Vec<_> = diags
-        .iter()
-        .filter(|d| d.severity == brief::diag::Severity::Error)
-        .collect();
+    let (doc, codes) = parse_summary(source).expect("lex must succeed for fixture inputs");
     assert!(
-        errs.is_empty(),
-        "fixture parsed with errors: {:?}\nsrc: {:?}",
-        errs,
+        codes.is_empty(),
+        "fixture parsed with diagnostics: {:?}\nsrc: {:?}",
+        codes,
         source
     );
-    let dbg = format!("{:#?}", doc);
-    strip_spans(&dbg)
+    doc
 }
 
 /// Remove `Span { start: N, len: N }` segments from a debug dump so two
@@ -56,8 +72,10 @@ fn strip_spans(s: &str) -> String {
             out.push_str("Span{}");
             i = j;
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            // Copy the whole UTF-8 sequence, not a single byte.
+            let ch = s[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
         }
     }
     out
@@ -72,6 +90,26 @@ fn assert_semantic_preserved(label: &str, src: &str) {
         raw_doc, fmt_doc,
         "[{}] format() changed parsed AST\n--- raw ---\n{}\n--- formatted ---\n{}",
         label, src, formatted
+    );
+}
+
+/// The full contract for any input, valid or not: formatting is
+/// idempotent, and when the input lexes, the formatted source parses to
+/// the same AST with the same diagnostics.
+fn assert_fmt_contract(label: &str, src: &str) {
+    let opts = brief::fmt::Opts::default();
+    let once = brief::fmt::format(src, &opts);
+    let twice = brief::fmt::format(&once, &opts);
+    assert_eq!(once, twice, "[{}] format() is not idempotent", label);
+    let Some(before) = parse_summary(src) else {
+        return;
+    };
+    let after = parse_summary(&once)
+        .unwrap_or_else(|| panic!("[{}] formatted source no longer lexes:\n{}", label, once));
+    assert_eq!(
+        before, after,
+        "[{}] format() changed what the parser sees\n--- raw ---\n{}\n--- formatted ---\n{}",
+        label, src, once
     );
 }
 
@@ -145,6 +183,93 @@ fn semantic_preserved_dirty_input() {
 fn semantic_preserved_frontmatter_passthrough() {
     let src = "+++\nz = 1\na = 2\n+++\n# Doc\n";
     assert_semantic_preserved("frontmatter", src);
+}
+
+#[test]
+fn semantic_preserved_table_escaped_pipe() {
+    // FMT-01: this used to come back as a B0502 column mismatch.
+    assert_semantic_preserved("escaped_pipe", "@t\n| a \\| b | c\n| d | e\n");
+}
+
+#[test]
+fn semantic_preserved_table_pipe_in_code_span() {
+    assert_semantic_preserved("code_span_pipe", "@t\n| `a|b` | c\n| d | e\n");
+    assert_semantic_preserved("double_tick_pipe", "@t\n| ``a|b`` | c\n| d | e\n");
+}
+
+#[test]
+fn semantic_preserved_table_empty_last_cell() {
+    assert_semantic_preserved("empty_last_cell", "@t\n| a |  |\n| bb | c\n");
+}
+
+#[test]
+fn semantic_preserved_code_shortcode_body() {
+    // FMT-02: blank runs and tables inside `@code` are code.
+    assert_semantic_preserved(
+        "code_shortcode",
+        "@code(brief)\n@t\n| a | b\n| longer | c\n\n\n\nx   \n@end\n",
+    );
+}
+
+#[test]
+fn semantic_preserved_lone_fence_inside_code_shortcode() {
+    assert_semantic_preserved(
+        "lone_fence",
+        "@code\n```\n@end\n\n\n\npara   \n\n```\nkeep\n\n\n```\n",
+    );
+}
+
+#[test]
+fn contract_holds_for_adversarial_inputs() {
+    let cases = [
+        ("unterminated_fence", "para\n```\ncode   \n\n\n"),
+        ("unterminated_code_shortcode", "@code\nx\n\n\n"),
+        (
+            "unterminated_frontmatter",
+            "+++\nx = 1\n\n\n# not a heading\n",
+        ),
+        ("plus_after_blank", "\n\n+++\nx = 1\n+++\n"),
+        (
+            "fence_in_comment",
+            "/*\n```\n*/\npara   \n\n\n```\nx\n\n\n```\n",
+        ),
+        ("fence_in_list", "- item\n\n  ```\n  a\n\n\n  ```\n- next\n"),
+        ("end_at_other_indent", "@code\n  @end\n\n\nx\n@end\n"),
+        (
+            "table_in_shortcode",
+            "@callout(kind: info)\n@t\n| a | bb\n| ccc | d\n@end\n",
+        ),
+        (
+            "unclosed_backtick_row",
+            "@t\n| a | b\n| `x | y\n| longer | c\n",
+        ),
+        ("column_mismatch", "@t\n| a | b\n| c\n| d | e | f\n"),
+        ("bare_cr", "# a\rb\r\nbody\r\n"),
+        ("bom", "\u{feff}+++\nx = 1\n+++\n# Doc\n"),
+        ("tab_in_code", "```\n\tx\n```\n"),
+        ("tab_indent", "- a\n\t- b\n"),
+        ("trailing_ws_in_fence", "```\nx   \n\n\n```\n"),
+    ];
+    for (label, src) in cases {
+        assert_fmt_contract(label, src);
+    }
+}
+
+#[test]
+fn contract_holds_for_every_repo_source() {
+    // Every `.brf` in the workspace: the docs, the examples,
+    // LearnXinYminutes, test fixtures and the fuzz corpus.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let files = brief::project::brf_files(&root);
+    assert!(
+        files.len() > 20,
+        "expected the repo corpus, found {} files",
+        files.len()
+    );
+    for path in files {
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_fmt_contract(&path.display().to_string(), &raw);
+    }
 }
 
 #[test]

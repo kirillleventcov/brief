@@ -4,13 +4,16 @@
 //! specification when no alternative is negotiated). All byte offsets coming
 //! out of brief-core are converted to UTF-16 code-unit columns via the helper
 //! `byte_offset_to_lsp_position`. This avoids any per-client negotiation
-//! complexity and is compatible with every editor out of the box.
+//! complexity and is compatible with every editor out of the box. The
+//! conversions accept any offset, in range or not, on a character boundary
+//! or not: the release build aborts on panic, so a bad span from core must
+//! never be able to take the server down.
 //!
-//! Project awareness: diagnostics run the same pipeline as `brief compile`
+//! Project awareness: diagnostics run the same front-end as `brief compile`
 //! (see `analysis`). The `brief.toml`-rooted snapshot (config, shortcode
 //! registry, `@ref` index) is cached per root and rebuilt on file open and
-//! save; open-buffer anchors are overlaid on the disk index on every
-//! change so unsaved edits resolve correctly.
+//! save; open buffers' anchors and broken state are overlaid on the disk
+//! index on every change so unsaved edits resolve correctly.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -24,7 +27,7 @@ use tracing::{info, warn};
 // (lib.name) is `brief` — match that.
 use brief::{diag::Severity, fmt, shortcode::ShortKindOpt};
 
-use crate::analysis::{self, Analysis, CompletionCtx, ProjectSnapshot};
+use crate::analysis::{self, Analysis, BufferEntry, CompletionCtx, ProjectSnapshot};
 
 // ---------------------------------------------------------------------------
 // Span → LSP Range conversion (UTF-16)
@@ -33,12 +36,14 @@ use crate::analysis::{self, Analysis, CompletionCtx, ProjectSnapshot};
 /// Convert a byte offset in `text` into an LSP `Position` using UTF-16
 /// code-unit columns (the default LSP encoding).
 ///
+/// An offset past the end clamps to the end, and one inside a multibyte
+/// character floors to that character's start.
+///
 /// The algorithm walks the source up to `byte_offset`, counting:
 /// - newlines → advance line, reset column to 0
 /// - characters → count UTF-16 code units (BMP = 1, supplementary = 2)
 fn byte_offset_to_lsp_position(text: &str, byte_offset: usize) -> Position {
-    let clamped = byte_offset.min(text.len());
-    let slice = &text[..clamped];
+    let slice = &text[..text.floor_char_boundary(byte_offset)];
 
     let mut line: u32 = 0;
     let mut character: u32 = 0;
@@ -60,7 +65,7 @@ fn byte_offset_to_lsp_position(text: &str, byte_offset: usize) -> Position {
 /// Convert a brief-core `Span` (byte start + length) into an LSP `Range`.
 fn span_to_lsp_range(text: &str, start: u32, len: u32) -> Range {
     let s = start as usize;
-    let e = (start + len) as usize;
+    let e = s + len as usize;
     let start_pos = byte_offset_to_lsp_position(text, s);
     let end_pos = byte_offset_to_lsp_position(text, e);
     Range {
@@ -73,6 +78,31 @@ fn span_to_lsp_range(text: &str, start: u32, len: u32) -> Range {
 // Backend
 // ---------------------------------------------------------------------------
 
+/// Convert one brief-core diagnostic into its LSP form against `text`.
+fn to_lsp_diagnostic(text: &str, d: &brief::diag::Diagnostic) -> Diagnostic {
+    let range = span_to_lsp_range(text, d.span.start, d.span.len);
+    let code_str = d.code.as_str();
+    let message = match &d.label {
+        Some(label) => format!("{}: {} ({})", code_str, label, d.code.message()),
+        None => format!("{}: {}", code_str, d.code.message()),
+    };
+    let severity = match d.severity {
+        Severity::Error => DiagnosticSeverity::ERROR,
+        Severity::Warning => DiagnosticSeverity::WARNING,
+    };
+    Diagnostic {
+        range,
+        severity: Some(severity),
+        code: Some(NumberOrString::String(code_str)),
+        code_description: None,
+        source: Some("brief".to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
+    }
+}
+
 /// Per-open-document state.
 #[derive(Debug)]
 struct DocState {
@@ -80,10 +110,10 @@ struct DocState {
     /// Filesystem path (canonicalized when possible); `None` for non-file
     /// URIs (untitled buffers), which are analyzed without project context.
     path: Option<PathBuf>,
-    /// Heading anchors of the current buffer content, refreshed on every
-    /// change. Overlaid over the disk index so other open documents see
-    /// unsaved anchor edits.
-    anchors: BTreeSet<String>,
+    /// The current buffer content's index entry (anchors, broken state),
+    /// refreshed on every change. Overlaid over the disk index so other
+    /// open documents see unsaved edits.
+    entry: BufferEntry,
 }
 
 /// (buffer text, filesystem path, project snapshot, pipeline result) for
@@ -129,9 +159,9 @@ impl Backend {
         Some(snap)
     }
 
-    /// Anchor sets of every *other* open buffer under `root`, keyed by
+    /// Index entries of every *other* open buffer under `root`, keyed by
     /// project-relative path.
-    fn overlay_for(&self, root: &Path, current: &Uri) -> BTreeMap<String, BTreeSet<String>> {
+    fn overlay_for(&self, root: &Path, current: &Uri) -> BTreeMap<String, BufferEntry> {
         let mut overlay = BTreeMap::new();
         for entry in self.docs.iter() {
             if entry.key() == current {
@@ -141,7 +171,7 @@ impl Backend {
                 continue;
             };
             if let Some(rel) = analysis::rel_path(root, p) {
-                overlay.insert(rel, entry.value().anchors.clone());
+                overlay.insert(rel, entry.value().entry.clone());
             }
         }
         overlay
@@ -164,7 +194,7 @@ impl Backend {
         let sourcemap_path = path.clone().unwrap_or_else(|| PathBuf::from(uri.as_str()));
         let analysis = analysis::analyze(&sourcemap_path, &text, snapshot.as_deref(), &overlay);
         if let Some(mut state) = self.docs.get_mut(uri) {
-            state.anchors = analysis.anchors.clone();
+            state.entry = analysis.entry.clone();
         }
         Some((text, path, snapshot, analysis))
     }
@@ -178,29 +208,7 @@ impl Backend {
         let mut lsp_diags: Vec<Diagnostic> = analysis
             .diagnostics
             .iter()
-            .map(|d| {
-                let range = span_to_lsp_range(&text, d.span.start, d.span.len);
-                let code_str = d.code.as_str();
-                let message = match &d.label {
-                    Some(label) => format!("{}: {} ({})", code_str, label, d.code.message()),
-                    None => format!("{}: {}", code_str, d.code.message()),
-                };
-                let severity = match d.severity {
-                    Severity::Error => DiagnosticSeverity::ERROR,
-                    Severity::Warning => DiagnosticSeverity::WARNING,
-                };
-                Diagnostic {
-                    range,
-                    severity: Some(severity),
-                    code: Some(NumberOrString::String(code_str)),
-                    code_description: None,
-                    source: Some("brief".to_string()),
-                    message,
-                    related_information: None,
-                    tags: None,
-                    data: None,
-                }
-            })
+            .map(|d| to_lsp_diagnostic(&text, d))
             .collect();
 
         // A broken brief.toml is fatal for `brief compile` (exit 2); the
@@ -214,7 +222,7 @@ impl Backend {
                     code: None,
                     code_description: None,
                     source: Some("brief".to_string()),
-                    message: format!("brief.toml failed to load: {err}"),
+                    message: err.to_string(),
                     related_information: None,
                     tags: None,
                     data: None,
@@ -226,14 +234,29 @@ impl Backend {
     }
 
     /// Current text of the file at `path`: the open buffer if one exists,
-    /// otherwise the on-disk content.
+    /// otherwise the on-disk content, read as the indexer reads it.
     fn text_for_path(&self, path: &Path) -> Option<String> {
         for entry in self.docs.iter() {
             if entry.value().path.as_deref() == Some(path) {
                 return Some(entry.value().text.clone());
             }
         }
-        std::fs::read_to_string(path).ok()
+        brief::project::read_source(path).ok()
+    }
+
+    /// Every open document under `root`, except `skip`.
+    fn docs_under(&self, root: &Path, skip: Option<&Uri>) -> Vec<Uri> {
+        self.docs
+            .iter()
+            .filter(|e| Some(e.key()) != skip)
+            .filter(|e| {
+                e.value()
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| analysis::rel_path(root, p).is_some())
+            })
+            .map(|e| e.key().clone())
+            .collect()
     }
 
     /// Parse the file at `path` (buffer first, then disk). Best-effort:
@@ -315,7 +338,7 @@ impl LanguageServer for Backend {
             DocState {
                 text: params.text_document.text,
                 path,
-                anchors: BTreeSet::new(),
+                entry: BufferEntry::default(),
             },
         );
         // Rebuild the project snapshot on open so the index reflects the
@@ -327,11 +350,27 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         // TextDocumentSyncKind::FULL — the single change event contains the
         // complete new text.
-        if let Some(change) = params.content_changes.into_iter().last() {
-            if let Some(mut state) = self.docs.get_mut(&uri) {
+        let Some(change) = params.content_changes.into_iter().last() else {
+            return;
+        };
+        let (before, path) = match self.docs.get_mut(&uri) {
+            Some(mut state) => {
                 state.text = change.text;
+                (state.entry.clone(), state.path.clone())
             }
-            self.publish_diagnostics_for(uri, false).await;
+            None => return,
+        };
+        self.publish_diagnostics_for(uri.clone(), false).await;
+
+        // An edit that adds or drops anchors, or breaks or fixes the
+        // buffer, changes the verdict on other open documents that `@ref`
+        // it. Refresh them now rather than on their next keystroke.
+        let changed = self.docs.get(&uri).is_some_and(|s| s.entry != before);
+        if changed && let Some(snapshot) = path.as_deref().and_then(|p| self.snapshot_for(p, false))
+        {
+            for u in self.docs_under(&snapshot.root, Some(&uri)) {
+                self.publish_diagnostics_for(u, false).await;
+            }
         }
     }
 
@@ -349,16 +388,7 @@ impl LanguageServer for Backend {
             self.publish_diagnostics_for(uri, false).await;
             return;
         };
-        let mut to_refresh: Vec<Uri> = Vec::new();
-        for entry in self.docs.iter() {
-            match &entry.value().path {
-                Some(p) if analysis::rel_path(&snapshot.root, p).is_some() => {
-                    to_refresh.push(entry.key().clone());
-                }
-                _ => {}
-            }
-        }
-        for u in to_refresh {
+        for u in self.docs_under(&snapshot.root, None) {
             self.publish_diagnostics_for(u, false).await;
         }
     }
@@ -607,7 +637,7 @@ impl LanguageServer for Backend {
             CompletionCtx::ShortcodeName { prefix } => {
                 let fallback;
                 let registry = match &snapshot {
-                    Some(s) => &s.registry,
+                    Some(s) => &s.project.registry,
                     None => {
                         fallback = brief::shortcode::Registry::with_builtins();
                         &fallback
@@ -667,7 +697,7 @@ impl LanguageServer for Backend {
                         .and_then(|p| analysis::rel_path(&snapshot.root, p))
                         .is_some_and(|rel| rel == target);
                     if matches {
-                        anchors = Some(entry.value().anchors.clone());
+                        anchors = Some(entry.value().entry.anchors.clone());
                         break;
                     }
                 }
@@ -803,34 +833,25 @@ impl LanguageServer for Backend {
 // ---------------------------------------------------------------------------
 
 /// Convert an LSP `Position` (UTF-16 line/character) back to a byte offset in
-/// `text`. Used to locate which construct the cursor is on.
+/// `text`. Used to locate which construct the cursor is on. Always returns a
+/// character boundary: a line past the end clamps to the end of the text,
+/// and a column past the end of its line clamps to the end of that line, as
+/// the LSP specification asks.
 fn lsp_position_to_byte_offset(text: &str, pos: Position) -> usize {
-    let mut current_line: u32 = 0;
-    let mut line_start_byte: usize = 0;
-
-    // Walk lines to find the right one.
-    for (byte_idx, ch) in text.char_indices() {
-        if current_line == pos.line {
-            // Now walk code units within this line.
-            return column_to_byte_offset(&text[line_start_byte..], pos.character)
-                + line_start_byte;
-        }
-        if ch == '\n' {
-            current_line += 1;
-            line_start_byte = byte_idx + 1;
+    let mut line_start: usize = 0;
+    for _ in 0..pos.line {
+        match text[line_start..].find('\n') {
+            Some(i) => line_start += i + 1,
+            None => return text.len(),
         }
     }
-
-    // If we're past the end, clamp to text length.
-    if current_line == pos.line {
-        return column_to_byte_offset(&text[line_start_byte..], pos.character) + line_start_byte;
-    }
-
-    text.len()
+    let rest = &text[line_start..];
+    let line = &rest[..rest.find('\n').unwrap_or(rest.len())];
+    line_start + column_to_byte_offset(line, pos.character)
 }
 
 /// Given a line slice and a UTF-16 column, return the byte offset within that
-/// line slice.
+/// line slice. A column inside a surrogate pair floors to the character.
 fn column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
     let mut remaining = utf16_col;
     for (byte_idx, ch) in line.char_indices() {
@@ -895,6 +916,93 @@ mod tests {
                 let pos = byte_offset_to_lsp_position(text, byte);
                 assert_eq!(lsp_position_to_byte_offset(text, pos), byte, "byte {byte}");
             }
+        }
+    }
+
+    fn pos(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    #[test]
+    fn offsets_inside_a_character_floor_to_its_start() {
+        // The didOpen that used to abort the server: core reported a span
+        // ending at byte 16, the middle of `é` (bytes 15..17).
+        let text = "@callout(kind: é)\nx\n@end";
+        assert!(!text.is_char_boundary(16));
+        assert_eq!(byte_offset_to_lsp_position(text, 16), pos(0, 15));
+        assert_eq!(byte_offset_to_lsp_position(text, 17), pos(0, 16));
+        assert_eq!(span_to_lsp_range(text, 16, 1).start, pos(0, 15));
+
+        // Every byte of a 4-byte emoji maps to the emoji's start; the byte
+        // after it is two UTF-16 units further on.
+        let text = "a😀b";
+        for b in 1..5 {
+            assert_eq!(byte_offset_to_lsp_position(text, b), pos(0, 1), "byte {b}");
+        }
+        assert_eq!(byte_offset_to_lsp_position(text, 5), pos(0, 3));
+    }
+
+    #[test]
+    fn out_of_range_spans_clamp_to_the_end() {
+        let text = "é\n😀";
+        let end = pos(1, 2);
+        assert_eq!(byte_offset_to_lsp_position(text, text.len() + 1), end);
+        assert_eq!(byte_offset_to_lsp_position(text, usize::MAX), end);
+        assert_eq!(
+            span_to_lsp_range(text, u32::MAX, u32::MAX),
+            Range { start: end, end }
+        );
+        assert_eq!(
+            span_to_lsp_range(text, 1, 100),
+            Range {
+                start: pos(0, 0),
+                end
+            }
+        );
+        assert_eq!(byte_offset_to_lsp_position("", 3), pos(0, 0));
+    }
+
+    #[test]
+    fn columns_past_the_line_end_stay_on_that_line() {
+        let text = "aé\n😀x\n";
+        assert_eq!(lsp_position_to_byte_offset(text, pos(0, 99)), 3);
+        // Column 1 falls inside the emoji's surrogate pair.
+        assert_eq!(lsp_position_to_byte_offset(text, pos(1, 1)), 4);
+        assert_eq!(lsp_position_to_byte_offset(text, pos(1, 2)), 8);
+        assert_eq!(lsp_position_to_byte_offset(text, pos(2, 5)), text.len());
+        for line in 0..4 {
+            for col in 0..6 {
+                let b = lsp_position_to_byte_offset(text, pos(line, col));
+                assert!(text.is_char_boundary(b), "({line}, {col}) -> {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostics_on_multibyte_input_convert_without_panic() {
+        let inputs = [
+            "@callout(kind: é)\nx\n@end",
+            "@callout(kind: 😀)\nx\n@end\n",
+            "# Tête {#tête}\n\n*ünclosed\n",
+            "日本語 *強調\n\n@ref[ドキュメント.brf](x)\n",
+            "| a | é |\n| 😀 |\n",
+            "😀\t😀\n",
+            "`é\n",
+        ];
+        for text in inputs {
+            let a = analysis::analyze(
+                Path::new("/nonexistent/doc.brf"),
+                text,
+                None,
+                &BTreeMap::new(),
+            );
+            for d in &a.diagnostics {
+                let lsp = to_lsp_diagnostic(text, d);
+                assert!(lsp.range.start <= lsp.range.end, "{text:?}: {lsp:?}");
+            }
+            // Every position the client can send maps back to a boundary.
+            let b = lsp_position_to_byte_offset(text, pos(0, 3));
+            assert!(text.is_char_boundary(b));
         }
     }
 

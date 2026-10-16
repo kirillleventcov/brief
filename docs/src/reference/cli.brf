@@ -99,14 +99,56 @@ list.
 ### `brief fmt`
 
 Reformat Brief source into the canonical style — gofmt doctrine, no
-configuration beyond one explicit opt-in.
+configuration beyond one explicit opt-in. Files are rewritten in place.
 
 ```bash
-brief fmt doc.brf              # formatted source to stdout
-brief fmt doc.brf --write      # rewrite in place
-brief fmt src/*.brf --check    # exit non-zero if anything would change
-brief fmt doc.brf --sort-frontmatter --write
+brief fmt                      # the whole project, in place
+brief fmt docs/ notes.brf      # files and directories, recursively
+brief fmt --check              # list the files that would change
+brief fmt --diff               # show what would change
+brief fmt - < in.brf           # stdin to stdout, for editors
+brief fmt doc.brf --stdout     # preview one file
 ```
+
+With no paths, `brief fmt` formats every `.brf` file under the nearest
+directory holding `brief.toml`, at or above the current one, or under
+the current directory when there is none. Directories are searched the
+same way, skipping hidden directories, `target/`, `dist/`, and
+`node_modules/`. Naming a file that is not `.brf` is an error.
+
+The formatter strips trailing whitespace, turns leading tabs into two
+spaces, collapses runs of blank lines, and aligns table columns. Code
+blocks, fenced or `@code`, and frontmatter are kept byte for byte, and
+the output always parses to the same document as the input. A file is
+written only when its formatting changes, via a temporary file renamed
+over the original, so an interrupted run never leaves a half-written
+source.
+
+Options:
+
+@dl
+--check
+: Write nothing. Print each file that would change on `stdout`, one
+  path per line.
+--diff
+: Write nothing. Print a unified diff of the changes on `stdout`.
+--stdout
+: Print the formatted source of a single file on `stdout` instead of
+  rewriting it.
+--sort-frontmatter
+: Sort top-level frontmatter keys alphabetically. Off by default because
+  re-emitting the TOML loses its comments.
+@end
+
+A one-line summary such as `brief: 2 files reformatted, 5 files unchanged`
+goes to `stderr`. The `--write` (`-w`) flag of earlier releases is still
+accepted and changes nothing.
+
+Exit codes:
+
+- `0` — success.
+- `1` — `--check` or `--diff` found files that would change.
+- `2` — a usage or I/O error.
 
 ### `brief watch`
 

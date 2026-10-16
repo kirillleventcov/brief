@@ -6,24 +6,15 @@ pub fn lex(src: &SourceMap) -> Result<Vec<Token>, Vec<Diagnostic>> {
     let mut diags = Vec::new();
     let bytes = src.source.as_bytes();
 
-    // Both scans are gated behind `str::contains`, which uses the
+    // The scan is gated behind `str::contains`, which uses the
     // SIMD-accelerated substring search in std — clean documents (no BOM,
-    // no tabs, the overwhelmingly common case) skip the per-byte loops.
+    // the overwhelmingly common case) skip the per-byte loop. Tabs are not
+    // checked here at all: they are legal inside code and frontmatter,
+    // which only the parser can recognise.
     if src.source.contains('\u{FEFF}') {
         for (i, w) in bytes.windows(3).enumerate() {
             if i > 0 && w == [0xEF, 0xBB, 0xBF] {
                 diags.push(Diagnostic::new(Code::BomNotAtStart, Span::new(i, 3)));
-            }
-        }
-    }
-
-    if src.source.contains('\t') {
-        for (i, b) in bytes.iter().enumerate() {
-            if *b == b'\t' {
-                diags.push(
-                    Diagnostic::new(Code::TabCharacter, Span::new(i, 1))
-                        .help("tabs are forbidden; use two spaces per indent level"),
-                );
             }
         }
     }
@@ -38,6 +29,8 @@ pub fn lex(src: &SourceMap) -> Result<Vec<Token>, Vec<Diagnostic>> {
             if i == bytes.len() && line_start == i {
                 break;
             }
+            // Trailing spaces are trimmed from the token; verbatim bodies
+            // that need them read the raw line back from the source.
             let raw = &source[line_start..i];
             let trimmed = raw.trim_end_matches(|c: char| c == ' ' || c == '\r');
             let indent = leading_spaces(trimmed);
@@ -100,10 +93,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tabs() {
+    fn leaves_tabs_to_the_parser() {
+        // Whether a tab is an error depends on whether it sits in code,
+        // which the lexer cannot know; `parser` tests cover the B0102 rule.
         let src = SourceMap::new("doc.brf", "  \tx\n");
-        let err = lex(&src).unwrap_err();
-        assert_eq!(err[0].code, Code::TabCharacter);
+        let toks = lex(&src).unwrap();
+        assert_eq!(text(&src, &toks[0]), "  \tx");
+        assert_eq!(toks[0].indent, 2);
     }
 
     #[test]

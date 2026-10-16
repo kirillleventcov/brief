@@ -159,6 +159,19 @@ fn scan_refs_inline(
                     );
                 }
                 Ok((path, anchor)) => match project.index.anchors.get(&path) {
+                    // A target that does not compile has untrustworthy
+                    // anchors and no page. Self-references are exempt: the
+                    // current file's own errors are already reported.
+                    Some(_)
+                        if project.index.broken.contains(&path)
+                            && !is_current(project.current, &path) =>
+                    {
+                        diags.push(
+                            Diagnostic::new(Code::RefTargetBroken, *span)
+                                .label(format!("`{}` has errors", path))
+                                .help(format!("compile `{}` to see its errors", path)),
+                        );
+                    }
                     None => {
                         let mut help_paths: Vec<&String> = project.index.anchors.keys().collect();
                         help_paths.sort();
@@ -202,12 +215,15 @@ fn scan_refs_inline(
                             );
                             return;
                         }
+                        let current = path_key(project.current);
+                        let relative_path = (current != path).then(|| relative_to(&current, &path));
                         out.insert(
                             *span,
                             crate::ast::ResolvedRef {
                                 target_path: path.clone(),
                                 target_anchor: anchor,
                                 display,
+                                relative_path,
                             },
                         );
                     }
@@ -223,6 +239,48 @@ fn scan_refs_inline(
         }
         _ => {}
     }
+}
+
+fn is_current(current: &std::path::Path, path: &str) -> bool {
+    path_key(current) == path
+}
+
+/// `current` in the forward-slash form `ProjectIndex` keys use. A leading
+/// `./` is dropped so it cannot defeat the comparison.
+fn path_key(current: &std::path::Path) -> String {
+    let mut cur = String::new();
+    for c in current.components() {
+        if let std::path::Component::CurDir = c {
+            continue;
+        }
+        if !cur.is_empty() {
+            cur.push('/');
+        }
+        cur.push_str(&c.as_os_str().to_string_lossy());
+    }
+    cur
+}
+
+/// `target` as seen from the directory holding `from`; both are
+/// project-relative forward-slash paths. `relative_to("sub/a.brf",
+/// "guide.brf")` is `../guide.brf`.
+fn relative_to(from: &str, target: &str) -> String {
+    let mut from_dirs: Vec<&str> = from.split('/').collect();
+    from_dirs.pop();
+    let target_segs: Vec<&str> = target.split('/').collect();
+    let (target_dirs, target_file) = target_segs.split_at(target_segs.len() - 1);
+    let common = from_dirs
+        .iter()
+        .zip(target_dirs)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = "../".repeat(from_dirs.len() - common);
+    for seg in &target_dirs[common..] {
+        out.push_str(seg);
+        out.push('/');
+    }
+    out.push_str(target_file[0]);
+    out
 }
 
 fn parse_target(s: &str) -> Result<(String, Option<String>), String> {
@@ -257,11 +315,17 @@ fn parse_target(s: &str) -> Result<(String, Option<String>), String> {
             if a.is_empty() {
                 return Err("@ref anchor after `#` cannot be empty".to_string());
             }
-            if !a
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-            {
-                return Err(format!("invalid anchor `{}`; must match [a-z0-9-]+", a));
+            if !crate::slug::is_heading_id(a) {
+                let rule = "heading ids are lowercase letters, digits, `-` and `_`";
+                let slug = crate::slug::slugify(a);
+                return Err(if slug.is_empty() {
+                    format!("invalid anchor `{}`; {}", a, rule)
+                } else {
+                    format!(
+                        "invalid anchor `{}`; {} (did you mean `{}`?)",
+                        a, rule, slug
+                    )
+                });
             }
             Some(a.to_string())
         }
@@ -451,6 +515,63 @@ fn check_shortcode(
             }
         }
     }
+    check_url_arg(name, args, span, diags);
+}
+
+/// The argument of a built-in that the emitters write into `href`/`src`.
+fn url_arg(name: &str) -> Option<&'static str> {
+    match name {
+        "link" => Some("url"),
+        "image" => Some("src"),
+        _ => None,
+    }
+}
+
+fn check_url_arg(
+    name: &str,
+    args: &crate::ast::ShortArgs,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(kw) = url_arg(name) else { return };
+    let Some(url) = args.keyword.get(kw).and_then(|v| v.as_str()) else {
+        return;
+    };
+    if let Some(scheme) = disallowed_scheme(url) {
+        diags.push(
+            Diagnostic::new(Code::UnsafeUrl, span)
+                .label(format!("`{}:` URLs are not allowed in `@{}`", scheme, name))
+                .help(
+                    "use an `http:`, `https:` or `mailto:` URL, a relative path, or a `#fragment`",
+                ),
+        );
+    }
+}
+
+/// The scheme of `url` when it has one outside the `http`/`https`/`mailto`
+/// allowlist, lowercased. A scheme is RFC 3986 `ALPHA *( ALPHA / DIGIT / "+"
+/// / "-" / "." )` followed by `:` before any `/`, `?` or `#`; anything else
+/// (`a/b:c`, `./x`, `#top`, `//host/p`) is a relative reference. Matching is
+/// done the way browsers parse: leading whitespace and control characters
+/// are skipped, and control characters inside the scheme are ignored, so
+/// ` JaVa\tScRiPt:` is caught as `javascript`.
+pub fn disallowed_scheme(url: &str) -> Option<String> {
+    let mut scheme = String::new();
+    for c in url
+        .trim_start_matches(|c: char| c.is_whitespace() || c.is_control())
+        .chars()
+    {
+        match c {
+            ':' if !scheme.is_empty() => {
+                return (!matches!(scheme.as_str(), "http" | "https" | "mailto")).then_some(scheme);
+            }
+            c if c.is_ascii_control() => {}
+            c if c.is_ascii_alphabetic() => scheme.push(c.to_ascii_lowercase()),
+            '0'..='9' | '+' | '-' | '.' if !scheme.is_empty() => scheme.push(c),
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn bind_positional(
@@ -731,5 +852,186 @@ mod tests {
             "B0603 should not fire when there is no project: {:?}",
             diags
         );
+    }
+
+    /// Resolve one `@ref` from `current` and return the single ResolvedRef.
+    fn resolve_one(current: &str, target: &str, files: &[(&str, &[&str])]) -> ResolvedRef {
+        let (doc, diags) = run_resolve(&format!("@ref[{}](T)\n", target), current, files);
+        assert!(diags.is_empty(), "{:?}", diags);
+        assert_eq!(doc.resolved_refs.len(), 1);
+        doc.resolved_refs.into_values().next().unwrap()
+    }
+
+    use crate::ast::ResolvedRef;
+
+    const TREE: &[(&str, &[&str])] = &[
+        ("guide.brf", &["x"]),
+        ("sub/a.brf", &["top"]),
+        ("sub/b.brf", &[]),
+        ("sub/deep/c.brf", &["y"]),
+        ("other/d.brf", &[]),
+    ];
+
+    #[test]
+    fn ref_href_is_relative_to_the_referring_file() {
+        let up = resolve_one("sub/a.brf", "guide.brf#x", TREE);
+        assert_eq!(up.relative_path.as_deref(), Some("../guide.brf"));
+        assert_eq!(up.href("html"), "../guide.html#x");
+        assert_eq!(up.href("md"), "../guide.md#x");
+
+        let sibling = resolve_one("sub/a.brf", "sub/b.brf", TREE);
+        assert_eq!(sibling.relative_path.as_deref(), Some("b.brf"));
+        assert_eq!(sibling.href("html"), "b.html");
+
+        let down = resolve_one("guide.brf", "sub/deep/c.brf#y", TREE);
+        assert_eq!(down.href("html"), "sub/deep/c.html#y");
+
+        let across = resolve_one("sub/deep/c.brf", "other/d.brf", TREE);
+        assert_eq!(across.href("html"), "../../other/d.html");
+
+        let leading_dot = resolve_one("./sub/a.brf", "guide.brf#x", TREE);
+        assert_eq!(leading_dot.href("html"), "../guide.html#x");
+    }
+
+    #[test]
+    fn ref_to_the_current_file_is_a_bare_fragment() {
+        let with_anchor = resolve_one("sub/a.brf", "sub/a.brf#top", TREE);
+        assert_eq!(with_anchor.relative_path, None);
+        assert_eq!(with_anchor.href("html"), "#top");
+
+        let whole_file = resolve_one("sub/a.brf", "sub/a.brf", TREE);
+        assert_eq!(whole_file.href("html"), "a.html");
+    }
+
+    #[test]
+    fn ref_without_a_current_path_stays_project_relative() {
+        let rr = resolve_one("", "sub/deep/c.brf#y", TREE);
+        assert_eq!(rr.href("html"), "sub/deep/c.html#y");
+    }
+
+    #[test]
+    fn ref_anchor_accepts_any_heading_id() {
+        let files: &[(&str, &[&str])] = &[("g.brf", &["install_steps", "café-au-lait", "section"])];
+        for anchor in ["install_steps", "café-au-lait", "section"] {
+            let rr = resolve_one("h.brf", &format!("g.brf#{}", anchor), files);
+            assert_eq!(rr.target_anchor.as_deref(), Some(anchor));
+        }
+    }
+
+    #[test]
+    fn ref_anchor_that_cannot_be_a_heading_id_is_b0603() {
+        let (_, diags) = run_resolve("@ref[g.brf#Install-Steps](T)\n", "h.brf", &[("g.brf", &[])]);
+        assert_eq!(diags.len(), 1, "{:?}", diags);
+        assert_eq!(diags[0].code, Code::RefBadTarget);
+        assert_eq!(
+            diags[0].label.as_deref(),
+            Some(
+                "invalid anchor `Install-Steps`; heading ids are lowercase letters, digits, `-` and `_` (did you mean `install-steps`?)"
+            )
+        );
+    }
+
+    fn resolve_codes(src: &str) -> Vec<(Code, crate::span::Span)> {
+        let mut doc = parse_only(src);
+        let reg = crate::shortcode::Registry::with_builtins();
+        resolve(&mut doc, &reg)
+            .into_iter()
+            .map(|d| (d.code, d.span))
+            .collect()
+    }
+
+    #[test]
+    fn unsafe_link_and_image_urls_are_b0410() {
+        for (src, scheme) in [
+            ("@link[me](javascript:alert(1))", "javascript"),
+            ("@link[me](JaVaScRiPt:alert(1))", "javascript"),
+            ("@link[me](   javascript:alert(1))", "javascript"),
+            ("@link[me](java\u{1}script:alert(1))", "javascript"),
+            ("@link(url: \"vbscript:x\")[me]", "vbscript"),
+            ("@link[me](data:text/html,<script>x</script>)", "data"),
+            ("@link[me](file:///etc/passwd)", "file"),
+            (
+                "@image(src: \"data:image/svg+xml;base64,PHN2Zz4=\", alt: \"a\")",
+                "data",
+            ),
+        ] {
+            // Leading text keeps `@image` inline rather than a block.
+            let line = format!("x {}\n", src);
+            let mut doc = parse_only(&line);
+            let reg = crate::shortcode::Registry::with_builtins();
+            let diags = resolve(&mut doc, &reg);
+            assert_eq!(diags.len(), 1, "{}: {:?}", src, diags);
+            assert_eq!(diags[0].code, Code::UnsafeUrl, "{}", src);
+            assert_eq!(
+                diags[0].span,
+                crate::span::Span::new(2, src.len()),
+                "{}",
+                src
+            );
+            let name = if src.starts_with("@link") {
+                "link"
+            } else {
+                "image"
+            };
+            assert_eq!(
+                diags[0].label.as_deref(),
+                Some(format!("`{}:` URLs are not allowed in `@{}`", scheme, name).as_str()),
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_urls_are_not_b0410() {
+        for src in [
+            "@link[a](https://example.com/x?y=1#z)",
+            "@link[a](HTTP://EXAMPLE.COM)",
+            "@link[a](mailto:me@example.com)",
+            "@link[a](#install-steps)",
+            "@link[a](guide.html)",
+            "@link[a](./a/b:c)",
+            "@link[a](a/b:c)",
+            "@link[a](?q=x:y)",
+            "@link[a](//cdn.example.com/x)",
+            "@link[a](1abc:x)",
+            "@image(src: \"img/logo.png\", alt: \"logo\")",
+        ] {
+            let codes = resolve_codes(&format!("x {}\n", src));
+            assert!(codes.is_empty(), "{}: {:?}", src, codes);
+        }
+    }
+
+    #[test]
+    fn disallowed_scheme_parses_like_a_browser() {
+        assert_eq!(
+            disallowed_scheme("javascript:x").as_deref(),
+            Some("javascript")
+        );
+        assert_eq!(
+            disallowed_scheme(" \t\nJAVASCRIPT:x").as_deref(),
+            Some("javascript")
+        );
+        assert_eq!(
+            disallowed_scheme("java\tscr\nipt:x").as_deref(),
+            Some("javascript")
+        );
+        assert_eq!(
+            disallowed_scheme("\u{0}javascript:x").as_deref(),
+            Some("javascript")
+        );
+        assert_eq!(
+            disallowed_scheme("view-source:x").as_deref(),
+            Some("view-source")
+        );
+        assert_eq!(
+            disallowed_scheme("web+app.v2:x").as_deref(),
+            Some("web+app.v2")
+        );
+        assert_eq!(disallowed_scheme("https:x"), None);
+        assert_eq!(disallowed_scheme("mailto:x"), None);
+        assert_eq!(disallowed_scheme("a/javascript:x"), None);
+        assert_eq!(disallowed_scheme("#javascript:x"), None);
+        assert_eq!(disallowed_scheme("java script:x"), None);
+        assert_eq!(disallowed_scheme(":x"), None);
+        assert_eq!(disallowed_scheme(""), None);
     }
 }

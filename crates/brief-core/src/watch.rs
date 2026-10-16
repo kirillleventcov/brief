@@ -1,34 +1,35 @@
 //! `brief watch` — file/directory watcher that recompiles on change.
 //!
-//! Behavior (v0.3.7):
-//!   - .brf change       → recompile that file
-//!   - brief.toml change → recompile all files (default), with one refinement:
-//!                         if the only field that changed across the diff is
-//!                         a shortcode `template_html`/`template_llm` string,
-//!                         only files referencing those shortcodes recompile.
-//!   - 100ms debounce per path (notify-debouncer-mini).
+//! Behavior:
+//!   - .brf change       → recompile that file, unless its output was
+//!                         already built from exactly this content.
+//!   - brief.toml change → recompile the files that project governs, with
+//!                         one refinement: if the only field that changed
+//!                         across the diff is a shortcode
+//!                         `template_html`/`template_llm` string, only files
+//!                         referencing those shortcodes recompile.
+//!   - 100ms debounce: a batch fires once events have been quiet that long.
 //!   - Whole-file recompile only. Block-level incremental is v0.4+.
 //!
-//! The watcher reuses the existing lex→parse→resolve→validate→emit pipeline.
-//! It writes outputs next to each source: `note.brf` → `note.html` /
+//! Every file compiles in its own project (`Project::discover`: the nearest
+//! `brief.toml` above it, `--config` replacing its config) through the same
+//! front-end as `brief compile`, so watch and compile never disagree. It
+//! writes outputs next to each source: `note.brf` → `note.html` /
 //! `note.txt` / `note.json`.
 
-use crate::config::{self, Config};
-use crate::diag::{Severity, render_all};
+use crate::config::Config;
+use crate::diag::Severity;
 use crate::emit::{html, llm};
-use crate::lexer;
-use crate::parser;
-use crate::shortcode::Registry;
+use crate::project::{FileDiagnostics, Project, ProjectIndex, discover_root, read_source};
 use crate::span::SourceMap;
-use crate::validate;
 
-use notify_debouncer_mini::{
-    DebounceEventResult, DebouncedEvent, new_debouncer, notify::RecursiveMode,
-};
+use notify::event::{AccessKind, AccessMode, ModifyKind};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::time::Duration;
 
 pub const DEBOUNCE_MS: u64 = 100;
@@ -70,8 +71,12 @@ pub struct LlmOpts {
 #[derive(Clone, Debug)]
 pub struct WatchOpts {
     pub paths: Vec<PathBuf>,
-    pub target: Target,
-    pub config_path: PathBuf,
+    /// Explicit `--target`. `None` uses each file's project
+    /// `compile.default_target`, then html, as `brief compile` does.
+    pub target: Option<Target>,
+    /// `--config`: replaces every project's `brief.toml`. The root, and so
+    /// `@ref` resolution, still comes from where each file lives.
+    pub config_override: Option<PathBuf>,
     pub llm_opts: LlmOpts,
     /// When true, suppress the clear-screen sequence between recompile runs.
     pub no_clear: bool,
@@ -95,6 +100,12 @@ pub enum CompileOutcome {
         src: PathBuf,
         msg: String,
     },
+    /// The file's `brief.toml` (or `--config`) does not load, or names an
+    /// unknown default target.
+    BadConfig {
+        src: PathBuf,
+        msg: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -108,38 +119,60 @@ pub enum ConfigDelta {
     None,
 }
 
+/// What a file's current output was built from, so a later event can tell
+/// whether anything that matters has changed.
+struct Built {
+    /// Content hash of the source behind the output on disk. `None` after a
+    /// failed compile, so saving the file again always retries it.
+    hash: Option<u64>,
+    root: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    config: Config,
+}
+
 pub struct Engine {
-    pub config_path: PathBuf,
-    pub config: Config,
-    pub registry: Registry,
-    pub target: Target,
+    pub config_override: Option<PathBuf>,
+    pub target: Option<Target>,
     pub llm_opts: LlmOpts,
     pub files: BTreeSet<PathBuf>,
     /// When true, suppress the clear-screen sequence between recompile runs.
     pub no_clear: bool,
+    /// Canonical watch inputs; a new `.brf` is tracked only inside these.
+    scope: Vec<PathBuf>,
     /// Per-file: set of shortcode names referenced in source. Built/refreshed
     /// each time a file is compiled.
     shortcode_use: HashMap<PathBuf, HashSet<String>>,
+    built: HashMap<PathBuf, Built>,
+    /// Every output this engine has written. Their change events are our
+    /// own doing and never trigger a rebuild.
+    outputs: HashSet<PathBuf>,
 }
 
 impl Engine {
+    /// Track every `.brf` under `opts.paths`. A config that fails to load
+    /// is a startup error, the same verdict `brief compile` gives.
     pub fn load(opts: &WatchOpts) -> Result<Self, String> {
-        let config = if opts.config_path.exists() {
-            config::load(&opts.config_path).map_err(|e| format!("bad config: {e}"))?
-        } else {
-            Config::default()
-        };
-        let registry = config::registry_from(&config);
         let files: BTreeSet<PathBuf> = discover_brf(&opts.paths).into_iter().collect();
+        let mut seen: HashSet<Option<PathBuf>> = HashSet::new();
+        for f in &files {
+            if seen.insert(discover_root(f)) {
+                Project::discover(f, opts.config_override.as_deref())?;
+            }
+        }
         Ok(Engine {
-            config_path: opts.config_path.clone(),
-            config,
-            registry,
+            config_override: opts.config_override.clone(),
             target: opts.target,
             llm_opts: opts.llm_opts.clone(),
             files,
             no_clear: opts.no_clear,
+            scope: opts
+                .paths
+                .iter()
+                .map(|p| canonicalize_or_clone(p))
+                .collect(),
             shortcode_use: HashMap::new(),
+            built: HashMap::new(),
+            outputs: HashSet::new(),
         })
     }
 
@@ -149,132 +182,124 @@ impl Engine {
 
     pub fn compile_all<W: Write>(&mut self, log: &mut W) -> Vec<CompileOutcome> {
         let files: Vec<PathBuf> = self.files.iter().cloned().collect();
-        files
-            .into_iter()
-            .map(|f| self.compile_one(&f, log))
-            .collect()
+        self.compile_files(&files, log)
     }
 
     pub fn compile_one<W: Write>(&mut self, path: &Path, log: &mut W) -> CompileOutcome {
-        let raw = match std::fs::read_to_string(path) {
+        self.compile_in(path, &mut HashMap::new(), log)
+    }
+
+    /// Compile `files`, indexing each project tree once for the batch
+    /// rather than once per file.
+    pub fn compile_files<W: Write>(
+        &mut self,
+        files: &[PathBuf],
+        log: &mut W,
+    ) -> Vec<CompileOutcome> {
+        let mut indexes = HashMap::new();
+        files
+            .iter()
+            .map(|f| self.compile_in(f, &mut indexes, log))
+            .collect()
+    }
+
+    fn compile_in<W: Write>(
+        &mut self,
+        path: &Path,
+        indexes: &mut HashMap<PathBuf, (ProjectIndex, Vec<FileDiagnostics>)>,
+        log: &mut W,
+    ) -> CompileOutcome {
+        let src_path = path.to_path_buf();
+        let source = match read_source(path) {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(log, "brief: cannot read {}: {}", path.display(), e);
                 return CompileOutcome::IoError {
-                    src: path.to_path_buf(),
+                    src: src_path,
                     msg: e.to_string(),
                 };
             }
         };
-        let source = raw.strip_prefix('\u{feff}').unwrap_or(&raw).to_string();
+        let hash = content_hash(&source);
 
         // Refresh shortcode-usage cache before compile so a brief.toml-only
         // template change can correctly filter to files using the shortcode.
         self.shortcode_use
-            .insert(path.to_path_buf(), scan_shortcode_uses(&source));
+            .insert(src_path.clone(), scan_shortcode_uses(&source));
 
-        let src = SourceMap::new(path.to_string_lossy(), source);
-        let opts = validate::ValidateOpts {
-            strict_heading_levels: self.config.compile.strict_heading_levels,
-        };
-
-        let tokens = match lexer::lex(&src) {
-            Ok(t) => t,
-            Err(d) => {
-                let _ = write!(log, "{}", render_all(&d, &src));
-                return CompileOutcome::LexError {
-                    src: path.to_path_buf(),
-                };
+        let project = match Project::discover(path, self.config_override.as_deref()) {
+            Ok(p) => p,
+            Err(msg) => {
+                self.built.remove(path);
+                return CompileOutcome::BadConfig { src: src_path, msg };
             }
         };
-        let (mut doc, mut diags) = parser::parse(tokens, &src);
-        let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let project_root = crate::project::discover_root(&abs_path);
-        let project_index = match &project_root {
-            Some(root) => {
-                let (idx, prepass_diags) = crate::project::build_index(root);
-                let mut has_err = false;
-                for fd in &prepass_diags {
-                    if fd.diagnostics.is_empty() {
-                        continue;
-                    }
-                    if fd.diagnostics.iter().any(|d| d.severity == Severity::Error) {
-                        has_err = true;
-                    }
-                    let _ = write!(log, "{}", render_all(&fd.diagnostics, &fd.source));
-                }
-                if has_err {
-                    // Pre-pass error in some sibling file. Compile of the
-                    // current file is aborted; the user sees the error and
-                    // a follow-up watch tick after the fix will clear it.
-                    return CompileOutcome::Errors {
-                        src: path.to_path_buf(),
-                        count: prepass_diags
-                            .iter()
-                            .map(|fd| {
-                                fd.diagnostics
-                                    .iter()
-                                    .filter(|d| d.severity == Severity::Error)
-                                    .count()
-                            })
-                            .sum(),
+        let target = match (self.target, &project.config.compile.default_target) {
+            (Some(t), _) => t,
+            (None, None) => Target::Html,
+            (None, Some(name)) => match Target::parse(name) {
+                Some(t) => t,
+                None => {
+                    self.built.remove(path);
+                    return CompileOutcome::BadConfig {
+                        src: src_path,
+                        msg: format!("unknown target `{}` (expected html, llm, json)", name),
                     };
                 }
-                Some(idx)
-            }
-            None => None,
+            },
         };
-        let resolve_project = match (&project_root, &project_index) {
-            (Some(root), Some(idx)) => {
-                let rel = abs_path
-                    .strip_prefix(root)
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|_| path.to_path_buf());
-                Some((idx, rel))
-            }
-            _ => None,
+        self.built.insert(
+            src_path.clone(),
+            Built {
+                hash: None,
+                root: project.root.clone(),
+                config_path: project.config_path.clone(),
+                config: project.config.clone(),
+            },
+        );
+
+        let index = project.root.as_ref().map(|root| {
+            &*indexes
+                .entry(root.clone())
+                .or_insert_with(|| crate::project::build_index(root))
+        });
+        let (index, index_diags) = match index {
+            Some((idx, diags)) => (Some(idx), diags.as_slice()),
+            None => (None, &[][..]),
         };
-        let project_arg =
-            resolve_project
-                .as_ref()
-                .map(|(idx, rel)| crate::resolve::ResolveProject {
-                    index: idx,
-                    current: rel.as_path(),
-                });
-        diags.extend(crate::resolve::resolve_with_project(
-            &mut doc,
-            &self.registry,
-            project_arg.as_ref(),
-        ));
-        diags.extend(validate::validate(&doc, &opts, &src));
-        let errors = diags
+        let src = SourceMap::new(path.to_string_lossy(), source);
+        let checked = project.check(&src, index, project.rel_path(path).as_deref());
+        let _ = write!(log, "{}", checked.render(&src, index_diags));
+        let errors = checked
+            .diagnostics
             .iter()
             .filter(|d| d.severity == Severity::Error)
             .count();
+        let diag_count = checked.diagnostics.len();
+        let Some(doc) = checked.doc else {
+            return CompileOutcome::LexError { src: src_path };
+        };
         if errors > 0 {
-            let _ = write!(log, "{}", render_all(&diags, &src));
             return CompileOutcome::Errors {
-                src: path.to_path_buf(),
+                src: src_path,
                 count: errors,
             };
         }
-        if !diags.is_empty() {
-            let _ = write!(log, "{}", render_all(&diags, &src));
-        }
 
-        let output = match self.target {
-            Target::Html => html::render(&doc, &self.registry),
+        let output = match target {
+            Target::Html => html::render(&doc, &project.registry),
             Target::Llm => {
+                let cfg = &project.config.compile.llm;
                 let lopts = llm::Opts {
                     strip_emphasis: self.llm_opts.strip_emphasis,
                     keep_table_rule: self.llm_opts.keep_table_rule,
                     keep_asset_urls: self.llm_opts.keep_asset_urls,
                     keep_metadata: self.llm_opts.keep_metadata,
-                    minify_code_blocks: self.config.compile.llm.minify_code_blocks,
-                    minify_languages: self.config.compile.llm.minify_languages.clone(),
-                    preserve_code_fences: self.config.compile.llm.preserve_code_fences,
+                    minify_code_blocks: cfg.minify_code_blocks,
+                    minify_languages: cfg.minify_languages.clone(),
+                    preserve_code_fences: cfg.preserve_code_fences,
                 };
-                let (out, warnings) = llm::render(&doc, &self.registry, &lopts);
+                let (out, warnings) = llm::render(&doc, &project.registry, &lopts);
                 for w in &warnings {
                     let _ = writeln!(log, "brief: {}", w);
                 }
@@ -283,45 +308,98 @@ impl Engine {
             Target::Json => format!("{:#?}\n", doc),
         };
 
-        let dst = output_path(path, self.target);
+        let dst = output_path(path, target);
         if let Err(e) = std::fs::write(&dst, &output) {
             let _ = writeln!(log, "brief: cannot write {}: {}", dst.display(), e);
             return CompileOutcome::IoError {
-                src: path.to_path_buf(),
+                src: src_path,
                 msg: e.to_string(),
             };
         }
-        CompileOutcome::Ok {
-            src: path.to_path_buf(),
-            dst,
-            diag_count: diags.len(),
+        self.outputs.insert(canonicalize_or_clone(&dst));
+        if let Some(b) = self.built.get_mut(path) {
+            b.hash = Some(hash);
         }
-    }
-
-    pub fn reload_config(&mut self) -> Result<ConfigDelta, String> {
-        let new_cfg = if self.config_path.exists() {
-            config::load(&self.config_path).map_err(|e| e.to_string())?
-        } else {
-            Config::default()
-        };
-        let delta = diff_config(&self.config, &new_cfg);
-        self.config = new_cfg;
-        self.registry = config::registry_from(&self.config);
-        Ok(delta)
+        CompileOutcome::Ok {
+            src: src_path,
+            dst,
+            diag_count,
+        }
     }
 
     pub fn files_using(&self, shortcodes: &BTreeSet<String>) -> Vec<PathBuf> {
         self.files
             .iter()
-            .filter(|f| {
-                self.shortcode_use
-                    .get(*f)
-                    .map(|uses| uses.iter().any(|u| shortcodes.contains(u)))
-                    .unwrap_or(false)
-            })
+            .filter(|f| self.uses_any(f, shortcodes))
             .cloned()
             .collect()
     }
+
+    fn uses_any(&self, file: &Path, shortcodes: &BTreeSet<String>) -> bool {
+        self.shortcode_use
+            .get(file)
+            .is_some_and(|uses| uses.iter().any(|u| shortcodes.contains(u)))
+    }
+
+    /// Whether `file` still holds exactly what its current output was
+    /// built from. Editors and tools touch files without changing them;
+    /// rebuilding on that is wasted work at best and a feedback loop at
+    /// worst.
+    fn is_unchanged(&self, file: &Path) -> bool {
+        match (self.built.get(file).and_then(|b| b.hash), read_source(file)) {
+            (Some(hash), Ok(s)) => hash == content_hash(&s),
+            _ => false,
+        }
+    }
+
+    /// How the config governing each of `files` differs from the one its
+    /// current output was built with. A file whose project root or config
+    /// file moved (a `brief.toml` appeared or vanished) needs a full
+    /// recompile. A config that fails to load is an `Err` naming it.
+    fn config_deltas(&self, files: &[PathBuf]) -> Vec<(PathBuf, Result<ConfigDelta, String>)> {
+        let mut projects: HashMap<Option<PathBuf>, Result<Project, String>> = HashMap::new();
+        files
+            .iter()
+            .map(|f| {
+                let project = projects
+                    .entry(discover_root(f))
+                    .or_insert_with(|| Project::discover(f, self.config_override.as_deref()));
+                let delta = match project {
+                    Err(e) => Err(e.clone()),
+                    Ok(new) => Ok(match self.built.get(f) {
+                        Some(b) if b.root == new.root && b.config_path == new.config_path => {
+                            diff_config(&b.config, &new.config)
+                        }
+                        _ => ConfigDelta::All,
+                    }),
+                };
+                (f.clone(), delta)
+            })
+            .collect()
+    }
+
+    /// Whether a `.brf` that just appeared lies inside what the user asked
+    /// to watch (the extra watches on project roots must not widen it).
+    fn in_scope(&self, file: &Path) -> bool {
+        self.scope.iter().any(|s| {
+            if s.is_dir() {
+                file.strip_prefix(s).is_ok_and(|rel| {
+                    let dirs: Vec<_> = rel.components().collect();
+                    dirs[..dirs.len().saturating_sub(1)]
+                        .iter()
+                        .all(|c| !skipped_dir(&c.as_os_str().to_string_lossy()))
+                })
+            } else {
+                file == s
+            }
+        })
+    }
+}
+
+fn content_hash(source: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    source.hash(&mut h);
+    h.finish()
 }
 
 pub fn output_path(src: &Path, target: Target) -> PathBuf {
@@ -452,8 +530,7 @@ fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) {
         };
         if ft.is_dir() {
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            // Skip hidden/build dirs to avoid recursing into `.git`, `target`, etc.
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
+            if skipped_dir(name) {
                 continue;
             }
             walk_dir(&path, out);
@@ -461,6 +538,11 @@ fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(canonicalize_or_clone(&path));
         }
     }
+}
+
+/// Hidden and build directories (`.git`, `target`, …) hold no sources.
+fn skipped_dir(name: &str) -> bool {
+    name.starts_with('.') || name == "target" || name == "node_modules"
 }
 
 fn canonicalize_or_clone(p: &Path) -> PathBuf {
@@ -493,57 +575,22 @@ pub fn run(opts: WatchOpts) -> Result<(), String> {
     let outcomes = engine.compile_all(&mut log);
     print_outcomes(&outcomes, &mut log);
 
-    let (tx, rx) = channel();
-    let mut debouncer = new_debouncer(
-        Duration::from_millis(DEBOUNCE_MS),
-        move |res: DebounceEventResult| {
-            let _ = tx.send(res);
-        },
-    )
+    let (tx, rx) = channel::<Result<Vec<PathBuf>, String>>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
+        Ok(event) if is_change(&event.kind) => {
+            let _ = tx.send(Ok(event.paths));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let _ = tx.send(Err(e.to_string()));
+        }
+    })
     .map_err(|e| format!("watcher init failed: {e}"))?;
 
-    // Watch each input path. For directories, recursively. For files, watch
-    // the parent (some platforms don't report file-only watches reliably).
-    let mut watched: HashSet<PathBuf> = HashSet::new();
-    for p in &opts.paths {
-        let canon = canonicalize_or_clone(p);
-        let (target, mode) = if canon.is_file() {
-            (
-                canon
-                    .parent()
-                    .map(|pp| pp.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from(".")),
-                RecursiveMode::NonRecursive,
-            )
-        } else {
-            (canon.clone(), RecursiveMode::Recursive)
-        };
-        if watched.insert(target.clone()) {
-            debouncer
-                .watcher()
-                .watch(&target, mode)
-                .map_err(|e| format!("watch {}: {e}", target.display()))?;
-        }
-    }
-
-    // Always also watch the config file's containing directory.
-    let cfg_dir = engine
-        .config_path
-        .parent()
-        .map(|p| {
-            if p.as_os_str().is_empty() {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            } else {
-                p.to_path_buf()
-            }
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    let cfg_dir = canonicalize_or_clone(&cfg_dir);
-    if watched.insert(cfg_dir.clone()) {
-        debouncer
-            .watcher()
-            .watch(&cfg_dir, RecursiveMode::NonRecursive)
-            .map_err(|e| format!("watch {}: {e}", cfg_dir.display()))?;
+    for (dir, mode) in watch_targets(&opts, &engine) {
+        watcher
+            .watch(&dir, mode)
+            .map_err(|e| format!("watch {}: {e}", dir.display()))?;
     }
 
     let _ = writeln!(
@@ -554,99 +601,216 @@ pub fn run(opts: WatchOpts) -> Result<(), String> {
         DEBOUNCE_MS
     );
 
-    while let Ok(res) = rx.recv() {
-        match res {
-            Ok(events) => handle_events(events, &mut engine, &mut log),
+    // An editor save is several events; wait for a quiet period and handle
+    // the batch once.
+    let debounce = Duration::from_millis(DEBOUNCE_MS);
+    while let Ok(first) = rx.recv() {
+        let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut absorb = |msg: Result<Vec<PathBuf>, String>, log: &mut std::io::Stderr| match msg {
+            Ok(paths) => changed.extend(paths),
+            // Errors tend to be transient (a file vanishing mid-save); a
+            // rebuild would not help.
             Err(e) => {
                 let _ = writeln!(log, "brief: watcher error: {}", e);
             }
+        };
+        absorb(first, &mut log);
+        loop {
+            match rx.recv_timeout(debounce) {
+                Ok(msg) => absorb(msg, &mut log),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        }
+        if !changed.is_empty() {
+            let paths: Vec<PathBuf> = changed.into_iter().collect();
+            handle_change_paths(&paths, &mut engine, &mut log);
         }
     }
     Ok(())
 }
 
-fn handle_events<W: Write>(events: Vec<DebouncedEvent>, engine: &mut Engine, log: &mut W) {
-    let paths: Vec<PathBuf> = events.into_iter().map(|e| e.path).collect();
-    handle_change_paths(&paths, engine, log);
+/// Directories to watch: each input (a file through its parent, since some
+/// platforms report file-only watches unreliably), plus the directories
+/// whose `brief.toml` (or `--config` file) governs a tracked file, so a
+/// config edit is seen even when it lives above the watched paths.
+fn watch_targets(opts: &WatchOpts, engine: &Engine) -> Vec<(PathBuf, RecursiveMode)> {
+    let mut recursive: Vec<PathBuf> = Vec::new();
+    let mut flat: Vec<PathBuf> = Vec::new();
+    for p in &opts.paths {
+        let canon = canonicalize_or_clone(p);
+        if canon.is_file() {
+            flat.extend(canon.parent().map(Path::to_path_buf));
+        } else {
+            recursive.push(canon);
+        }
+    }
+    let roots: BTreeSet<PathBuf> = engine
+        .files
+        .iter()
+        .filter_map(|f| discover_root(f))
+        .collect();
+    flat.extend(roots);
+    if let Some(cfg) = &engine.config_override {
+        flat.extend(canonicalize_or_clone(cfg).parent().map(Path::to_path_buf));
+    }
+
+    recursive.sort();
+    recursive.dedup();
+    flat.sort();
+    flat.dedup();
+    let mut out: Vec<(PathBuf, RecursiveMode)> = Vec::new();
+    for dir in &recursive {
+        if !recursive.iter().any(|r| r != dir && dir.starts_with(r)) {
+            out.push((dir.clone(), RecursiveMode::Recursive));
+        }
+    }
+    for dir in flat {
+        if !recursive.iter().any(|r| dir.starts_with(r)) {
+            out.push((dir, RecursiveMode::NonRecursive));
+        }
+    }
+    out
+}
+
+/// Whether an event means a watched path's content may have changed.
+///
+/// notify's inotify backend also reports opens and reads, and every
+/// compile opens its source and indexes the rest of the project, so
+/// counting access as change makes each rebuild trigger the next one,
+/// forever. A close-after-write is the one access event that signals new
+/// content; metadata-only changes (`touch`, `chmod`) leave content alone.
+fn is_change(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Create(_) | EventKind::Remove(_) => true,
+        EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_) | ModifyKind::Any) => true,
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        // Backends report `Any` for what they cannot classify. Missing a
+        // real change is worse than a spurious event, which the content
+        // hash check turns into a no-op.
+        EventKind::Any => true,
+        EventKind::Access(_) | EventKind::Modify(_) | EventKind::Other => false,
+    }
 }
 
 /// Dispatch a list of changed paths through the engine. Public for tests
 /// (so we don't have to drive the FS watcher to exercise the logic).
+///
+/// Events that change nothing (our own outputs, a source saved with the
+/// same content, a config edit with no effect) print nothing at all, not
+/// even the clear-screen.
 pub fn handle_change_paths<W: Write>(paths: &[PathBuf], engine: &mut Engine, log: &mut W) {
+    let override_canon = engine.config_override.as_deref().map(canonicalize_or_clone);
+    let mut config_all = false;
+    let mut config_dirs: Vec<PathBuf> = Vec::new();
+    let mut brf_changes: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut removed: Vec<PathBuf> = Vec::new();
+
+    for path in paths {
+        let p = canonicalize_or_clone(path);
+        if engine.outputs.contains(&p) {
+            continue;
+        }
+        if override_canon.as_ref() == Some(&p) {
+            config_all = true;
+            continue;
+        }
+        if p.file_name().and_then(|s| s.to_str()) == Some("brief.toml") {
+            // A brief.toml appearing, changing or vanishing re-roots or
+            // reconfigures every file below it.
+            config_dirs.extend(p.parent().map(Path::to_path_buf));
+            continue;
+        }
+        if p.extension().and_then(|s| s.to_str()) != Some("brf") {
+            continue;
+        }
+        if !p.exists() {
+            if engine.files.contains(&p) {
+                removed.push(p);
+            }
+            continue;
+        }
+        // New file? Track it. (Discovery is one-shot; this lets a new file
+        // dropped into the watched dir start being compiled.)
+        if !engine.files.contains(&p) {
+            if !engine.in_scope(&p) {
+                continue;
+            }
+            engine.add_file(p.clone());
+        }
+        if !engine.is_unchanged(&p) {
+            brf_changes.insert(p);
+        }
+    }
+
+    let mut messages: Vec<String> = Vec::new();
+    let mut to_compile: BTreeSet<PathBuf> = BTreeSet::new();
+    if config_all || !config_dirs.is_empty() {
+        let affected: Vec<PathBuf> = engine
+            .files
+            .iter()
+            .filter(|f| config_all || config_dirs.iter().any(|d| f.starts_with(d)))
+            .cloned()
+            .collect();
+        let mut failures: BTreeSet<String> = BTreeSet::new();
+        let mut all = false;
+        let mut templates: BTreeSet<String> = BTreeSet::new();
+        for (f, delta) in engine.config_deltas(&affected) {
+            match delta {
+                Err(e) => {
+                    failures.insert(e);
+                }
+                Ok(ConfigDelta::All) => {
+                    all = true;
+                    to_compile.insert(f);
+                }
+                Ok(ConfigDelta::Templates(names)) => {
+                    if engine.uses_any(&f, &names) {
+                        to_compile.insert(f);
+                    }
+                    templates.extend(names);
+                }
+                Ok(ConfigDelta::None) => {}
+            }
+        }
+        for e in failures {
+            messages.push(format!("brief: config reload failed: {}", e));
+        }
+        if all {
+            messages.push("brief: config changed → recompiling all".to_string());
+        } else if !templates.is_empty() {
+            let listed = templates.into_iter().collect::<Vec<_>>().join(", ");
+            messages.push(format!(
+                "brief: template change ({}) → recompiling files using {}",
+                listed, listed
+            ));
+            if to_compile.is_empty() {
+                messages.push(format!("brief: (no tracked file references {})", listed));
+            }
+        }
+    }
+
+    if messages.is_empty() && removed.is_empty() && brf_changes.is_empty() && to_compile.is_empty()
+    {
+        return;
+    }
     // Clear screen between runs per spec §4.7, unless suppressed.
     if !engine.no_clear {
         let _ = write!(log, "\x1b[2J\x1b[H");
     }
-
-    let cfg_canon = canonicalize_or_clone(&engine.config_path);
-    let mut config_changed = false;
-    let mut brf_changes: BTreeSet<PathBuf> = BTreeSet::new();
-
-    for path in paths {
-        let p = canonicalize_or_clone(path);
-        if p == cfg_canon {
-            config_changed = true;
-            continue;
-        }
-        if p.extension().and_then(|s| s.to_str()) == Some("brf") {
-            // New file? Track it. (Discovery is one-shot; this lets a new
-            // file dropped into the watched dir start being compiled.)
-            if !engine.files.contains(&p) && p.exists() {
-                engine.add_file(p.clone());
-            }
-            if engine.files.contains(&p) {
-                brf_changes.insert(p);
-            }
-        }
+    for m in &messages {
+        let _ = writeln!(log, "{}", m);
     }
-
-    if config_changed {
-        match engine.reload_config() {
-            Ok(ConfigDelta::All) => {
-                let _ = writeln!(log, "brief: config changed → recompiling all");
-                let outcomes = engine.compile_all(log);
-                print_outcomes(&outcomes, log);
-                return; // covers any concurrent .brf changes
-            }
-            Ok(ConfigDelta::Templates(names)) => {
-                let listed: Vec<String> = names.iter().cloned().collect();
-                let _ = writeln!(
-                    log,
-                    "brief: template change ({}) → recompiling files using {}",
-                    listed.join(", "),
-                    listed.join(", ")
-                );
-                let files = engine.files_using(&names);
-                if files.is_empty() {
-                    let _ = writeln!(
-                        log,
-                        "brief: (no tracked file references {})",
-                        listed.join(", ")
-                    );
-                }
-                for f in &files {
-                    let outcome = engine.compile_one(f, log);
-                    print_outcomes(std::slice::from_ref(&outcome), log);
-                }
-                // Fall through to also handle direct .brf changes.
-            }
-            Ok(ConfigDelta::None) => { /* nothing material in config */ }
-            Err(e) => {
-                let _ = writeln!(log, "brief: config reload failed: {}", e);
-            }
-        }
+    for f in removed {
+        engine.files.remove(&f);
+        engine.shortcode_use.remove(&f);
+        engine.built.remove(&f);
+        let _ = writeln!(log, "brief: {} removed (no longer tracked)", f.display());
     }
-
-    for f in brf_changes {
-        if !f.exists() {
-            engine.files.remove(&f);
-            engine.shortcode_use.remove(&f);
-            let _ = writeln!(log, "brief: {} removed (no longer tracked)", f.display());
-            continue;
-        }
-        let outcome = engine.compile_one(&f, log);
-        print_outcomes(std::slice::from_ref(&outcome), log);
-    }
+    to_compile.extend(brf_changes);
+    let files: Vec<PathBuf> = to_compile.into_iter().collect();
+    let outcomes = engine.compile_files(&files, log);
+    print_outcomes(&outcomes, log);
 }
 
 fn print_outcomes<W: Write>(outcomes: &[CompileOutcome], log: &mut W) {
@@ -686,7 +850,7 @@ fn print_outcomes<W: Write>(outcomes: &[CompileOutcome], log: &mut W) {
                     if *count == 1 { "" } else { "s" }
                 );
             }
-            CompileOutcome::IoError { src, msg } => {
+            CompileOutcome::IoError { src, msg } | CompileOutcome::BadConfig { src, msg } => {
                 let _ = writeln!(log, "brief: {} → FAILED: {}", src.display(), msg);
             }
         }
@@ -804,6 +968,55 @@ mod tests {
     }
 
     #[test]
+    fn reads_are_not_changes_but_writes_are() {
+        use notify::event::{CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode};
+        let change = [
+            EventKind::Create(CreateKind::File),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+        ];
+        let no_change = [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
+        ];
+        for k in &change {
+            assert!(is_change(k), "{:?} should count", k);
+        }
+        for k in &no_change {
+            assert!(!is_change(k), "{:?} should not count", k);
+        }
+    }
+
+    #[test]
+    fn watch_targets_cover_config_dirs_once() {
+        let td = tempfile::TempDir::new().unwrap();
+        let root = td.path().canonicalize().unwrap();
+        std::fs::write(root.join("brief.toml"), "").unwrap();
+        std::fs::create_dir_all(root.join("docs/deep")).unwrap();
+        std::fs::write(root.join("docs/a.brf"), "# A\n").unwrap();
+        std::fs::write(root.join("docs/deep/b.brf"), "# B\n").unwrap();
+        let opts = WatchOpts {
+            paths: vec![root.join("docs"), root.join("docs/deep")],
+            target: Some(Target::Html),
+            config_override: None,
+            llm_opts: LlmOpts::default(),
+            no_clear: true,
+        };
+        let engine = Engine::load(&opts).unwrap();
+        let targets: Vec<(PathBuf, bool)> = watch_targets(&opts, &engine)
+            .into_iter()
+            .map(|(p, m)| (p, m == RecursiveMode::Recursive))
+            .collect();
+        // docs/deep is inside docs; the root is watched only for brief.toml.
+        assert_eq!(targets, vec![(root.join("docs"), true), (root, false)]);
+    }
+
+    #[test]
     fn output_path_replaces_brf_extension() {
         let p = output_path(Path::new("/tmp/foo/note.brf"), Target::Html);
         assert_eq!(p, PathBuf::from("/tmp/foo/note.html"));
@@ -828,8 +1041,8 @@ mod tests {
         std::fs::write(&f, "# Hello\n").unwrap();
         let opts = WatchOpts {
             paths: vec![dir.clone()],
-            target: Target::Html,
-            config_path: dir.join("brief.toml"),
+            target: Some(Target::Html),
+            config_override: None,
             llm_opts: LlmOpts::default(),
             no_clear: true,
         };
@@ -871,8 +1084,8 @@ template_html = "<aside>{{content}}</aside>"
 
         let opts = WatchOpts {
             paths: vec![dir.clone()],
-            target: Target::Html,
-            config_path: cfg_path,
+            target: Some(Target::Html),
+            config_override: None,
             llm_opts: LlmOpts::default(),
             no_clear: false,
         };
@@ -897,8 +1110,8 @@ template_html = "<aside>{{content}}</aside>"
 
         let opts = WatchOpts {
             paths: vec![dir.clone()],
-            target: Target::Html,
-            config_path: dir.join("brief.toml"),
+            target: Some(Target::Html),
+            config_override: None,
             llm_opts: LlmOpts::default(),
             no_clear: false,
         };
@@ -913,6 +1126,7 @@ template_html = "<aside>{{content}}</aside>"
         );
 
         // Simulate a subsequent file-change event.
+        std::fs::write(&f, "# Hello again\n").unwrap();
         let mut log: Vec<u8> = Vec::new();
         handle_change_paths(&[f.clone()], &mut engine, &mut log);
         let out = String::from_utf8_lossy(&log);
@@ -933,8 +1147,8 @@ template_html = "<aside>{{content}}</aside>"
 
         let opts = WatchOpts {
             paths: vec![dir.clone()],
-            target: Target::Html,
-            config_path: dir.join("brief.toml"),
+            target: Some(Target::Html),
+            config_override: None,
             llm_opts: LlmOpts::default(),
             no_clear: true,
         };
@@ -942,9 +1156,15 @@ template_html = "<aside>{{content}}</aside>"
         let mut initial_log: Vec<u8> = Vec::new();
         let _ = engine.compile_all(&mut initial_log);
 
+        std::fs::write(&f, "# Hello again\n").unwrap();
         let mut log: Vec<u8> = Vec::new();
         handle_change_paths(&[f.clone()], &mut engine, &mut log);
         let out = String::from_utf8_lossy(&log);
+        assert!(
+            out.contains("doc.html"),
+            "recompile expected; got: {:?}",
+            out
+        );
         assert!(
             !out.contains("\x1b[2J"),
             "clear sequence should be suppressed when no_clear=true; got: {:?}",
@@ -962,8 +1182,8 @@ template_html = "<aside>{{content}}</aside>"
 
         let opts = WatchOpts {
             paths: vec![dir.clone()],
-            target: Target::Html,
-            config_path: dir.join("brief.toml"),
+            target: Some(Target::Html),
+            config_override: None,
             llm_opts: LlmOpts::default(),
             no_clear: false,
         };
@@ -998,8 +1218,8 @@ template_html = "<aside>{{content}}</aside>"
 
         let opts = WatchOpts {
             paths: vec![root.to_path_buf()],
-            target: Target::Html,
-            config_path: root.join("brief.toml"),
+            target: Some(Target::Html),
+            config_override: None,
             llm_opts: LlmOpts::default(),
             no_clear: true,
         };

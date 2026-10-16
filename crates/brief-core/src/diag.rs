@@ -38,6 +38,7 @@ pub enum Code {
     ConflictingCodeAttributes = 316,
     BadHeadingAnchor = 317,
     NestingTooDeep = 318,
+    UnterminatedComment = 319,
 
     MinifyFailed = 701,
     CodeBlockLineCount = 702,
@@ -53,6 +54,7 @@ pub enum Code {
     DuplicateKwarg = 407,
     DeprecatedCalloutKind = 408,
     UnknownArg = 409,
+    UnsafeUrl = 410,
 
     OrderedListSequence = 501,
     TableColumnMismatch = 502,
@@ -65,6 +67,8 @@ pub enum Code {
     RefMissingAnchor = 602,
     RefBadTarget = 603,
     RefNoProject = 604,
+    RefTargetBroken = 605,
+    MissingFragment = 606,
 }
 
 impl Code {
@@ -98,6 +102,7 @@ impl Code {
         Code::ConflictingCodeAttributes,
         Code::BadHeadingAnchor,
         Code::NestingTooDeep,
+        Code::UnterminatedComment,
         Code::UnknownShortcode,
         Code::ArgTypeMismatch,
         Code::MissingArg,
@@ -107,6 +112,7 @@ impl Code {
         Code::DuplicateKwarg,
         Code::DeprecatedCalloutKind,
         Code::UnknownArg,
+        Code::UnsafeUrl,
         Code::OrderedListSequence,
         Code::TableColumnMismatch,
         Code::HeadingMonotonic,
@@ -117,6 +123,8 @@ impl Code {
         Code::RefMissingAnchor,
         Code::RefBadTarget,
         Code::RefNoProject,
+        Code::RefTargetBroken,
+        Code::MissingFragment,
         Code::MinifyFailed,
         Code::CodeBlockLineCount,
         Code::LineCommentConverted,
@@ -157,6 +165,7 @@ impl Code {
             ConflictingCodeAttributes => "conflicting code-fence attributes",
             BadHeadingAnchor => "invalid heading anchor",
             NestingTooDeep => "blocks are nested too deeply",
+            UnterminatedComment => "block comment `/*` is never closed",
             BadDefinitionList => "malformed definition list",
             MinifyFailed => "code block did not parse in its tagged language; emitted verbatim",
             CodeBlockLineCount => {
@@ -173,17 +182,20 @@ impl Code {
             DuplicateKwarg => "keyword argument given more than once",
             DeprecatedCalloutKind => "callout kind is deprecated; use the GFM equivalent",
             UnknownArg => "shortcode does not declare this argument",
+            UnsafeUrl => "URL scheme is not allowed",
             OrderedListSequence => "ordered list numbering must be sequential starting from 1",
             TableColumnMismatch => "table row column count does not match header",
             HeadingMonotonic => "heading levels must increase by at most one",
             AlignArrayLength => "alignment array length must equal the column count",
-            DuplicateHeadingAnchor => "heading anchor must be unique within a document",
+            DuplicateHeadingAnchor => "heading id must be unique within a document",
             RefMissingFile => "cross-document reference target file does not exist in project",
             RefMissingAnchor => {
                 "cross-document reference target anchor does not exist in target file"
             }
             RefBadTarget => "malformed cross-document reference target",
             RefNoProject => "`@ref` requires a `brief.toml`-rooted project; none found",
+            RefTargetBroken => "cross-document reference target has errors",
+            MissingFragment => "link fragment does not match any heading in this document",
         }
     }
 
@@ -196,7 +208,7 @@ impl Code {
                 "Brief sources must be valid UTF-8. Re-encode the file (e.g. `iconv -t UTF-8`) or find and fix the corrupt bytes at the reported offset."
             }
             TabCharacter => {
-                "Tabs are forbidden in Brief sources. Configure your editor to insert two spaces."
+                "Tabs are forbidden in Brief markup. Configure your editor to insert two spaces. Code fence and `@code` bodies and `+++` frontmatter are verbatim, so tabs there (Go, Makefiles, TSV) are kept as written."
             }
             BomNotAtStart => {
                 "A UTF-8 byte-order mark is tolerated only as the very first bytes of the file. A BOM anywhere else is usually the result of concatenating files; delete it."
@@ -238,7 +250,7 @@ impl Code {
                 "A block shortcode (`@details`, `@dl`, `@code`, a custom block) was never closed. Add `@end` at the same indentation as the opening line."
             }
             InlineBlockComment => {
-                "`/* ... */` comments are block-level in Brief: they must start at the beginning of a line. For a comment after content on the same line there is no inline form — move it to its own line."
+                "`/* ... */` comments are block-level in Brief: they must start at the beginning of a line. For a comment after content on the same line there is no inline form — move it to its own line. If the text is literal, escape the slash (`\\/*`) or put it in a code span."
             }
             BadListMarker => {
                 "Unordered list items are `- ` (dash, one space); ordered items are `1. ` (number, dot, one space). Markdown's `*` and `+` markers are not list markers in Brief."
@@ -271,7 +283,10 @@ impl Code {
                 "A heading anchor is a trailing `{#name}` where name matches `[a-z0-9-]+`: `## Title {#title}`. Fix the anchor syntax or remove the braces."
             }
             NestingTooDeep => {
-                "Blocks (lists, blockquotes, block shortcodes) nest at most 64 levels deep. Deeper nesting is almost always generated or accidental input; restructure the document."
+                "Blocks (lists, blockquotes, block shortcodes) nest at most 64 levels deep, and so do inline shortcode bodies (`@sup[@sub[...]]`). Deeper nesting is almost always generated or accidental input; restructure the document."
+            }
+            UnterminatedComment => {
+                "A line holding only `/*` (or starting with `/* ` and a space) opens a block comment, and everything up to the line ending in `*/` is dropped from the output. This one never closes, so the rest of the file would vanish. Add the closing `*/`, or escape the slash (`\\/*`) if the line is prose."
             }
             UnknownShortcode => {
                 "Shortcodes must be registered in `brief.toml` under `[shortcodes.<name>]` (or be a built-in: link, image, kbd, sub, sup, details, t, code, callout, math, footnote, ref). Note: `@br` is intentionally not a shortcode — use `\\` at end of line for a hard break."
@@ -297,6 +312,9 @@ impl Code {
             DeprecatedCalloutKind => {
                 "This callout kind is a deprecated alias. Use the GFM set: note, tip, important, warning, caution. This is the compiler's only deprecation warning; it compiles with exit 0."
             }
+            UnsafeUrl => {
+                "Link and image targets must be `http:`, `https:` or `mailto:` URLs, a relative path, or a `#fragment`. Other schemes (`javascript:`, `data:`, `vbscript:`, `file:`, ...) are rejected so content from contributors or models cannot inject script through a link. A scheme is the letters, digits, `+`, `-` and `.` before the first `:`, provided no `/`, `?` or `#` comes first, so a relative path such as `a/b:c` is fine. Matching follows browsers: it ignores case, leading whitespace and control characters (` JaVaScRiPt:` is `javascript:`)."
+            }
             UnknownArg => {
                 "The shortcode does not declare an argument with this name. Check the spelling against the declared arguments (listed in the diagnostic's help text), or declare it in `brief.toml`."
             }
@@ -316,19 +334,25 @@ impl Code {
                 "A `@dl` body alternates term lines and `: definition` lines — colon, exactly one space, definition. Terms without definitions, definitions without terms, multiple definitions per term, and extra or missing spaces after `:` are all rejected."
             }
             DuplicateHeadingAnchor => {
-                "Two headings in this document declare the same `{#anchor}`. Anchors are `@ref` targets and must be unique within a file; rename one."
+                "Two headings in this document have the same id. Every heading gets an id: its explicit `{#anchor}`, or else its text slugged the way GitHub does it (lowercased, punctuation dropped, spaces as `-`; a heading with no letters or digits gets `section`). Ids are `#fragment` and `@ref` targets, so two headings may not share one, whether it is explicit or automatic. Pin a distinct id on one of them with a trailing `{#id}`: `## Setup {#setup-linux}`."
             }
             RefMissingFile => {
                 "Brief verifies cross-document references at compile time. The file referenced by `@ref[path.brf]` was not found anywhere under the project root (the directory containing `brief.toml`). Either fix the path, create the missing file, or move the file into the project tree."
             }
             RefMissingAnchor => {
-                "Brief verifies that the `#anchor` portion of `@ref[file.brf#anchor]` matches a heading anchor declared in the target file (e.g. `## Title {#anchor}`). The anchor was not found. The diagnostic's help text lists the anchors that *do* exist in the target file."
+                "Brief verifies that the `#anchor` portion of `@ref[file.brf#anchor]` matches a heading id in the target file: an explicit `## Title {#anchor}`, or the automatic id every heading gets from its text (`## Install Steps` is `install-steps`). No heading there has this id. The diagnostic's help text lists the ids that *do* exist in the target file."
             }
             RefBadTarget => {
-                "`@ref` targets are project-relative `.brf` paths, optionally suffixed with `#anchor`. Leading `/`, `..` segments, backslashes, missing `.brf` extension, and anchors not matching `[a-z0-9-]+` are rejected. Restate the target in canonical form."
+                "`@ref` targets are project-relative `.brf` paths, optionally suffixed with `#anchor`. Leading `/`, `..` segments, backslashes, a missing `.brf` extension, and anchors that cannot be a heading id (anything but lowercase letters, digits, `-` and `_`) are rejected. Restate the target in canonical form."
             }
             RefNoProject => {
                 "`@ref` only works inside a project rooted by a `brief.toml` file. The compiler walks up from the source file looking for one. Create a `brief.toml` (an empty file is fine) at the desired root, or remove the `@ref` invocation."
+            }
+            RefTargetBroken => {
+                "The file this `@ref` points at does not compile, so its headings cannot be trusted as link targets and its page would not build. Compile the target file (`brief compile <target>`) to see its errors, and fix them."
+            }
+            MissingFragment => {
+                "A `@link` to `#fragment` points into the current document, but no heading here has that id. Every heading gets an automatic id the way GitHub makes them (its text lowercased, punctuation dropped, spaces as `-`) unless it pins one with `{#id}`. Fix the fragment, or pin the matching `{#id}` on the heading. A bare `#` and `#top` always mean the top of the page and are accepted."
             }
             MinifyFailed => {
                 "A code block is tagged with a minifiable language but does not lex in that language (e.g. an unterminated string, or pseudo-code tagged `json`). The block is emitted verbatim and compilation continues; fix the code or the language tag. Compiles with exit 0."

@@ -21,6 +21,35 @@ pub struct ResolvedRef {
     pub target_anchor: Option<String>,
     /// Display text (taken from the `title` positional arg).
     pub display: String,
+    /// `target_path` relative to the directory of the file holding the
+    /// `@ref`, still ending in `.brf`: `guide.brf` seen from `sub/a.brf` is
+    /// `../guide.brf`. `None` when the target is that file itself.
+    pub relative_path: Option<String>,
+}
+
+impl ResolvedRef {
+    /// Link to the target from the referring page, for output where each
+    /// `foo.brf` becomes a sibling `foo.<ext>`: `../guide.html#x`, `b.html`,
+    /// or just `#x` for an anchor in the same file. Page-relative, so it
+    /// stays correct wherever the output tree is deployed.
+    pub fn href(&self, ext: &str) -> String {
+        let mut out = String::new();
+        let file = match &self.relative_path {
+            Some(p) => Some(p.as_str()),
+            None if self.target_anchor.is_some() => None,
+            None => Some(self.target_path.rsplit('/').next().unwrap_or("")),
+        };
+        if let Some(f) = file {
+            out.push_str(f.strip_suffix(".brf").unwrap_or(f));
+            out.push('.');
+            out.push_str(ext);
+        }
+        if let Some(a) = &self.target_anchor {
+            out.push('#');
+            out.push_str(a);
+        }
+        out
+    }
 }
 
 #[derive(Clone, Debug)]

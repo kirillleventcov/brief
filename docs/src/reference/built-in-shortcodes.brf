@@ -148,10 +148,16 @@ Block:
 @end
 ```
 
-The body is verbatim LaTeX, passed through to the HTML target inside
-`<span class="math">` (inline) or `<div class="math math-display">`
-(block). LLM mode renders inline math as `$body$` and block math as
-`$$body$$`.
+The body is verbatim LaTeX: backslashes, `_` and `*` are TeX, not Brief
+escapes or emphasis. The HTML target escapes it once and wraps it in
+`<span class="math math-inline">` (inline) or
+`<div class="math math-display">` (block). LLM mode renders inline math as
+`$body$` and block math as `$$body$$`.
+
+Square brackets nest inside an inline body, so `@math[\sqrt[3]{x}]` works:
+the body ends at the `]` that balances the opening `[`. An unmatched
+bracket, such as a half-open interval, is an error; write it as `\lbrack`
+or `\rbrack`, or use the block form.
 
 Brief does not ship a LaTeX engine. Wire one up at the page-template
 layer (KaTeX, MathJax) for browser rendering.

@@ -111,9 +111,23 @@ See @ref[getting-started.brf](Getting Started) for the next step.
 See @ref[reference/grammar.brf#headings](Headings) for the heading rules.
 ```
 
-- `path` is project-relative (rooted at `brief.toml`).
-- An `#anchor` suffix targets a heading anchor in that page; missing
-  files / missing anchors are build warnings.
+- `path` is relative to `src/`.
+- An `#anchor` suffix targets a heading anchor in that page.
+- A missing file or anchor is a build error, and so is a link to a `.brf`
+  file that is not listed in `SUMMARY.brf` (it would be a dead link).
+
+## Errors and warnings
+
+Every page is checked exactly as `brief compile` checks it. Any error
+fails the build with exit code 1 and leaves `dist/` as it was; all
+failing pages are reported, each diagnostic at its line and column.
+Warnings are printed the same way and do not fail the build unless
+`--deny-warnings` is given. A `.brf` file under `src/` that is not a
+site page (a draft, say) can have errors without failing the build,
+unless a page links to it.
+
+Under `serve`, a failed rebuild prints its errors and the server keeps
+serving the last good build.
 
 ## Themes
 
@@ -148,9 +162,11 @@ that reloads the page when it sees one. No WebSockets, no polling.
 ```
 brief-web init   [PATH]                 # scaffold (--multi, --force)
 brief-web build  [PATH]                 # one-shot build into dist/
+                       [--deny-warnings]
 brief-web serve  [PATH] [--host H]      # build + live-reload server
                        [--port N]
                        [--no-watch]
+                       [--deny-warnings]
 ```
 
 `PATH` defaults to the current directory in every command.

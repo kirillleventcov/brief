@@ -92,6 +92,8 @@ pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> (String, Vec<Strin
         warnings: Vec::new(),
         frontmatter_minify_code,
         resolved_refs: &doc.resolved_refs,
+        root: &out,
+        verbatim: Vec::new(),
     };
     for b in &doc.blocks {
         render_block(b, &mut ctx, &mut out, 0);
@@ -99,35 +101,48 @@ pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> (String, Vec<Strin
     if !footnotes.is_empty() {
         emit_footnotes_section(&footnotes, reg, opts, &doc.resolved_refs, &mut out);
     }
-    let warnings = ctx.warnings;
-    // Collapse runs of 3+ newlines down to 2. Copy unaffected stretches in
-    // bulk; `\n` is ASCII so scanning bytes is UTF-8 safe. Documents with no
-    // over-long newline run (the common case) are returned as-is.
+    let out = collapse_newline_runs(out, &ctx.verbatim);
+    (out, ctx.warnings)
+}
+
+/// Collapse runs of 3+ newlines down to 2, except inside the `verbatim`
+/// code-body ranges: a code body is content, so its newlines are never
+/// dropped and never count toward a run around it. Copy unaffected
+/// stretches in bulk; `\n` is ASCII so scanning bytes is UTF-8 safe. Output
+/// with no over-long newline run (the common case) is returned as-is.
+fn collapse_newline_runs(out: String, verbatim: &[(usize, usize)]) -> String {
     let bytes = out.as_bytes();
     let mut collapsed = String::new();
     let mut copy_from = 0;
     let mut nl_run = 0usize;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' {
-            nl_run += 1;
-            if nl_run == 3 {
-                // First excess newline: copy everything before it once.
-                collapsed.reserve(out.len() - collapsed.len());
-                collapsed.push_str(&out[copy_from..i]);
-                copy_from = i + 1;
-            } else if nl_run > 3 {
-                collapsed.push_str(&out[copy_from..i]);
-                copy_from = i + 1;
+    let mut i = 0;
+    let end = (bytes.len(), bytes.len());
+    for &(skip_from, skip_to) in verbatim.iter().chain(std::iter::once(&end)) {
+        while i < skip_from {
+            if bytes[i] == b'\n' {
+                nl_run += 1;
+                if nl_run == 3 {
+                    // First excess newline: copy everything before it once.
+                    collapsed.reserve(out.len() - collapsed.len());
+                    collapsed.push_str(&out[copy_from..i]);
+                    copy_from = i + 1;
+                } else if nl_run > 3 {
+                    collapsed.push_str(&out[copy_from..i]);
+                    copy_from = i + 1;
+                }
+            } else {
+                nl_run = 0;
             }
-        } else {
-            nl_run = 0;
+            i += 1;
         }
+        nl_run = 0;
+        i = i.max(skip_to);
     }
     if copy_from == 0 {
-        return (out, warnings);
+        return out;
     }
     collapsed.push_str(&out[copy_from..]);
-    (collapsed, warnings)
+    collapsed
 }
 
 struct Ctx<'a> {
@@ -138,6 +153,15 @@ struct Ctx<'a> {
     warnings: Vec<String>,
     frontmatter_minify_code: Option<bool>,
     resolved_refs: &'a std::collections::BTreeMap<crate::span::Span, crate::ast::ResolvedRef>,
+    /// The buffer that becomes the final output; compared by address only.
+    /// A code body written into a scratch buffer has no known offset in the
+    /// output (a blockquote re-prefixes every line, so no newline run can
+    /// form there anyway), so only bodies written here are recorded. A
+    /// template points this at its own buffer and shifts what it records.
+    root: *const String,
+    /// Byte ranges of code bodies in `root`, in ascending order, that the
+    /// newline-run collapse must leave untouched.
+    verbatim: Vec<(usize, usize)>,
 }
 
 fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String, indent: usize) {
@@ -233,12 +257,15 @@ fn emit_code_block(
             out.push_str(l);
         }
         out.push('\n');
-        out.push_str(body_to_emit);
-        out.push('\n');
+    }
+    let start = out.len();
+    out.push_str(body_to_emit);
+    if std::ptr::eq(out, ctx.root) && out.len() > start {
+        ctx.verbatim.push((start, out.len()));
+    }
+    out.push('\n');
+    if ctx.opts.preserve_code_fences {
         out.push_str("```\n");
-    } else {
-        out.push_str(body_to_emit);
-        out.push('\n');
     }
 }
 
@@ -396,11 +423,26 @@ fn render_block_shortcode_llm(
 ) {
     if let Some(sc) = ctx.reg.get(name) {
         if let Some(t) = &sc.template_llm {
+            // Record code bodies relative to `inner`, then shift them to
+            // wherever the template splices `{{content}}` into `out`.
             let mut inner = String::new();
+            let outer_root = std::mem::replace(&mut ctx.root, &inner);
+            let outer_verbatim = std::mem::take(&mut ctx.verbatim);
             for c in children {
                 render_block(c, ctx, &mut inner, indent);
             }
-            let r = expand_template_llm(t, args, &inner);
+            ctx.root = outer_root;
+            let inner_verbatim = std::mem::replace(&mut ctx.verbatim, outer_verbatim);
+            let mut content_at = Vec::new();
+            let r = expand_template_llm_at(t, args, &inner, Some(&mut content_at));
+            if std::ptr::eq(out, ctx.root) {
+                let base = out.len();
+                for at in content_at {
+                    for &(s, e) in &inner_verbatim {
+                        ctx.verbatim.push((base + at + s, base + at + e));
+                    }
+                }
+            }
             out.push_str(&r);
             return;
         }
@@ -431,11 +473,9 @@ fn render_block_shortcode_llm(
             let _ = writeln!(out, "[/details]");
         }
         "math" => {
-            let mut s = String::new();
-            for c in children {
-                render_block(c, ctx, &mut s, indent);
-            }
-            let _ = writeln!(out, "$${}$$", s.trim());
+            // Verbatim TeX straight from the AST; rendering the body as a
+            // paragraph would indent it and run it through inline output.
+            let _ = writeln!(out, "$${}$$", super::math_block_source(children).trim());
         }
         _ => {
             let _ = writeln!(out, "@{}", name);
@@ -592,7 +632,8 @@ fn render_inline_shortcode_llm(
             let _ = write!(out, "[sup:{}]", inner_string.as_deref().unwrap_or(""));
         }
         "math" => {
-            let _ = write!(out, "${}$", inner_string.as_deref().unwrap_or(""));
+            let tex = content.map(super::math_source).unwrap_or_default();
+            let _ = write!(out, "${}$", tex);
         }
         _ => {
             let _ = write!(out, "@{}", name);
@@ -710,6 +751,8 @@ fn emit_footnotes_section(
             warnings: Vec::new(),
             frontmatter_minify_code: None,
             resolved_refs,
+            root: out,
+            verbatim: Vec::new(),
         };
         render_inline_seq(body, &mut ctx, out);
         out.push('\n');
@@ -717,6 +760,17 @@ fn emit_footnotes_section(
 }
 
 fn expand_template_llm(tpl: &str, args: &ShortArgs, content: &str) -> String {
+    expand_template_llm_at(tpl, args, content, None)
+}
+
+/// `expand_template_llm`, also reporting the byte offset of each
+/// `{{content}}` substitution in the result.
+fn expand_template_llm_at(
+    tpl: &str,
+    args: &ShortArgs,
+    content: &str,
+    mut content_at: Option<&mut Vec<usize>>,
+) -> String {
     let mut out = String::new();
     let bytes = tpl.as_bytes();
     let mut start = 0;
@@ -730,6 +784,9 @@ fn expand_template_llm(tpl: &str, args: &ShortArgs, content: &str) -> String {
                 out.push_str(&tpl[start..i]);
                 let key = tpl[i + 2..i + 2 + rel].trim();
                 if key == "content" {
+                    if let Some(at) = content_at.as_deref_mut() {
+                        at.push(out.len());
+                    }
                     out.push_str(content);
                 } else if let Some(rest) = key.strip_prefix("args.") {
                     if let Some(v) = args.keyword.get(rest).and_then(|v| v.as_str()) {

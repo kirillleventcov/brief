@@ -33,11 +33,16 @@ It can span as many lines as it needs.
 Rules:
 
 - Block comments cannot nest.
-- The opening `/*` must appear at the start of a line, end of a line, or
-  on its own line.
-- The closing `*/` must appear at the start of a line, end of a line, or
-  on its own line.
-- A block comment in the middle of a paragraph is a compile error.
+- A comment opens on a line that is exactly `/*` or starts with `/* `
+  (slash, star, space). A line such as `/**` or `/*.tmp files` is
+  ordinary text.
+- The comment runs to the first line that ends with `*/`;
+  `/* like this */` opens and closes on one line.
+- A comment that never closes is a compile error (@ec[B0319]) instead of
+  silently hiding the rest of the file.
+- A `/* ... */` after content on a line, or one opened at the end of a
+  content line, is a compile error (@ec[B0307]). There is no inline
+  comment; escape the slash (`\/*`) when the text is literal.
 
 ## What gets stripped
 

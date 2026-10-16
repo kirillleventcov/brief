@@ -5,10 +5,14 @@
 //!     directly. These are fast and deterministic — they exercise the same
 //!     branches the FS watcher would, without depending on notify/FSEvents
 //!     timing.
-//!  2. One end-to-end test that spawns the binary and exercises notify-mini
-//!     for real (with generous waits).
+//!  2. End-to-end tests that spawn the binary and exercise notify for real
+//!     (with generous waits) live in `crates/brief-cli/tests/watch_e2e.rs`.
 
-use brief::watch::{Engine, LlmOpts, Target, WatchOpts, handle_change_paths, scan_shortcode_uses};
+#![cfg(feature = "watch")]
+
+use brief::watch::{
+    CompileOutcome, Engine, LlmOpts, Target, WatchOpts, handle_change_paths, scan_shortcode_uses,
+};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -22,8 +26,8 @@ fn temp_dir(name: &str) -> PathBuf {
 fn opts_for(dir: &Path, target: Target) -> WatchOpts {
     WatchOpts {
         paths: vec![dir.to_path_buf()],
-        target,
-        config_path: dir.join("brief.toml"),
+        target: Some(target),
+        config_override: None,
         llm_opts: LlmOpts::default(),
         no_clear: true,
     }
@@ -263,4 +267,217 @@ fn scan_shortcode_uses_for_typical_brief_doc() {
     assert!(uses.contains("tip"));
     assert!(uses.contains("link"));
     assert!(uses.contains("kbd"));
+}
+
+// ---------- Idle stability ----------
+
+#[test]
+fn unchanged_content_is_not_rebuilt() {
+    let dir = temp_dir("unchanged-content");
+    let a = dir.join("a.brf");
+    std::fs::write(&a, "# A\n").unwrap();
+    let mut opts = opts_for(&dir, Target::Html);
+    opts.no_clear = false;
+    let mut engine = Engine::load(&opts).unwrap();
+    let mut log: Vec<u8> = Vec::new();
+    engine.compile_all(&mut log);
+    let a_html = dir.join("a.html");
+    let mtime_before = std::fs::metadata(&a_html).unwrap().modified().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Same bytes rewritten, as an editor's save-without-changes does.
+    std::fs::write(&a, "# A\n").unwrap();
+    let mut log: Vec<u8> = Vec::new();
+    handle_change_paths(&[a.clone()], &mut engine, &mut log);
+    assert_eq!(String::from_utf8_lossy(&log), "", "no rebuild, no clear");
+    let mtime_after = std::fs::metadata(&a_html).unwrap().modified().unwrap();
+    assert_eq!(mtime_before, mtime_after);
+}
+
+#[test]
+fn own_output_events_are_ignored() {
+    let dir = temp_dir("own-outputs");
+    let a = dir.join("a.brf");
+    std::fs::write(&a, "# A\n").unwrap();
+    let mut opts = opts_for(&dir, Target::Html);
+    opts.no_clear = false;
+    let mut engine = Engine::load(&opts).unwrap();
+    let mut log: Vec<u8> = Vec::new();
+    engine.compile_all(&mut log);
+
+    let mut log: Vec<u8> = Vec::new();
+    handle_change_paths(&[dir.join("a.html")], &mut engine, &mut log);
+    assert_eq!(String::from_utf8_lossy(&log), "");
+}
+
+#[test]
+fn single_file_watch_does_not_adopt_siblings() {
+    let dir = temp_dir("single-file-scope");
+    let a = dir.join("a.brf");
+    let b = dir.join("b.brf");
+    std::fs::write(&a, "# A\n").unwrap();
+    let mut opts = opts_for(&dir, Target::Html);
+    opts.paths = vec![a.clone()];
+    let mut engine = Engine::load(&opts).unwrap();
+    let mut log: Vec<u8> = Vec::new();
+    engine.compile_all(&mut log);
+
+    std::fs::write(&b, "# B\n").unwrap();
+    handle_change_paths(&[b.clone()], &mut engine, &mut log);
+    assert_eq!(engine.files.len(), 1);
+    assert!(!dir.join("b.html").exists());
+}
+
+// ---------- Project discovery ----------
+
+#[test]
+fn each_file_compiles_in_its_own_project() {
+    let dir = temp_dir("own-project");
+    std::fs::create_dir_all(dir.join("p1")).unwrap();
+    std::fs::create_dir_all(dir.join("p2")).unwrap();
+    std::fs::write(
+        dir.join("p1/brief.toml"),
+        "[shortcodes.lede]\nkind = \"inline\"\ntemplate_html = \"<b>{{content}}</b>\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("p2/brief.toml"),
+        "[compile]\ndefault_target = \"llm\"\n\n\
+         [shortcodes.lede]\nkind = \"inline\"\ntemplate_html = \"<i>{{content}}</i>\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("p1/a.brf"), "@lede[one]\n").unwrap();
+    std::fs::write(dir.join("p2/a.brf"), "@lede[two]\n").unwrap();
+
+    // No --target: each project's default_target decides.
+    let mut opts = opts_for(&dir, Target::Html);
+    opts.target = None;
+    let mut engine = Engine::load(&opts).unwrap();
+    let mut log: Vec<u8> = Vec::new();
+    engine.compile_all(&mut log);
+    let log = String::from_utf8_lossy(&log);
+    assert!(!log.contains("error"), "{}", log);
+    assert!(read(&dir.join("p1/a.html")).contains("<b>one</b>"));
+    assert!(dir.join("p2/a.txt").exists(), "{}", log);
+    assert!(!dir.join("p2/a.html").exists());
+}
+
+#[test]
+fn brief_toml_above_the_watched_dir_governs_it() {
+    let dir = temp_dir("toml-above");
+    std::fs::write(
+        dir.join("brief.toml"),
+        "[shortcodes.lede]\nkind = \"inline\"\ntemplate_html = \"<b>{{content}}</b>\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("docs")).unwrap();
+    std::fs::write(dir.join("docs/a.brf"), "@lede[hi]\n").unwrap();
+    let mut opts = opts_for(&dir, Target::Html);
+    opts.paths = vec![dir.join("docs")];
+    let mut engine = Engine::load(&opts).unwrap();
+    let mut log: Vec<u8> = Vec::new();
+    engine.compile_all(&mut log);
+    assert!(read(&dir.join("docs/a.html")).contains("<b>hi</b>"));
+}
+
+#[test]
+fn config_override_applies_to_every_project() {
+    let dir = temp_dir("config-override");
+    std::fs::create_dir_all(dir.join("p1")).unwrap();
+    std::fs::write(dir.join("p1/brief.toml"), "").unwrap();
+    std::fs::write(dir.join("p1/a.brf"), "@lede[x]\n").unwrap();
+    std::fs::write(dir.join("b.brf"), "@lede[y]\n").unwrap();
+    let cfg = dir.join("override.toml");
+    std::fs::write(
+        &cfg,
+        "[shortcodes.lede]\nkind = \"inline\"\ntemplate_html = \"<u>{{content}}</u>\"\n",
+    )
+    .unwrap();
+    let mut opts = opts_for(&dir, Target::Html);
+    opts.config_override = Some(cfg.clone());
+    let mut engine = Engine::load(&opts).unwrap();
+    let mut log: Vec<u8> = Vec::new();
+    engine.compile_all(&mut log);
+    assert!(read(&dir.join("p1/a.html")).contains("<u>x</u>"));
+    assert!(read(&dir.join("b.html")).contains("<u>y</u>"));
+
+    // Editing the override recompiles both.
+    std::fs::write(
+        &cfg,
+        "[shortcodes.lede]\nkind = \"inline\"\ntemplate_html = \"<s>{{content}}</s>\"\n",
+    )
+    .unwrap();
+    let mut log: Vec<u8> = Vec::new();
+    handle_change_paths(&[cfg.clone()], &mut engine, &mut log);
+    assert!(read(&dir.join("p1/a.html")).contains("<s>x</s>"));
+    assert!(read(&dir.join("b.html")).contains("<s>y</s>"));
+}
+
+#[test]
+fn bad_config_fails_startup() {
+    let dir = temp_dir("bad-config");
+    std::fs::write(dir.join("brief.toml"), "[compile]\nnope = 1\n").unwrap();
+    std::fs::write(dir.join("a.brf"), "# A\n").unwrap();
+    let err = Engine::load(&opts_for(&dir, Target::Html))
+        .err()
+        .expect("bad config must fail");
+    let cfg = dir.canonicalize().unwrap().join("brief.toml");
+    assert!(
+        err.starts_with(&format!("bad config {}: ", cfg.display())),
+        "{}",
+        err
+    );
+}
+
+// ---------- Broken-file policy ----------
+
+#[test]
+fn broken_file_only_fails_files_that_ref_it() {
+    let dir = temp_dir("broken-sibling");
+    std::fs::write(dir.join("brief.toml"), "").unwrap();
+    std::fs::write(dir.join("draft.brf"), "# D {#d}\n\n*unfinished\n").unwrap();
+    std::fs::write(dir.join("guide.brf"), "# Guide\n").unwrap();
+    std::fs::write(dir.join("links.brf"), "See @ref[draft.brf#d](the draft).\n").unwrap();
+    let mut engine = Engine::load(&opts_for(&dir, Target::Html)).unwrap();
+
+    let mut log: Vec<u8> = Vec::new();
+    let guide = engine.compile_one(&dir.join("guide.brf").canonicalize().unwrap(), &mut log);
+    assert!(matches!(guide, CompileOutcome::Ok { .. }), "{:?}", guide);
+    assert_eq!(String::from_utf8_lossy(&log), "");
+
+    let mut log: Vec<u8> = Vec::new();
+    let links = engine.compile_one(&dir.join("links.brf").canonicalize().unwrap(), &mut log);
+    assert!(
+        matches!(links, CompileOutcome::Errors { count: 1, .. }),
+        "{:?}",
+        links
+    );
+    let log = String::from_utf8_lossy(&log);
+    let b0605 = log.find("error[B0605]").expect("B0605");
+    let draft = log.find("error[B0207]").expect("draft's own error");
+    assert!(b0605 < draft, "{}", log);
+}
+
+#[test]
+fn failed_file_is_retried_on_an_identical_save() {
+    let dir = temp_dir("failed-retry");
+    let a = dir.join("a.brf");
+    std::fs::write(&a, "@nope[x]\n").unwrap();
+    let mut engine = Engine::load(&opts_for(&dir, Target::Html)).unwrap();
+    let mut log: Vec<u8> = Vec::new();
+    engine.compile_all(&mut log);
+
+    // The fix lives outside this file (here: a shortcode added to a new
+    // brief.toml the watcher has not seen); saving again must retry.
+    std::fs::write(
+        dir.join("brief.toml"),
+        "[shortcodes.nope]\nkind = \"inline\"\ntemplate_html = \"<b>{{content}}</b>\"\n",
+    )
+    .unwrap();
+    std::fs::write(&a, "@nope[x]\n").unwrap();
+    let mut log: Vec<u8> = Vec::new();
+    handle_change_paths(&[a.clone()], &mut engine, &mut log);
+    let log = String::from_utf8_lossy(&log);
+    assert!(log.contains("a.html"), "{}", log);
+    assert!(read(&dir.join("a.html")).contains("<b>x</b>"));
 }

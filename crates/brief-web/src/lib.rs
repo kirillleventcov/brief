@@ -14,5 +14,5 @@ pub mod summary;
 pub mod theme;
 pub mod watch;
 
-pub use builder::{BuildOutcome, Builder};
+pub use builder::{BuildError, BuildOutcome, Builder};
 pub use config::{BookConfig, BuildConfig, ProjectConfig, ServerConfig, SiteConfig};

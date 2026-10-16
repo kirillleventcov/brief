@@ -906,3 +906,189 @@ fn inline_code_with_backtick_value_space_padded() {
     assert_eq!(out, "`` `code` ``\n");
     assert!(holes.is_empty(), "{:?}", holes);
 }
+
+fn assert_compiles(brief_source: &str) {
+    let src = SourceMap::new("out.brf", brief_source);
+    let tokens = lex(&src).expect("lex must succeed");
+    let (mut doc, mut diags) = parse(tokens, &src);
+    let reg = Registry::with_builtins();
+    diags.extend(resolve(&mut doc, &reg));
+    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+    assert!(
+        diags.is_empty(),
+        "converter produced invalid Brief:\n--- BRIEF ---\n{}\n--- DIAGS ---\n{:#?}",
+        brief_source,
+        diags
+    );
+}
+
+const UNCLOSED_DETAILS_HOLE: &str = "// TODO[B-hole:html-block]: unclosed `<details>`: opening HTML preserved inside Brief block comment, content kept as plain Brief\n";
+
+#[test]
+fn unclosed_details_keeps_rest_of_document() {
+    let md = "Intro.\n\n<details><summary>S</summary>\n\nBody\n\n# Heading\n\nMore.\n";
+    let r = convert(md, "test.md");
+    assert_eq!(
+        r.brief_source,
+        format!(
+            "Intro.\n\n{}/*\n<details><summary>S</summary>\n*/\nBody\n\n# Heading\nMore.\n",
+            UNCLOSED_DETAILS_HOLE
+        )
+    );
+    assert_eq!(r.diagnostics.len(), 1, "{:?}", r.diagnostics);
+    assert_eq!(r.diagnostics[0].hole, Hole::HtmlBlock);
+    assert_eq!((r.diagnostics[0].line, r.diagnostics[0].col), (3, 1));
+    assert_compiles(&r.brief_source);
+}
+
+#[test]
+fn details_left_open_in_blockquote_does_not_swallow_document() {
+    // End(BlockQuote) used to pop the `<details>` buffer in the quote's
+    // place, leaving the quote open and everything after it unreachable.
+    let md = "> <details><summary>S</summary>\n>\n> Body in quote\n\nAfter quote.\n\nTail.\n";
+    let (out, holes) = run(md);
+    assert_eq!(
+        out,
+        format!(
+            "> {}> /*\n> <details><summary>S</summary>\n> */\n> Body in quote\nAfter quote.\n\nTail.\n",
+            UNCLOSED_DETAILS_HOLE
+        )
+    );
+    assert_eq!(holes, vec![Hole::HtmlBlock]);
+}
+
+#[test]
+fn details_left_open_in_gfm_alert_does_not_swallow_document() {
+    let md = "> [!NOTE]\n> <details><summary>S</summary>\n>\n> note body\n\nAfter.\n";
+    let (out, holes) = run(md);
+    assert_eq!(
+        out,
+        format!(
+            "@callout(kind: note)\n{}/*\n<details><summary>S</summary>\n*/\n// TODO[B-hole:gfm-alert]: GFM alert mapped to `@callout(kind: note)`\nnote body\n@end\nAfter.\n",
+            UNCLOSED_DETAILS_HOLE
+        )
+    );
+    assert_eq!(holes, vec![Hole::GfmAlert, Hole::HtmlBlock]);
+}
+
+#[test]
+fn details_left_open_in_list_item_keeps_following_items() {
+    let md = "- item one\n\n  <details><summary>S</summary>\n\n  Inside item\n\n- item two\n\nAfter list.\n";
+    let (out, holes) = run(md);
+    assert_eq!(
+        out,
+        format!(
+            "- item one\n{}/*\n<details><summary>S</summary>\n*/\nInside item\n- item two\nAfter list.\n",
+            UNCLOSED_DETAILS_HOLE
+        )
+    );
+    assert_eq!(holes, vec![Hole::HtmlBlock]);
+}
+
+#[test]
+fn unclosed_details_in_footnote_keeps_body() {
+    let md = "Ref[^1].\n\n[^1]: <details><summary>F</summary>\n\n    foot body\n\nTail.\n";
+    let (out, holes) = run(md);
+    assert!(out.contains("<details><summary>F</summary>"), "{}", out);
+    assert!(out.contains("foot body]"), "{}", out);
+    assert!(out.ends_with("\nTail.\n"), "{}", out);
+    assert_eq!(holes, vec![Hole::HtmlBlock]);
+}
+
+#[test]
+fn nested_details_closed_by_adjacent_tags() {
+    // `</details>\n</details>` is one HtmlBlock; the second close used to be
+    // dropped, leaving the outer block open and swallowing the rest.
+    let md = "<details><summary>A</summary>\n\n<details><summary>B</summary>\n\nInner\n\n</details>\n</details>\n\nTail.\n";
+    let (out, holes) = run(md);
+    assert_eq!(
+        out,
+        "@details(summary: \"A\")\n@details(summary: \"B\")\nInner\n@end\n@end\n\nTail.\n"
+    );
+    assert!(holes.is_empty(), "{:?}", holes);
+    assert_compiles(&out);
+}
+
+#[test]
+fn sibling_details_sharing_an_html_block() {
+    // The next block's opener used to vanish with the preceding close tag.
+    let md = "<details><summary>A</summary>\n\nx\n\n</details>\n<details><summary>B</summary>\n\ny\n\n</details>\n\nTail.\n";
+    let (out, holes) = run(md);
+    assert_eq!(
+        out,
+        "@details(summary: \"A\")\nx\n@end\n\n@details(summary: \"B\")\ny\n@end\n\nTail.\n"
+    );
+    assert!(holes.is_empty(), "{:?}", holes);
+    assert_compiles(&out);
+}
+
+#[test]
+fn stray_details_close_after_close_is_reported() {
+    let md = "<details><summary>A</summary>\n\nx\n\n</details></details>\n\nTail.\n";
+    let (out, holes) = run(md);
+    assert_eq!(
+        out,
+        "@details(summary: \"A\")\nx\n@end\n\n// TODO[B-hole:html-block]: HTML block preserved inside Brief block comment\n/*\n</details>\n*/\nTail.\n"
+    );
+    assert_eq!(holes, vec![Hole::HtmlBlock]);
+}
+
+#[test]
+fn details_text_beside_summary_kept() {
+    // Text after `</summary>` in the opening HTML block, and before
+    // `<summary>`, used to be dropped.
+    let (out, holes) = run(
+        "<details>\n<summary>S</summary>\nBody right after summary\n\nMore body\n\n</details>\n\nTail.\n",
+    );
+    assert_eq!(
+        out,
+        "@details(summary: \"S\")\nBody right after summary\n\nMore body\n@end\n\nTail.\n"
+    );
+    assert!(holes.is_empty(), "{:?}", holes);
+
+    let (out, holes) = run("<details>\nLead text\n<summary>S</summary>\nX\n</details>\n\nTail.\n");
+    assert_eq!(
+        out,
+        "@details(summary: \"S\")\nLead text\nX\n@end\n\nTail.\n"
+    );
+    assert!(holes.is_empty(), "{:?}", holes);
+}
+
+#[test]
+fn html_after_closed_details_kept() {
+    let md = "<details><summary>S</summary>X</details>\n<p>after html</p>\n\nTail.\n";
+    let (out, holes) = run(md);
+    assert_eq!(
+        out,
+        "@details(summary: \"S\")\nX\n@end\n\n// TODO[B-hole:html-block]: HTML block preserved inside Brief block comment\n/*\n<p>after html</p>\n*/\nTail.\n"
+    );
+    assert_eq!(holes, vec![Hole::HtmlBlock]);
+}
+
+#[test]
+fn definition_list_inside_details_stays_inside() {
+    // The list used to be written straight to the document, ahead of the
+    // `@details` that contains it.
+    let md = "<details><summary>S</summary>\n\nTerm\n: Def\n\n</details>\n\nTail.\n";
+    let (out, holes) = run(md);
+    assert_eq!(
+        out,
+        "@details(summary: \"S\")\n@dl\nTerm\n: Def\n@end\n@end\n\nTail.\n"
+    );
+    assert!(holes.is_empty(), "{:?}", holes);
+    assert_compiles(&out);
+}
+
+#[test]
+fn nested_definition_list_flattened_not_dropped() {
+    // The inner list used to overwrite the outer one's state, dropping
+    // every outer item collected so far.
+    let md = "Term\n: Def\n\n  Inner\n  : InnerDef\n\n  After inner\n\nTerm2\n: Def2\n\nTail.\n";
+    let (out, holes) = run(md);
+    assert_eq!(
+        out,
+        "@dl\nTerm\n: Def\n@end\n\n@dl\nInner\n: InnerDef\n@end\n\n// TODO[B-hole:nested-definition-list]: nested definition list flattened into a sibling `@dl` block\n@dl\nTerm\n: After inner\nTerm2\n: Def2\n@end\n\nTail.\n"
+    );
+    assert_eq!(holes, vec![Hole::NestedDefinitionList]);
+    assert_compiles(&out);
+}

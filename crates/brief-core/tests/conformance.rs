@@ -91,7 +91,7 @@ fn t_12_7_llm_token_reduction() {
 fn html_basic_render() {
     let (html, codes) = compile("# Title\n\nA *bold* and _ital_ paragraph.\n\n- one\n- two\n");
     assert!(codes.is_empty(), "{:?}", codes);
-    assert!(html.contains("<h1>Title</h1>"));
+    assert!(html.contains("<h1 id=\"title\">Title</h1>"), "{}", html);
     assert!(html.contains("<strong>bold</strong>"));
     assert!(html.contains("<em>ital</em>"));
     assert!(html.contains("<ul>"));
@@ -848,8 +848,12 @@ fn heading_no_anchor() {
 
     let (html, codes) = compile("## Plain heading\n");
     assert!(codes.is_empty(), "{:?}", codes);
-    assert!(html.contains("<h2>Plain heading</h2>"), "html: {}", html);
-    assert!(!html.contains("id="), "no id attr: {}", html);
+    // No `{#anchor}`: the heading still gets its automatic id.
+    assert!(
+        html.contains("<h2 id=\"plain-heading\">Plain heading</h2>"),
+        "html: {}",
+        html
+    );
 
     let llm_out = render_llm("## Plain heading\n");
     assert!(llm_out.contains("## Plain heading"), "llm: {}", llm_out);
@@ -895,8 +899,13 @@ fn heading_anchor_duplicate() {
 fn heading_curly_without_hash_is_plain_text() {
     let (html, codes) = compile("## Heading with {curly} not anchor\n");
     assert!(codes.is_empty(), "{:?}", codes);
-    assert!(html.contains("{curly}"), "curly braces preserved: {}", html);
-    assert!(!html.contains("id="), "no id attr: {}", html);
+    assert!(
+        html.contains(
+            "<h2 id=\"heading-with-curly-not-anchor\">Heading with {curly} not anchor</h2>"
+        ),
+        "curly braces preserved, id slugged from the text: {}",
+        html
+    );
 }
 
 /// Test 9: hyphens and digits in anchor name are valid.
@@ -957,4 +966,75 @@ fn llm_table_escapes_pipes_in_cells() {
     }
     assert!(out.contains("x \\| y"), "{}", out);
     assert!(out.contains("`c\\|d`"), "{}", out);
+}
+
+#[test]
+fn math_renders_verbatim_tex_escaped_once() {
+    // Backslashes used to be eaten as Brief escapes, `<` escaped twice, and
+    // block math wrapped in a span holding visible `<p>` tags.
+    let input =
+        "Energy @math[\\frac{a}{b} < c].\n\n@math\n\\sum_{i=1}^{n} i < n^2\n\\\\ x_1\n@end\n";
+    let (html, codes) = compile(input);
+    assert!(codes.is_empty(), "{:?}", codes);
+    assert_eq!(
+        html,
+        "<p>Energy <span class=\"math math-inline\">\\frac{a}{b} &lt; c</span>.</p>\n\
+         <div class=\"math math-display\">\\sum_{i=1}^{n} i &lt; n^2\n\\\\ x_1</div>\n"
+    );
+
+    let src = SourceMap::new("t.brf", input);
+    let (mut doc, diags) = parse(lex(&src).unwrap(), &src);
+    assert!(diags.is_empty(), "{:?}", diags);
+    let reg = Registry::with_builtins();
+    assert!(resolve(&mut doc, &reg).is_empty());
+    let (out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
+    assert!(out.contains("Energy $\\frac{a}{b} < c$."), "{}", out);
+    assert!(
+        out.contains("$$\\sum_{i=1}^{n} i < n^2\n\\\\ x_1$$\n"),
+        "{}",
+        out
+    );
+}
+
+#[test]
+fn code_fence_with_tabs_and_trailing_spaces_compiles_verbatim() {
+    let (html, codes) = compile("```go\nfunc main() {\n\tfmt.Println()  \n}\n```\n");
+    assert!(codes.is_empty(), "{:?}", codes);
+    assert_eq!(
+        html,
+        "<pre><code class=\"language-go\">func main() {\n\tfmt.Println()  \n}</code></pre>\n"
+    );
+}
+
+#[test]
+fn unclosed_emphasis_in_blockquote_is_an_error() {
+    // Rendered `<blockquote><p><strong></strong></p>` with exit 0.
+    let (out, codes) = compile("> *unclosed bold\n");
+    assert_eq!(codes, vec![Code::UnterminatedEmph]);
+    assert!(out.contains("--> t.brf:1:3"), "{}", out);
+}
+
+#[test]
+fn unterminated_comment_reports_its_opener() {
+    let (out, codes) = compile("# T\n\n/* draft\n\n## Hidden\n");
+    assert_eq!(codes, vec![Code::UnterminatedComment]);
+    assert!(out.contains("--> t.brf:3:1"), "{}", out);
+}
+
+#[test]
+fn prose_starting_with_slash_star_keeps_following_blocks() {
+    // `/**` used to open a comment and swallow the rest of the file.
+    let (html, codes) = compile("Paths:\n/** doc-style prose\n\n- item\n\nfinal\n");
+    assert!(codes.is_empty(), "{:?}", codes);
+    assert_eq!(
+        html,
+        "<p>Paths: /** doc-style prose</p>\n<ul>\n<li>item</li>\n</ul>\n<p>final</p>\n"
+    );
+}
+
+#[test]
+fn inline_arg_error_is_reported_on_its_own_line() {
+    let (out, codes) = compile("# Title\n\nSome intro paragraph.\n\nPress @kbd(1 2)[x] now.\n");
+    assert_eq!(codes, vec![Code::BadArgSyntax]);
+    assert!(out.contains("--> t.brf:5:14"), "{}", out);
 }

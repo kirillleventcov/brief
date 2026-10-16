@@ -49,6 +49,7 @@ this page.
 | @ec[B0316] | conflicting code-fence attributes
 | @ec[B0317] | invalid heading anchor
 | @ec[B0318] | blocks are nested too deeply
+| @ec[B0319] | block comment `/*` is never closed
 
 ## B04xx — shortcode resolution
 
@@ -63,6 +64,7 @@ this page.
 | @ec[B0407] | keyword argument given more than once
 | @ec[B0408] | callout kind is deprecated; use the GFM equivalent
 | @ec[B0409] | shortcode does not declare this argument
+| @ec[B0410] | URL scheme is not allowed
 
 ## B05xx — semantic / cross-cutting
 
@@ -73,7 +75,7 @@ this page.
 | @ec[B0503] | heading levels must increase by at most one
 | @ec[B0504] | alignment array length must equal the column count
 | @ec[B0505] | malformed definition list
-| @ec[B0506] | heading anchor must be unique within a document
+| @ec[B0506] | heading id must be unique within a document
 
 ## B06xx — cross-document references
 
@@ -83,6 +85,8 @@ this page.
 | @ec[B0602] | cross-document reference target anchor does not exist in target file
 | @ec[B0603] | malformed cross-document reference target
 | @ec[B0604] | `@ref` requires a `brief.toml`-rooted project; none found
+| @ec[B0605] | cross-document reference target has errors
+| @ec[B0606] | link fragment does not match any heading in this document
 
 ## B07xx — code-block minification (LLM mode)
 

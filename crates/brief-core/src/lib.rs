@@ -11,6 +11,7 @@ pub mod parser;
 pub mod project;
 pub mod resolve;
 pub mod shortcode;
+pub mod slug;
 pub mod span;
 pub mod token;
 pub mod validate;

@@ -206,6 +206,51 @@ fn ref_whole_file() {
     assert!(holes.is_empty(), "{:?}", holes);
 }
 
+/// Convert `brf` as the project file `current`, with `@ref` resolved
+/// against an index holding `files`.
+fn run_in_project(brf: &str, current: &str, files: &[(&str, &[&str])]) -> String {
+    use brief::project::ProjectIndex;
+    use brief::resolve::{ResolveProject, resolve_with_project};
+    let src = SourceMap::new(current, brf);
+    let (mut doc, _) = parse(lex(&src).expect("lex"), &src);
+    let mut index = ProjectIndex::default();
+    for (path, anchors) in files {
+        index.anchors.insert(
+            path.to_string(),
+            anchors.iter().map(|a| a.to_string()).collect(),
+        );
+    }
+    let current = std::path::PathBuf::from(current);
+    let project = ResolveProject {
+        index: &index,
+        current: &current,
+    };
+    let reg = Registry::with_builtins();
+    let diags = resolve_with_project(&mut doc, &reg, Some(&project));
+    assert!(diags.is_empty(), "{:?}", diags);
+    let r = to_markdown(&doc, &reg, &src);
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    r.markdown
+}
+
+#[test]
+fn resolved_ref_links_relative_to_the_converted_file() {
+    let files: &[(&str, &[&str])] = &[
+        ("guide.brf", &["install-steps"]),
+        ("sub/a.brf", &["top"]),
+        ("sub/b.brf", &[]),
+    ];
+    let out = run_in_project(
+        "@ref[guide.brf#install-steps](Install), @ref[sub/b.brf](B), @ref[sub/a.brf#top](Top)\n",
+        "sub/a.brf",
+        files,
+    );
+    assert_eq!(
+        out,
+        "[Install](../guide.md#install-steps), [B](b.md), [Top](#top)\n"
+    );
+}
+
 #[test]
 fn details_becomes_html() {
     let (out, holes) = run("@details(summary: \"More\")\nHidden.\n@end\n");

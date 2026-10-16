@@ -43,6 +43,39 @@ fn project_compile_resolves_valid_ref_to_html() {
 }
 
 #[test]
+fn project_compile_links_relative_to_the_compiled_file() {
+    let td = tempfile::TempDir::new().unwrap();
+    let root = td.path();
+    write(&root.join("brief.toml"), "");
+    write(&root.join("guide.brf"), "# Guide\n\n## Install Steps\n");
+    write(&root.join("sub/b.brf"), "# B\n");
+    write(
+        &root.join("sub/a.brf"),
+        "# A\n\n@ref[guide.brf#install-steps](Steps) @ref[sub/b.brf](B) @ref[sub/a.brf#a](Top)\n",
+    );
+
+    let output = Command::new(brief_bin())
+        .arg("compile")
+        .arg(root.join("sub/a.brf"))
+        .arg("--target=html")
+        .output()
+        .expect("run brief");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(
+            "<p><a href=\"../guide.html#install-steps\">Steps</a> <a href=\"b.html\">B</a> <a href=\"#a\">Top</a></p>"
+        ),
+        "stdout: {}",
+        stdout
+    );
+}
+
+#[test]
 fn project_compile_reports_missing_anchor() {
     let td = tempfile::TempDir::new().unwrap();
     let root = td.path();
@@ -81,11 +114,11 @@ fn ref_outside_project_is_b0604() {
 #[test]
 fn prepass_errors_render_against_their_own_source() {
     let td = tempfile::TempDir::new().unwrap();
-    let root = td.path();
+    let root = td.path().canonicalize().unwrap();
     write(&root.join("brief.toml"), "");
     // a.brf has a parse error: a heading with too many '#'
     write(&root.join("a.brf"), "####### Bad heading\n");
-    write(&root.join("b.brf"), "# OK\n");
+    write(&root.join("b.brf"), "# OK\n\nSee @ref[a.brf](A).\n");
 
     let output = Command::new(brief_bin())
         .arg("compile")
@@ -93,13 +126,21 @@ fn prepass_errors_render_against_their_own_source() {
         .arg("--target=html")
         .output()
         .expect("run brief");
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    // The error should reference a.brf (where the broken heading lives),
-    // not b.brf (the file being compiled).
+    // B0605 points at b.brf, where the @ref is; a.brf's own error follows,
+    // located in a.brf where the broken heading lives.
     assert!(
-        stderr.contains("a.brf"),
-        "expected a.brf in stderr, got: {}",
+        stderr.contains(&format!("  --> {}:3:5\n", root.join("b.brf").display())),
+        "stderr: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains(&format!(
+            "error[B0301]: heading level exceeds maximum of 6\n  --> {}:1:1\n",
+            root.join("a.brf").display()
+        )),
+        "stderr: {}",
         stderr
     );
 }
