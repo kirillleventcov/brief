@@ -1,6 +1,6 @@
 #![no_main]
 
-use brief::inline::parse_inline;
+use brief::inline;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -12,5 +12,5 @@ fuzz_target!(|data: &[u8]| {
     }
     // The block parser feeds parse_inline a single trimmed line. Newlines
     // would never appear in a real call, but the fuzzer is allowed to try.
-    let _ = parse_inline(input, 0);
+    let _ = inline::parse_inline(input, 0);
 });

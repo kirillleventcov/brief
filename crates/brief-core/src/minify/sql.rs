@@ -13,12 +13,19 @@
 //! Strategy: aggressive (Strategy A). SQL statements are explicitly
 //! `;`-terminated, so newlines can be stripped freely.
 
-use super::c_common::{Token, TokenKind, emit_aggressive};
+use super::c_common::{self, Token, TokenKind};
 use super::{MinifyError, MinifyOptions, MinifyOutput};
 
+/// Minify (Postgres-flavored) SQL source, stripping all non-required
+/// whitespace.
+///
+/// # Errors
+///
+/// Returns [`MinifyError`] on unterminated (nested) comments, string
+/// literals, or quoted identifiers.
 pub fn minify(source: &str, opts: &MinifyOptions) -> Result<MinifyOutput, MinifyError> {
     let toks = tokenize(source)?;
-    emit_aggressive(&toks, opts.keep_comments)
+    c_common::emit_aggressive(&toks, opts.keep_comments)
 }
 
 fn tokenize(src: &str) -> Result<Vec<Token<'_>>, MinifyError> {
@@ -90,10 +97,9 @@ fn tokenize(src: &str) -> Result<Vec<Token<'_>>, MinifyError> {
         if c == b'$' {
             // Could be a dollar-quoted string ($tag$ ... $tag$) or a
             // positional parameter ($1, $2, ...).
-            if let Some((tag_end, body_end)) = try_scan_dollar_quoted(bytes, i) {
+            if let Some(body_end) = try_scan_dollar_quoted(bytes, i) {
                 out.push(Token::new(TokenKind::StrLit(&src[i..body_end])));
                 i = body_end;
-                let _ = tag_end;
                 continue;
             }
             // Positional param `$1`, etc. — treat the run as a Word.
@@ -117,7 +123,7 @@ fn tokenize(src: &str) -> Result<Vec<Token<'_>>, MinifyError> {
             i += n;
             continue;
         }
-        let n = scan_multi_punct(bytes, i);
+        let n = scan_multi_punct(src, i);
         out.push(Token::new(TokenKind::Punct(&src[i..i + n])));
         i += n;
     }
@@ -159,10 +165,8 @@ fn scan_quoted_ident(src: &str, i: usize) -> Result<usize, MinifyError> {
     Err(MinifyError::new("unterminated quoted identifier"))
 }
 
-/// On success returns `(tag_end, body_end)` where:
-/// - `tag_end` is the byte index of the second `$` of the opening `$tag$`
-/// - `body_end` is the byte index just past the closing `$tag$`
-fn try_scan_dollar_quoted(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
+/// On success returns the byte index just past the closing `$tag$`.
+fn try_scan_dollar_quoted(bytes: &[u8], i: usize) -> Option<usize> {
     debug_assert_eq!(bytes[i], b'$');
     let tag_start = i + 1;
     let mut j = tag_start;
@@ -185,18 +189,17 @@ fn try_scan_dollar_quoted(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
     // Find matching `$<tag>$` close.
     let mut k = body_start;
     while k < bytes.len() {
-        if bytes[k] == b'$' && k + 1 + tag.len() < bytes.len() {
-            if &bytes[k + 1..k + 1 + tag.len()] == tag
-                && bytes.get(k + 1 + tag.len()) == Some(&b'$')
-            {
-                return Some((tag_end, k + 1 + tag.len() + 1));
-            }
+        if bytes[k] == b'$'
+            && k + 1 + tag.len() < bytes.len()
+            && &bytes[k + 1..k + 1 + tag.len()] == tag
+            && bytes.get(k + 1 + tag.len()) == Some(&b'$')
+        {
+            return Some(k + 1 + tag.len() + 1);
         }
-        if bytes[k] == b'$' && tag.is_empty() {
-            // `$$ … $$`
-            if peek(bytes, k + 1) == Some(b'$') && k > body_start {
-                return Some((tag_end, k + 2));
-            }
+        // `$$ … $$`
+        if bytes[k] == b'$' && tag.is_empty() && peek(bytes, k + 1) == Some(b'$') && k > body_start
+        {
+            return Some(k + 2);
         }
         k += 1;
     }
@@ -230,15 +233,12 @@ fn scan_word(src: &str, i: usize) -> usize {
     j - i
 }
 
-fn scan_multi_punct(bytes: &[u8], i: usize) -> usize {
-    let two = bytes
-        .get(i..i + 2)
-        .map(|s| std::str::from_utf8(s).unwrap_or(""))
-        .unwrap_or("");
+fn scan_multi_punct(src: &str, i: usize) -> usize {
+    let two = src.get(i..i + 2).unwrap_or("");
     if matches!(two, "<=" | ">=" | "<>" | "!=" | "||" | "::") {
         return 2;
     }
-    let c = char_at(unsafe { std::str::from_utf8_unchecked(bytes) }, i);
+    let c = char_at(src, i);
     c.len_utf8()
 }
 

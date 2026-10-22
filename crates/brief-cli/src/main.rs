@@ -6,15 +6,16 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod fmt_cmd;
 
 use brief::ast::Document;
-use brief::diag::{Severity, render_all};
+use brief::diag::{self, Severity};
 use brief::emit::{html, llm};
-use brief::lexer;
-use brief::parser;
-use brief::project::{Project, read_source};
+use brief::project::{self, Project};
 use brief::span::SourceMap;
+use brief::{convert, lexer, parser, watch};
 use clap::{Parser, Subcommand};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{self, ExitCode};
 
 #[derive(Parser)]
 #[command(name = "brief", version, about = "Brief language compiler")]
@@ -25,171 +26,138 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    Compile {
-        input: PathBuf,
-        /// Output target: html, llm, or json. Defaults to
-        /// `compile.default_target` from brief.toml, then html.
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        report_tokens: bool,
-        #[arg(long)]
-        strip_emphasis: bool,
-        #[arg(long)]
-        keep_table_rule: bool,
-        #[arg(long)]
-        keep_asset_urls: bool,
-        #[arg(long)]
-        keep_metadata: bool,
-        /// Treat the input as Markdown and convert to Brief in memory before
-        /// compiling. Equivalent to `brief convert ... | brief compile -` but
-        /// in one step.
-        #[arg(long)]
-        convert: bool,
-        /// Write output to a file derived from the input path
-        /// (`doc.brf` → `doc.html` / `doc.txt` / `doc.json`).
-        /// Mutually exclusive with `--output`.
-        #[arg(short = 'w', long, conflicts_with = "output")]
-        write: bool,
-        /// Write output to PATH. Mutually exclusive with `--write`.
-        #[arg(short = 'o', long, value_name = "PATH")]
-        output: Option<PathBuf>,
-    },
+    Compile(CompileArgs),
     Explain {
         code: String,
     },
     /// Convert between Markdown and Brief. Direction is chosen by
     /// extension: `.md` inputs convert to Brief, `.brf` inputs convert to
     /// Markdown.
-    Convert {
-        /// One or more input files (`.md` → Brief, `.brf` → Markdown).
-        inputs: Vec<PathBuf>,
-        /// Override output path. Single-input only.
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-        /// Write converted output to stdout instead of a file.
-        /// Single-input only.
-        #[arg(long)]
-        stdout: bool,
-        /// Overwrite existing destination files.
-        #[arg(long)]
-        force: bool,
-        /// Disable the post-convert self-test. By default, `brief convert`
-        /// checks its own output: converted Brief must compile, and
-        /// converted Markdown must survive a round-trip back through the
-        /// Markdown→Brief converter. Pass `--no-strict` to write the
-        /// (possibly broken) output regardless.
-        #[arg(long)]
-        no_strict: bool,
-    },
+    Convert(ConvertArgs),
     /// Reformat Brief sources in place according to the canonical style.
     /// gofmt-doctrine: no config beyond an explicit opt-in for the
     /// controversial frontmatter sort.
     Fmt(fmt_cmd::FmtArgs),
     /// Watch files/dirs and recompile on change. 100ms debounce. Whole-file
     /// recompile only.
-    Watch {
-        /// Files or directories to watch. Defaults to the current directory.
-        paths: Vec<PathBuf>,
-        /// Output target: html, llm, or json. Defaults to
-        /// `compile.default_target` from brief.toml, then html.
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        strip_emphasis: bool,
-        #[arg(long)]
-        keep_table_rule: bool,
-        #[arg(long)]
-        keep_asset_urls: bool,
-        #[arg(long)]
-        keep_metadata: bool,
-        /// Do not print a clear-screen sequence between recompile runs.
-        #[arg(long)]
-        no_clear: bool,
-    },
+    Watch(WatchArgs),
+}
+
+// The argument structs below deliberately carry `//` rather than `///`
+// comments on the structs themselves: clap turns a struct doc comment into
+// the subcommand's `about`, which would change `--help` output.
+
+// Flags for `brief compile`.
+#[derive(clap::Args)]
+struct CompileArgs {
+    input: PathBuf,
+    /// Output target: html, llm, or json. Defaults to
+    /// `compile.default_target` from brief.toml, then html.
+    #[arg(long)]
+    target: Option<String>,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    report_tokens: bool,
+    #[command(flatten)]
+    llm: LlmFlags,
+    /// Treat the input as Markdown and convert to Brief in memory before
+    /// compiling. Equivalent to `brief convert ... | brief compile -` but
+    /// in one step.
+    #[arg(long)]
+    convert: bool,
+    /// Write output to a file derived from the input path
+    /// (`doc.brf` → `doc.html` / `doc.txt` / `doc.json`).
+    /// Mutually exclusive with `--output`.
+    #[arg(short = 'w', long, conflicts_with = "output")]
+    write: bool,
+    /// Write output to PATH. Mutually exclusive with `--write`.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    output: Option<PathBuf>,
+}
+
+// LLM-target switches shared by `brief compile` and `brief watch`.
+#[derive(clap::Args)]
+struct LlmFlags {
+    #[arg(long)]
+    strip_emphasis: bool,
+    #[arg(long)]
+    keep_table_rule: bool,
+    #[arg(long)]
+    keep_asset_urls: bool,
+    #[arg(long)]
+    keep_metadata: bool,
+}
+
+// Flags for `brief convert`.
+#[derive(clap::Args)]
+struct ConvertArgs {
+    /// One or more input files (`.md` → Brief, `.brf` → Markdown).
+    inputs: Vec<PathBuf>,
+    /// Override output path. Single-input only.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Write converted output to stdout instead of a file.
+    /// Single-input only.
+    #[arg(long)]
+    stdout: bool,
+    /// Overwrite existing destination files.
+    #[arg(long)]
+    force: bool,
+    /// Disable the post-convert self-test. By default, `brief convert`
+    /// checks its own output: converted Brief must compile, and
+    /// converted Markdown must survive a round-trip back through the
+    /// Markdown→Brief converter. Pass `--no-strict` to write the
+    /// (possibly broken) output regardless.
+    #[arg(long)]
+    no_strict: bool,
+}
+
+// Flags for `brief watch`.
+#[derive(clap::Args)]
+struct WatchArgs {
+    /// Files or directories to watch. Defaults to the current directory.
+    paths: Vec<PathBuf>,
+    /// Output target: html, llm, or json. Defaults to
+    /// `compile.default_target` from brief.toml, then html.
+    #[arg(long)]
+    target: Option<String>,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[command(flatten)]
+    llm: LlmFlags,
+    /// Do not print a clear-screen sequence between recompile runs.
+    #[arg(long)]
+    no_clear: bool,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Compile {
-            input,
-            target,
-            config: cfg,
-            report_tokens,
-            strip_emphasis,
-            keep_table_rule,
-            keep_asset_urls,
-            keep_metadata,
-            convert,
-            write,
-            output,
-        } => run_compile(
-            input,
-            target,
-            cfg,
-            report_tokens,
-            strip_emphasis,
-            keep_table_rule,
-            keep_asset_urls,
-            keep_metadata,
-            convert,
-            write,
-            output,
-        ),
+        Cmd::Compile(args) => run_compile(args),
         Cmd::Explain { code } => run_explain(&code),
-        Cmd::Convert {
-            inputs,
-            output,
-            stdout,
-            force,
-            no_strict,
-        } => run_convert(inputs, output, stdout, force, no_strict),
+        Cmd::Convert(args) => run_convert(args),
         Cmd::Fmt(args) => fmt_cmd::run(args),
-        Cmd::Watch {
-            paths,
-            target,
-            config: cfg,
-            strip_emphasis,
-            keep_table_rule,
-            keep_asset_urls,
-            keep_metadata,
-            no_clear,
-        } => run_watch(
-            paths,
-            target,
-            cfg,
-            strip_emphasis,
-            keep_table_rule,
-            keep_asset_urls,
-            keep_metadata,
-            no_clear,
-        ),
+        Cmd::Watch(args) => run_watch(args),
     }
 }
 
-fn run_watch(
-    paths: Vec<PathBuf>,
-    target: Option<String>,
-    cfg_path: Option<PathBuf>,
-    strip_emphasis: bool,
-    keep_table_rule: bool,
-    keep_asset_urls: bool,
-    keep_metadata: bool,
-    no_clear: bool,
-) -> ExitCode {
-    use brief::watch::{LlmOpts, Target as WatchTarget, WatchOpts};
+fn run_watch(args: WatchArgs) -> ExitCode {
+    use brief::watch::{LlmOptions, Target as WatchTarget, WatchOptions};
+    let WatchArgs {
+        paths,
+        target,
+        config,
+        llm: llm_flags,
+        no_clear,
+    } = args;
     // Without `--target`, each file takes its own project's
     // `compile.default_target`, exactly as `brief compile` would.
     let target = match target {
         None => None,
-        Some(t) => match WatchTarget::parse(&t) {
-            Some(t) => Some(t),
-            None => {
+        Some(t) => match t.parse::<WatchTarget>() {
+            Ok(t) => Some(t),
+            Err(_) => {
                 eprintln!("brief: unknown target `{}` (expected html, llm, json)", t);
                 return ExitCode::from(2);
             }
@@ -200,39 +168,37 @@ fn run_watch(
     } else {
         paths
     };
-    let opts = WatchOpts {
+    let options = WatchOptions {
         paths,
         target,
-        config_override: cfg_path,
-        llm_opts: LlmOpts {
-            strip_emphasis,
-            keep_table_rule,
-            keep_asset_urls,
-            keep_metadata,
+        config_override: config,
+        llm_options: LlmOptions {
+            strip_emphasis: llm_flags.strip_emphasis,
+            keep_table_rule: llm_flags.keep_table_rule,
+            keep_asset_urls: llm_flags.keep_asset_urls,
+            keep_metadata: llm_flags.keep_metadata,
         },
         no_clear,
     };
-    if let Err(e) = brief::watch::run(opts) {
+    if let Err(e) = watch::run(options) {
         eprintln!("brief: {}", e);
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }
 
-fn run_compile(
-    input: PathBuf,
-    target: Option<String>,
-    cfg_path: Option<PathBuf>,
-    report_tokens: bool,
-    strip_emphasis: bool,
-    keep_table_rule: bool,
-    keep_asset_urls: bool,
-    keep_metadata: bool,
-    convert: bool,
-    write: bool,
-    output_path: Option<PathBuf>,
-) -> ExitCode {
-    let raw = match read_source(&input) {
+fn run_compile(args: CompileArgs) -> ExitCode {
+    let CompileArgs {
+        input,
+        target,
+        config,
+        report_tokens,
+        llm: llm_flags,
+        convert: from_markdown,
+        write,
+        output: output_path,
+    } = args;
+    let raw = match project::read_source(&input) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("brief: cannot read {}: {}", input.display(), e);
@@ -242,8 +208,8 @@ fn run_compile(
 
     let is_markdown = input.extension().and_then(|s| s.to_str()) == Some("md");
 
-    let source = if convert {
-        let result = brief::convert::convert(&raw, &input.to_string_lossy());
+    let source = if from_markdown {
+        let result = convert::convert(&raw, &input.to_string_lossy());
         for d in &result.diagnostics {
             eprintln!(
                 "brief: note[{}]: {}:{}:{}: {}",
@@ -267,17 +233,17 @@ fn run_compile(
 
     let src = SourceMap::new(input.to_string_lossy(), source);
 
-    let project = match Project::discover(&input, cfg_path.as_deref()) {
+    let project = match Project::discover(&input, config.as_deref()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("brief: {}", e);
             return ExitCode::from(2);
         }
     };
-    let cfg = &project.config;
+    let config = &project.config;
     let registry = &project.registry;
     let target = target
-        .or_else(|| cfg.compile.default_target.clone())
+        .or_else(|| config.compile.default_target.clone())
         .unwrap_or_else(|| "html".to_string());
 
     let Some(doc) = check_and_report(&project, &input, &src, || {}) else {
@@ -287,20 +253,20 @@ fn run_compile(
     let output = match target.as_str() {
         "html" => html::render(&doc, registry),
         "llm" => {
-            let lopts = llm::Opts {
-                strip_emphasis,
-                keep_table_rule,
-                keep_asset_urls,
-                keep_metadata,
-                minify_code_blocks: cfg.compile.llm.minify_code_blocks,
-                minify_languages: cfg.compile.llm.minify_languages.clone(),
-                preserve_code_fences: cfg.compile.llm.preserve_code_fences,
+            let llm_opts = llm::Options {
+                strip_emphasis: llm_flags.strip_emphasis,
+                keep_table_rule: llm_flags.keep_table_rule,
+                keep_asset_urls: llm_flags.keep_asset_urls,
+                keep_metadata: llm_flags.keep_metadata,
+                minify_code_blocks: config.compile.llm.minify_code_blocks,
+                minify_languages: config.compile.llm.minify_languages.clone(),
+                preserve_code_fences: config.compile.llm.preserve_code_fences,
             };
-            let (out, warnings) = llm::render(&doc, registry, &lopts);
-            for w in &warnings {
+            let rendered = llm::render(&doc, registry, &llm_opts);
+            for w in &rendered.warnings {
                 eprintln!("brief: {}", w);
             }
-            out
+            rendered.text
         }
         "json" => format!("{:#?}\n", doc),
         other => {
@@ -325,7 +291,7 @@ fn run_compile(
         Some(path) => {
             // `-w` derives the output extension from the target (llm -> .txt),
             // so compiling a `.txt` input would silently replace the source.
-            let same_file = match (std::fs::canonicalize(path), std::fs::canonicalize(&input)) {
+            let same_file = match (fs::canonicalize(path), fs::canonicalize(&input)) {
                 (Ok(a), Ok(b)) => a == b,
                 _ => path == &input,
             };
@@ -336,7 +302,7 @@ fn run_compile(
                 );
                 return ExitCode::from(2);
             }
-            if let Err(e) = std::fs::write(path, &output) {
+            if let Err(e) = fs::write(path, &output) {
                 eprintln!("brief: cannot write {}: {}", path.display(), e);
                 return ExitCode::from(2);
             }
@@ -346,7 +312,7 @@ fn run_compile(
 
     if report_tokens && target == "llm" {
         let chars = output.chars().count();
-        let approx = (chars + 3) / 4;
+        let approx = chars.div_ceil(4);
         eprintln!(
             "brief: {} -> {} chars, ~{} tokens (chars/4 heuristic)",
             src.path, chars, approx
@@ -366,9 +332,9 @@ fn check_and_report(
     src: &SourceMap,
     on_errors: impl FnOnce(),
 ) -> Option<Document> {
-    let index = project.index();
-    let (index, index_diags) = match &index {
-        Some((idx, diags)) => (Some(idx), diags.as_slice()),
+    let index_build = project.index();
+    let (index, index_diags) = match &index_build {
+        Some(build) => (Some(&build.index), build.diagnostics.as_slice()),
         None => (None, &[][..]),
     };
     let checked = project.check(src, index, project.rel_path(input).as_deref());
@@ -386,18 +352,18 @@ fn check_and_report(
 /// means the reader has all it wants, so exit 0 quietly rather than abort
 /// the way `print!` does. Any other write failure exits 2.
 fn write_stdout(text: &str) {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
+    use std::io::Write as _;
+    let mut out = io::stdout().lock();
     if let Err(e) = out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
-        if e.kind() == std::io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            process::exit(0);
         }
         eprintln!("brief: cannot write to stdout: {}", e);
-        std::process::exit(2);
+        process::exit(2);
     }
 }
 
-fn compile_output_path(input: &std::path::Path, target: &str) -> PathBuf {
+fn compile_output_path(input: &Path, target: &str) -> PathBuf {
     let ext = match target {
         "html" => "html",
         "llm" => "txt",
@@ -412,8 +378,8 @@ fn run_explain(code: &str) -> ExitCode {
     // Long-form text lives in brief-core (`Code::explain`) so the CLI and
     // the LSP hover can never drift apart.
     for c in Code::ALL {
-        if c.as_str() == code {
-            println!("error[{}]: {}\n\n{}", c.as_str(), c.message(), c.explain());
+        if c.to_string() == code {
+            println!("error[{}]: {}\n\n{}", c, c.message(), c.explain());
             return ExitCode::SUCCESS;
         }
     }
@@ -421,13 +387,14 @@ fn run_explain(code: &str) -> ExitCode {
     ExitCode::from(2)
 }
 
-fn run_convert(
-    inputs: Vec<PathBuf>,
-    output: Option<PathBuf>,
-    use_stdout: bool,
-    force: bool,
-    no_strict: bool,
-) -> ExitCode {
+fn run_convert(args: ConvertArgs) -> ExitCode {
+    let ConvertArgs {
+        inputs,
+        output,
+        stdout: use_stdout,
+        force,
+        no_strict,
+    } = args;
     if inputs.is_empty() {
         eprintln!("brief: convert requires at least one input file");
         return ExitCode::from(2);
@@ -450,7 +417,7 @@ fn run_convert(
     let multi = inputs.len() > 1;
 
     for input in &inputs {
-        let raw = match read_source(input) {
+        let raw = match project::read_source(input) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
@@ -466,36 +433,33 @@ fn run_convert(
         // Direction is chosen by extension: `.brf` exports to Markdown,
         // anything else migrates to Brief.
         let is_reverse = input.extension().and_then(|s| s.to_str()) == Some("brf");
-        let (converted, notes) = if is_reverse {
-            match convert_reverse(input, &raw, no_strict) {
-                Ok(v) => v,
-                Err(()) => {
-                    failed += 1;
-                    continue;
-                }
-            }
+        let Converted { text, notes } = if is_reverse {
+            let Some(converted) = convert_reverse(input, &raw, no_strict) else {
+                failed += 1;
+                continue;
+            };
+            converted
         } else {
-            let result = brief::convert::convert(&raw, &input.to_string_lossy());
+            let result = convert::convert(&raw, &input.to_string_lossy());
 
             // Strict-by-default: pipe through the lex + parse self-test.
             // Skipped on --no-strict.
-            if !no_strict {
-                if let Err(rendered) =
+            if !no_strict
+                && let Err(rendered) =
                     strict_self_test(&result.brief_source, &input.to_string_lossy())
-                {
-                    eprintln!(
-                        "brief: {} → FAILED: --strict self-test rejected the converted output:",
-                        input.display()
-                    );
-                    eprint!("{}", rendered);
-                    eprintln!(
-                        "brief: pass --no-strict to write the broken output anyway, or fix the converter."
-                    );
-                    failed += 1;
-                    continue;
-                }
+            {
+                eprintln!(
+                    "brief: {} → FAILED: --strict self-test rejected the converted output:",
+                    input.display()
+                );
+                eprint!("{}", rendered);
+                eprintln!(
+                    "brief: pass --no-strict to write the broken output anyway, or fix the converter."
+                );
+                failed += 1;
+                continue;
             }
-            let notes = result
+            let notes: Vec<String> = result
                 .diagnostics
                 .iter()
                 .map(|d| {
@@ -509,19 +473,24 @@ fn run_convert(
                     )
                 })
                 .collect();
-            (result.brief_source, notes)
+            Converted {
+                text: result.brief_source,
+                notes,
+            }
         };
 
-        let dest = if use_stdout {
+        let default_dest;
+        let dest: Option<&Path> = if use_stdout {
             None
-        } else if let Some(o) = &output {
-            Some(o.clone())
+        } else if let Some(o) = output.as_deref() {
+            Some(o)
         } else {
-            Some(default_output_path(input))
+            default_dest = default_output_path(input);
+            Some(&default_dest)
         };
 
         match dest {
-            None => write_stdout(&converted),
+            None => write_stdout(&text),
             Some(path) => {
                 if path.exists() && !force {
                     eprintln!(
@@ -532,7 +501,7 @@ fn run_convert(
                     failed += 1;
                     continue;
                 }
-                if let Err(e) = std::fs::write(&path, &converted) {
+                if let Err(e) = fs::write(path, &text) {
                     eprintln!(
                         "brief: {} → FAILED: cannot write {}: {}",
                         input.display(),
@@ -580,7 +549,7 @@ fn run_convert(
     }
 }
 
-fn default_output_path(input: &std::path::Path) -> PathBuf {
+fn default_output_path(input: &Path) -> PathBuf {
     match input.extension().and_then(|s| s.to_str()) {
         Some("md") => input.with_extension("brf"),
         Some("brf") => input.with_extension("md"),
@@ -594,14 +563,21 @@ fn default_output_path(input: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Output of converting one input file: the converted source, plus the
+/// pre-rendered conversion notes to print after it.
+struct Converted {
+    text: String,
+    notes: Vec<String>,
+}
+
 /// Convert one `.brf` input to Markdown.
 ///
 /// Runs the same front-end as `brief compile`, in the input's own project,
 /// so `@ref` targets and shortcode arguments obey the same rules, then
-/// emits Markdown. Prints failure details to stderr and returns `Err(())`
+/// emits Markdown. Prints failure details to stderr and returns `None`
 /// when the source does not compile or the strict round-trip self-test
 /// rejects the output.
-fn convert_reverse(input: &Path, raw: &str, no_strict: bool) -> Result<(String, Vec<String>), ()> {
+fn convert_reverse(input: &Path, raw: &str, no_strict: bool) -> Option<Converted> {
     let src = SourceMap::new(input.to_string_lossy(), raw.to_string());
 
     // Custom shortcodes need their `template_html` for the Markdown
@@ -610,21 +586,19 @@ fn convert_reverse(input: &Path, raw: &str, no_strict: bool) -> Result<(String, 
         Ok(p) => p,
         Err(e) => {
             eprintln!("brief: {} → FAILED: {}", input.display(), e);
-            return Err(());
+            return None;
         }
     };
-    let Some(doc) = check_and_report(&project, input, &src, || {
+    let doc = check_and_report(&project, input, &src, || {
         eprintln!("brief: {} → FAILED:", input.display())
-    }) else {
-        return Err(());
-    };
+    })?;
 
-    let result = brief::convert::to_markdown(&doc, &project.registry, &src);
+    let result = convert::to_markdown(&doc, &project.registry, &src);
 
     // Strict-by-default: the emitted Markdown must survive the forward
     // converter and compile back to valid Brief. Skipped on --no-strict.
     if !no_strict {
-        let back = brief::convert::convert(&result.markdown, &input.to_string_lossy());
+        let back = convert::convert(&result.markdown, &input.to_string_lossy());
         if let Err(rendered) = strict_self_test(&back.brief_source, &input.to_string_lossy()) {
             eprintln!(
                 "brief: {} → FAILED: --strict round-trip self-test rejected the converted Markdown:",
@@ -632,11 +606,11 @@ fn convert_reverse(input: &Path, raw: &str, no_strict: bool) -> Result<(String, 
             );
             eprint!("{}", rendered);
             eprintln!("brief: pass --no-strict to write the output anyway, or fix the converter.");
-            return Err(());
+            return None;
         }
     }
 
-    let notes = result
+    let notes: Vec<String> = result
         .diagnostics
         .iter()
         .map(|d| {
@@ -650,7 +624,10 @@ fn convert_reverse(input: &Path, raw: &str, no_strict: bool) -> Result<(String, 
             )
         })
         .collect();
-    Ok((result.markdown, notes))
+    Some(Converted {
+        text: result.markdown,
+        notes,
+    })
 }
 
 /// Result of running the strict self-test against converted Brief.
@@ -664,7 +641,7 @@ fn strict_self_test(brief_source: &str, name: &str) -> Result<(), String> {
     };
     let any_error = diags.iter().any(|d| d.severity == Severity::Error);
     if any_error {
-        Err(render_all(&diags, &src))
+        Err(diag::render_all(&diags, &src))
     } else {
         Ok(())
     }

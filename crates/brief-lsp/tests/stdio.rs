@@ -1,9 +1,10 @@
 //! End-to-end test over the real stdio transport: the server must survive
 //! documents whose diagnostics land on multibyte characters.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::BufReader;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::Duration;
 
 /// Long enough for a debug build on a loaded machine; a server that has
@@ -21,13 +22,17 @@ impl Drop for Server {
 }
 
 fn send(stdin: &mut ChildStdin, body: &str) {
-    write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
-    stdin.flush().unwrap();
+    use std::io::Write as _;
+
+    write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).expect("write to server stdin");
+    stdin.flush().expect("flush server stdin");
 }
 
 /// Read one framed message body.
 fn read_message(stdout: &mut BufReader<ChildStdout>) -> Option<String> {
-    let mut len = None;
+    use std::io::{BufRead as _, Read as _};
+
+    let mut len: Option<usize> = None;
     loop {
         let mut line = String::new();
         if stdout.read_line(&mut line).ok()? == 0 {
@@ -38,7 +43,7 @@ fn read_message(stdout: &mut BufReader<ChildStdout>) -> Option<String> {
             break;
         }
         if let Some(n) = line.strip_prefix("Content-Length: ") {
-            len = n.parse::<usize>().ok();
+            len = n.parse().ok();
         }
     }
     let mut body = vec![0u8; len?];
@@ -49,8 +54,8 @@ fn read_message(stdout: &mut BufReader<ChildStdout>) -> Option<String> {
 /// Server messages, read on a thread so a dead or wedged server shows up
 /// as a timeout instead of a hung test.
 fn messages(stdout: ChildStdout) -> Receiver<String> {
-    let (tx, rx) = channel();
-    std::thread::spawn(move || {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
         let mut stdout = BufReader::new(stdout);
         while let Some(msg) = read_message(&mut stdout) {
             if tx.send(msg).is_err() {

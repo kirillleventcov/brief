@@ -1,6 +1,6 @@
 //! `brief-web` — static-site generator for Brief documents.
 //!
-//! See `crates/brief-web/README.md` (eventual) and the design proposal in the
+//! See `crates/brief-web/README.md` and the design proposal in the
 //! repository root for the architectural overview. The split mirrors `mdBook`:
 //! a `BookConfig` describes the project, a `Builder` produces a `dist/`
 //! directory, and a development server with SSE-backed live reload runs

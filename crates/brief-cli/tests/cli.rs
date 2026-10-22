@@ -4,17 +4,20 @@
 //! than unit tests; one round-trip per case. We run them inside a per-test
 //! temp dir so artifacts don't leak between tests.
 
-use std::path::PathBuf;
-use std::process::Command;
+use brief::diag::Code;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::{env, fs};
 
 fn brief_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_brief"))
 }
 
 fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("brief-cli-test-{}", name));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = env::temp_dir().join(format!("brief-cli-test-{}", name));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create test dir");
     dir
 }
 
@@ -22,14 +25,14 @@ fn temp_dir(name: &str) -> PathBuf {
 fn single_file_default_output() {
     let dir = temp_dir("single_default");
     let input = dir.join("note.md");
-    std::fs::write(&input, "# Hello\n").unwrap();
+    fs::write(&input, "# Hello\n").unwrap();
     let status = Command::new(brief_bin())
         .arg("convert")
         .arg(&input)
         .status()
         .unwrap();
     assert!(status.success());
-    let out = std::fs::read_to_string(dir.join("note.brf")).unwrap();
+    let out = fs::read_to_string(dir.join("note.brf")).unwrap();
     assert_eq!(out, "# Hello\n");
 }
 
@@ -37,7 +40,7 @@ fn single_file_default_output() {
 fn single_file_explicit_output() {
     let dir = temp_dir("single_explicit");
     let input = dir.join("note.md");
-    std::fs::write(&input, "# Hello\n").unwrap();
+    fs::write(&input, "# Hello\n").unwrap();
     let dest = dir.join("custom.brf");
     let status = Command::new(brief_bin())
         .arg("convert")
@@ -47,7 +50,7 @@ fn single_file_explicit_output() {
         .status()
         .unwrap();
     assert!(status.success());
-    let out = std::fs::read_to_string(&dest).unwrap();
+    let out = fs::read_to_string(&dest).unwrap();
     assert_eq!(out, "# Hello\n");
 }
 
@@ -56,8 +59,8 @@ fn multiple_inputs_with_output_flag_rejected() {
     let dir = temp_dir("multi_with_o");
     let a = dir.join("a.md");
     let b = dir.join("b.md");
-    std::fs::write(&a, "# A\n").unwrap();
-    std::fs::write(&b, "# B\n").unwrap();
+    fs::write(&a, "# A\n").unwrap();
+    fs::write(&b, "# B\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("convert")
         .arg(&a)
@@ -75,7 +78,7 @@ fn multiple_inputs_with_output_flag_rejected() {
 fn stdout_mode() {
     let dir = temp_dir("stdout_mode");
     let input = dir.join("note.md");
-    std::fs::write(&input, "# Hello\n").unwrap();
+    fs::write(&input, "# Hello\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("convert")
         .arg(&input)
@@ -91,8 +94,8 @@ fn refuses_to_overwrite_without_force() {
     let dir = temp_dir("no_overwrite");
     let input = dir.join("note.md");
     let dest = dir.join("note.brf");
-    std::fs::write(&input, "# Hello\n").unwrap();
-    std::fs::write(&dest, "existing content").unwrap();
+    fs::write(&input, "# Hello\n").unwrap();
+    fs::write(&dest, "existing content").unwrap();
     let out = Command::new(brief_bin())
         .arg("convert")
         .arg(&input)
@@ -102,7 +105,7 @@ fn refuses_to_overwrite_without_force() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("FAILED"));
     assert!(stderr.contains("--force"));
-    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "existing content");
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "existing content");
 }
 
 #[test]
@@ -110,8 +113,8 @@ fn force_overwrites() {
     let dir = temp_dir("force_overwrite");
     let input = dir.join("note.md");
     let dest = dir.join("note.brf");
-    std::fs::write(&input, "# Hello\n").unwrap();
-    std::fs::write(&dest, "old").unwrap();
+    fs::write(&input, "# Hello\n").unwrap();
+    fs::write(&dest, "old").unwrap();
     let status = Command::new(brief_bin())
         .arg("convert")
         .arg(&input)
@@ -119,7 +122,7 @@ fn force_overwrites() {
         .status()
         .unwrap();
     assert!(status.success());
-    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "# Hello\n");
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "# Hello\n");
 }
 
 #[test]
@@ -127,7 +130,7 @@ fn compile_md_without_convert_errors() {
     let dir = temp_dir("compile_md_no_convert");
     let input = dir.join("note.md");
     // Use a Markdown-only construct that wouldn't survive Brief's strict lex.
-    std::fs::write(&input, "**bold here**\n").unwrap();
+    fs::write(&input, "**bold here**\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("compile")
         .arg(&input)
@@ -147,7 +150,7 @@ fn compile_md_without_convert_errors() {
 fn compile_md_with_convert_succeeds() {
     let dir = temp_dir("compile_md_with_convert");
     let input = dir.join("note.md");
-    std::fs::write(&input, "# Hello\n\n**bold here**\n").unwrap();
+    fs::write(&input, "# Hello\n\n**bold here**\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("compile")
         .arg(&input)
@@ -174,7 +177,7 @@ fn compile_brf_with_convert_flag_still_works() {
     // source. Plain ASCII text round-trips, so the compile still succeeds.
     let dir = temp_dir("compile_brf_with_convert");
     let input = dir.join("doc.brf");
-    std::fs::write(&input, "# Hello\n").unwrap();
+    fs::write(&input, "# Hello\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("compile")
         .arg(&input)
@@ -193,7 +196,7 @@ fn compile_brf_with_convert_flag_still_works() {
 fn compile_llm_minifies_json_block() {
     let dir = temp_dir("minify_json");
     let input = dir.join("doc.brf");
-    std::fs::write(
+    fs::write(
         &input,
         "# Doc\n\n```json\n{\n  \"a\": 1,\n  \"b\": [1, 2, 3]\n}\n```\n",
     )
@@ -221,7 +224,7 @@ fn compile_llm_minifies_json_block() {
 fn compile_llm_invalid_json_warns_but_succeeds() {
     let dir = temp_dir("invalid_json");
     let input = dir.join("doc.brf");
-    std::fs::write(&input, "```json\n{ not valid }\n```\n").unwrap();
+    fs::write(&input, "```json\n{ not valid }\n```\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("compile")
         .arg(&input)
@@ -246,7 +249,7 @@ fn compile_llm_invalid_json_warns_but_succeeds() {
 fn compile_llm_unknown_attr_is_error() {
     let dir = temp_dir("unknown_attr");
     let input = dir.join("doc.brf");
-    std::fs::write(&input, "```json @bogus\n{}\n```\n").unwrap();
+    fs::write(&input, "```json @bogus\n{}\n```\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("compile")
         .arg(&input)
@@ -264,8 +267,8 @@ fn batch_continues_past_failure() {
     let good = dir.join("good.md");
     let bad = dir.join("missing.md");
     let good2 = dir.join("good2.md");
-    std::fs::write(&good, "# G\n").unwrap();
-    std::fs::write(&good2, "# G2\n").unwrap();
+    fs::write(&good, "# G\n").unwrap();
+    fs::write(&good2, "# G2\n").unwrap();
     // bad is intentionally not written
     let out = Command::new(brief_bin())
         .arg("convert")
@@ -288,7 +291,7 @@ fn batch_continues_past_failure() {
 fn compile_w_refuses_to_overwrite_input() {
     let dir = temp_dir("compile_w_selfclobber");
     let input = dir.join("note.txt");
-    std::fs::write(&input, "# Hello\n\nContent.\n").unwrap();
+    fs::write(&input, "# Hello\n\nContent.\n").unwrap();
     // --target=llm derives note.txt as the output path — the input itself.
     let out = Command::new(brief_bin())
         .arg("compile")
@@ -300,7 +303,7 @@ fn compile_w_refuses_to_overwrite_input() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("refusing to overwrite input"), "{}", stderr);
-    let content = std::fs::read_to_string(&input).unwrap();
+    let content = fs::read_to_string(&input).unwrap();
     assert_eq!(content, "# Hello\n\nContent.\n", "source must be untouched");
 }
 
@@ -308,7 +311,7 @@ fn compile_w_refuses_to_overwrite_input() {
 fn compile_o_refuses_output_equal_to_input() {
     let dir = temp_dir("compile_o_selfclobber");
     let input = dir.join("note.brf");
-    std::fs::write(&input, "# Hello\n").unwrap();
+    fs::write(&input, "# Hello\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("compile")
         .arg(&input)
@@ -317,14 +320,14 @@ fn compile_o_refuses_output_equal_to_input() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert_eq!(std::fs::read_to_string(&input).unwrap(), "# Hello\n");
+    assert_eq!(fs::read_to_string(&input).unwrap(), "# Hello\n");
 }
 
 #[test]
 fn compile_w_recompile_over_existing_output_is_fine() {
     let dir = temp_dir("compile_w_recompile");
     let input = dir.join("note.brf");
-    std::fs::write(&input, "# Hello\n").unwrap();
+    fs::write(&input, "# Hello\n").unwrap();
     for _ in 0..2 {
         let status = Command::new(brief_bin())
             .arg("compile")
@@ -341,9 +344,9 @@ fn compile_w_recompile_over_existing_output_is_fine() {
 #[test]
 fn compile_unknown_config_key_is_an_error() {
     let dir = temp_dir("strict_config");
-    std::fs::write(dir.join("brief.toml"), "[compile]\ntypo_key = true\n").unwrap();
+    fs::write(dir.join("brief.toml"), "[compile]\ntypo_key = true\n").unwrap();
     let input = dir.join("d.brf");
-    std::fs::write(&input, "# Hi\n").unwrap();
+    fs::write(&input, "# Hi\n").unwrap();
     let out = Command::new(brief_bin())
         .current_dir(&dir)
         .arg("compile")
@@ -364,13 +367,13 @@ fn compile_unknown_config_key_is_an_error() {
 #[test]
 fn compile_respects_default_target_from_config() {
     let dir = temp_dir("default_target");
-    std::fs::write(
+    fs::write(
         dir.join("brief.toml"),
         "[compile]\ndefault_target = \"llm\"\n",
     )
     .unwrap();
     let input = dir.join("d.brf");
-    std::fs::write(&input, "# Hi\n\nBody text.\n").unwrap();
+    fs::write(&input, "# Hi\n\nBody text.\n").unwrap();
     let out = Command::new(brief_bin())
         .current_dir(&dir)
         .arg("compile")
@@ -390,13 +393,13 @@ fn compile_respects_default_target_from_config() {
 #[test]
 fn compile_explicit_target_overrides_config_default() {
     let dir = temp_dir("default_target_override");
-    std::fs::write(
+    fs::write(
         dir.join("brief.toml"),
         "[compile]\ndefault_target = \"llm\"\n",
     )
     .unwrap();
     let input = dir.join("d.brf");
-    std::fs::write(&input, "# Hi\n").unwrap();
+    fs::write(&input, "# Hi\n").unwrap();
     let out = Command::new(brief_bin())
         .current_dir(&dir)
         .arg("compile")
@@ -411,16 +414,16 @@ fn compile_explicit_target_overrides_config_default() {
 
 #[test]
 fn explain_covers_every_diagnostic_code() {
-    for code in brief::diag::Code::ALL {
+    for code in Code::ALL {
         let out = Command::new(brief_bin())
             .arg("explain")
-            .arg(code.as_str())
+            .arg(code.to_string())
             .output()
             .unwrap();
         assert!(
             out.status.success(),
             "`brief explain {}` returned unknown-code",
-            code.as_str()
+            code
         );
     }
 }
@@ -431,7 +434,7 @@ fn explain_covers_every_diagnostic_code() {
 fn reverse_single_file_default_output() {
     let dir = temp_dir("rev_single_default");
     let input = dir.join("note.brf");
-    std::fs::write(&input, "# Hello\n").unwrap();
+    fs::write(&input, "# Hello\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("convert")
         .arg(&input)
@@ -442,7 +445,7 @@ fn reverse_single_file_default_output() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let md = std::fs::read_to_string(dir.join("note.md")).unwrap();
+    let md = fs::read_to_string(dir.join("note.md")).unwrap();
     assert_eq!(md, "# Hello\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("(clean)"), "stderr: {}", stderr);
@@ -452,7 +455,7 @@ fn reverse_single_file_default_output() {
 fn reverse_stdout_mode() {
     let dir = temp_dir("rev_stdout");
     let input = dir.join("note.brf");
-    std::fs::write(&input, "a *b* c\n").unwrap();
+    fs::write(&input, "a *b* c\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("convert")
         .arg(&input)
@@ -471,7 +474,7 @@ fn reverse_stdout_mode() {
 fn reverse_reports_underline_hole() {
     let dir = temp_dir("rev_underline");
     let input = dir.join("note.brf");
-    std::fs::write(&input, "a +u+ b\n").unwrap();
+    fs::write(&input, "a +u+ b\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("convert")
         .arg(&input)
@@ -482,7 +485,7 @@ fn reverse_reports_underline_hole() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let md = std::fs::read_to_string(dir.join("note.md")).unwrap();
+    let md = fs::read_to_string(dir.join("note.md")).unwrap();
     assert_eq!(md, "a <u>u</u> b\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -496,7 +499,7 @@ fn reverse_reports_underline_hole() {
 fn reverse_invalid_brief_fails() {
     let dir = temp_dir("rev_invalid");
     let input = dir.join("broken.brf");
-    std::fs::write(&input, "@details(summary: \"x\")\nnever closed\n").unwrap();
+    fs::write(&input, "@details(summary: \"x\")\nnever closed\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("convert")
         .arg(&input)
@@ -512,27 +515,24 @@ fn reverse_invalid_brief_fails() {
 fn reverse_refuses_overwrite_without_force() {
     let dir = temp_dir("rev_no_overwrite");
     let input = dir.join("note.brf");
-    std::fs::write(&input, "# Hello\n").unwrap();
-    std::fs::write(dir.join("note.md"), "existing").unwrap();
+    fs::write(&input, "# Hello\n").unwrap();
+    fs::write(dir.join("note.md"), "existing").unwrap();
     let out = Command::new(brief_bin())
         .arg("convert")
         .arg(&input)
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
-    assert_eq!(
-        std::fs::read_to_string(dir.join("note.md")).unwrap(),
-        "existing"
-    );
+    assert_eq!(fs::read_to_string(dir.join("note.md")).unwrap(), "existing");
 }
 
 #[test]
 fn reverse_ref_resolves_in_project() {
     let dir = temp_dir("rev_ref_project");
-    std::fs::write(dir.join("brief.toml"), "").unwrap();
-    std::fs::write(dir.join("b.brf"), "# Top {#top}\n\nbody.\n").unwrap();
+    fs::write(dir.join("brief.toml"), "").unwrap();
+    fs::write(dir.join("b.brf"), "# Top {#top}\n\nbody.\n").unwrap();
     let input = dir.join("a.brf");
-    std::fs::write(&input, "See @ref[b.brf#top](Anchor).\n").unwrap();
+    fs::write(&input, "See @ref[b.brf#top](Anchor).\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("convert")
         .arg(&input)
@@ -543,7 +543,7 @@ fn reverse_ref_resolves_in_project() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let md = std::fs::read_to_string(dir.join("a.md")).unwrap();
+    let md = fs::read_to_string(dir.join("a.md")).unwrap();
     assert_eq!(md, "See [Anchor](b.md#top).\n");
 }
 
@@ -551,28 +551,36 @@ fn reverse_ref_resolves_in_project() {
 
 /// Run `brief <args>` with stdout piped, read 10 bytes, then close the
 /// pipe, the way `| head -c 10` does.
-fn run_into_closed_pipe(args: &[&std::ffi::OsStr]) -> std::process::Output {
-    use std::io::Read;
+fn run_into_closed_pipe(args: &[&OsStr]) -> Output {
+    use std::io::Read as _;
+
     let mut child = Command::new(brief_bin())
         .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
+        .expect("spawn brief");
     let mut head = [0u8; 10];
-    child.stdout.take().unwrap().read_exact(&mut head).unwrap();
-    child.wait_with_output().unwrap()
+    child
+        .stdout
+        .take()
+        .expect("stdout is piped")
+        .read_exact(&mut head)
+        .expect("read head of stdout");
+    child.wait_with_output().expect("wait for brief")
 }
 
 /// Far more output than a pipe buffers, so the writer must hit the
 /// closed pipe.
-fn big_doc(dir: &std::path::Path) -> PathBuf {
+fn big_doc(dir: &Path) -> PathBuf {
+    use std::fmt::Write as _;
+
     let input = dir.join("big.brf");
     let mut src = String::from("# Big\n\n");
     for i in 0..20_000 {
-        src.push_str(&format!("Paragraph number {} with some text.\n\n", i));
+        let _ = write!(src, "Paragraph number {} with some text.\n\n", i);
     }
-    std::fs::write(&input, src).unwrap();
+    fs::write(&input, src).expect("write big doc");
     input
 }
 

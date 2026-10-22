@@ -1,7 +1,16 @@
+//! Splits Brief source into line [`Token`]s for the parser.
+
 use crate::diag::{Code, Diagnostic};
 use crate::span::{SourceMap, Span};
 use crate::token::{Token, TokenKind};
 
+/// Splits `src` into one token per line, followed by a final
+/// [`TokenKind::Eof`].
+///
+/// # Errors
+///
+/// Returns [`Code::BomNotAtStart`] diagnostics for every byte-order mark
+/// after the first byte of the source.
 pub fn lex(src: &SourceMap) -> Result<Vec<Token>, Vec<Diagnostic>> {
     let mut diags = Vec::new();
     let bytes = src.source.as_bytes();
@@ -13,7 +22,7 @@ pub fn lex(src: &SourceMap) -> Result<Vec<Token>, Vec<Diagnostic>> {
     // which only the parser can recognise.
     if src.source.contains('\u{FEFF}') {
         for (i, w) in bytes.windows(3).enumerate() {
-            if i > 0 && w == [0xEF, 0xBB, 0xBF] {
+            if i > 0 && w == [0xef, 0xbb, 0xbf] {
                 diags.push(Diagnostic::new(Code::BomNotAtStart, Span::new(i, 3)));
             }
         }
@@ -32,7 +41,7 @@ pub fn lex(src: &SourceMap) -> Result<Vec<Token>, Vec<Diagnostic>> {
             // Trailing spaces are trimmed from the token; verbatim bodies
             // that need them read the raw line back from the source.
             let raw = &source[line_start..i];
-            let trimmed = raw.trim_end_matches(|c: char| c == ' ' || c == '\r');
+            let trimmed = raw.trim_end_matches([' ', '\r']);
             let indent = leading_spaces(trimmed);
             let span = Span::new(line_start, trimmed.len());
             if trimmed.trim().is_empty() {

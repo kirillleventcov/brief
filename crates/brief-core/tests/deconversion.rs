@@ -4,17 +4,18 @@
 //! produced and (b) the set of `MdHole` codes raised. Order of holes within
 //! a single conversion is not asserted unless explicitly stated.
 
-use brief::convert::{MdHole, to_markdown};
-use brief::lexer::lex;
-use brief::parser::parse;
-use brief::resolve::resolve;
-use brief::shortcode::{Registry, ShortKindOpt, Shortcode};
+use brief::convert::{self, MdHole};
+use brief::lexer;
+use brief::parser;
+use brief::resolve;
+use brief::shortcode::{Registry, Shortcode, ShortcodeKind};
 use brief::span::SourceMap;
+use std::path::PathBuf;
 
 fn run_with(brf: &str, reg: &Registry) -> (String, Vec<MdHole>) {
     let src = SourceMap::new("test.brf", brf);
-    let tokens = lex(&src).expect("lex must succeed");
-    let (mut doc, parse_diags) = parse(tokens, &src);
+    let tokens = lexer::lex(&src).expect("lex must succeed");
+    let (mut doc, parse_diags) = parser::parse(tokens, &src);
     let parse_errors: Vec<_> = parse_diags
         .iter()
         .filter(|d| d.severity == brief::diag::Severity::Error)
@@ -23,8 +24,8 @@ fn run_with(brf: &str, reg: &Registry) -> (String, Vec<MdHole>) {
     // Resolve normalizes positional args into keyword slots. `@ref` errors
     // with B0604 outside a project; to_markdown falls back to parsing the
     // raw target, which is exactly the path these tests exercise.
-    let _ = resolve(&mut doc, reg);
-    let r = to_markdown(&doc, reg, &src);
+    let _ = resolve::resolve(&mut doc, reg);
+    let r = convert::to_markdown(&doc, reg, &src);
     (r.markdown, r.diagnostics.iter().map(|d| d.hole).collect())
 }
 
@@ -210,9 +211,9 @@ fn ref_whole_file() {
 /// against an index holding `files`.
 fn run_in_project(brf: &str, current: &str, files: &[(&str, &[&str])]) -> String {
     use brief::project::ProjectIndex;
-    use brief::resolve::{ResolveProject, resolve_with_project};
+    use brief::resolve::{self, ResolveProject};
     let src = SourceMap::new(current, brf);
-    let (mut doc, _) = parse(lex(&src).expect("lex"), &src);
+    let (mut doc, _) = parser::parse(lexer::lex(&src).expect("lex"), &src);
     let mut index = ProjectIndex::default();
     for (path, anchors) in files {
         index.anchors.insert(
@@ -220,15 +221,15 @@ fn run_in_project(brf: &str, current: &str, files: &[(&str, &[&str])]) -> String
             anchors.iter().map(|a| a.to_string()).collect(),
         );
     }
-    let current = std::path::PathBuf::from(current);
+    let current = PathBuf::from(current);
     let project = ResolveProject {
         index: &index,
         current: &current,
     };
     let reg = Registry::with_builtins();
-    let diags = resolve_with_project(&mut doc, &reg, Some(&project));
+    let diags = resolve::resolve_with_project(&mut doc, &reg, Some(&project));
     assert!(diags.is_empty(), "{:?}", diags);
-    let r = to_markdown(&doc, &reg, &src);
+    let r = convert::to_markdown(&doc, &reg, &src);
     assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
     r.markdown
 }
@@ -274,7 +275,7 @@ fn custom_shortcode_falls_back_to_html_template() {
     reg.map.insert(
         "wave".into(),
         Shortcode {
-            kind: ShortKindOpt::Inline,
+            kind: ShortcodeKind::Inline,
             template_html: Some("<span class=\"wave\">{{content}}</span>".into()),
             ..Default::default()
         },
@@ -290,7 +291,7 @@ fn custom_block_shortcode_without_template_unwraps_children() {
     reg.map.insert(
         "box".into(),
         Shortcode {
-            kind: ShortKindOpt::Block,
+            kind: ShortcodeKind::Block,
             ..Default::default()
         },
     );

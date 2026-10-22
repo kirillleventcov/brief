@@ -6,20 +6,28 @@
 
 use crate::config::BookConfig;
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 
+/// Built-in page template, used when the theme has no `page.html`.
 pub const DEFAULT_PAGE_TEMPLATE: &str = include_str!("../assets/page.html");
+/// Built-in stylesheet, used when the theme has no `style.css`.
 pub const DEFAULT_STYLESHEET: &str = include_str!("../assets/style.css");
+/// Live-reload SSE client injected into pages by `brief-web serve`.
 pub const RELOAD_CLIENT_JS: &str = include_str!("../assets/reload.js");
 
-/// Loads a theme from `theme_dir` if present, otherwise falls back to the
-/// built-in defaults.
+/// The page template and stylesheet a site is rendered with: the theme
+/// directory's files where present, the built-in defaults otherwise.
 pub struct Theme {
     pub page_template: String,
     pub stylesheet: String,
 }
 
 impl Theme {
+    /// Load `page.html` and `style.css` from `theme_dir` if present, falling
+    /// back to the built-in defaults for each missing file.
+    ///
+    /// Fails with a human-readable message if a present file cannot be read.
     pub fn load(theme_dir: Option<&Path>) -> Result<Self, String> {
         let mut t = Theme {
             page_template: DEFAULT_PAGE_TEMPLATE.to_string(),
@@ -28,12 +36,12 @@ impl Theme {
         if let Some(dir) = theme_dir {
             let p = dir.join("page.html");
             if p.exists() {
-                t.page_template = std::fs::read_to_string(&p)
+                t.page_template = fs::read_to_string(&p)
                     .map_err(|e| format!("cannot read theme template {}: {}", p.display(), e))?;
             }
             let c = dir.join("style.css");
             if c.exists() {
-                t.stylesheet = std::fs::read_to_string(&c)
+                t.stylesheet = fs::read_to_string(&c)
                     .map_err(|e| format!("cannot read theme stylesheet {}: {}", c.display(), e))?;
             }
         }
@@ -41,18 +49,27 @@ impl Theme {
     }
 }
 
-/// Substitution context for theme templates.
-pub struct PageContext<'a> {
-    pub title: &'a str,
-    pub description: &'a str,
-    pub site_title: &'a str,
-    pub content_html: &'a str,
-    pub sidebar_html: &'a str,
-    pub base_url: &'a str,
-    pub stylesheet_path: &'a str,
-    pub reload_script: &'a str,
+/// Substitution context for theme templates. Every value borrows from the
+/// page being rendered.
+pub struct PageContext<'page> {
+    pub title: &'page str,
+    pub description: &'page str,
+    pub site_title: &'page str,
+    /// Trusted HTML, substituted unescaped.
+    pub content_html: &'page str,
+    /// Trusted HTML, substituted unescaped.
+    pub sidebar_html: &'page str,
+    pub base_url: &'page str,
+    pub stylesheet_path: &'page str,
+    /// Trusted script markup, substituted unescaped; empty when live reload
+    /// is off.
+    pub reload_script: &'page str,
 }
 
+/// Expand the `{{ name }}` placeholders of `template` with the values of
+/// `ctx`, HTML-escaping every value that is not documented as trusted.
+/// Unknown placeholders are left in place.
+#[must_use]
 pub fn render_page(template: &str, ctx: &PageContext<'_>) -> String {
     // Text-ish values (page H1, frontmatter description, site title, paths)
     // are escaped here, at the single template boundary — a page titled
@@ -86,7 +103,7 @@ pub fn render_page(template: &str, ctx: &PageContext<'_>) -> String {
 
 /// Escape for both element-text and double-quoted-attribute positions —
 /// theme templates use the same placeholder in either.
-fn escape_text(s: &str) -> String {
+pub(crate) fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -133,8 +150,9 @@ fn expand(template: &str, subs: &BTreeMap<&str, &str>) -> String {
     out
 }
 
-/// Convenience: produce the absolute URL of a built-in static asset under
-/// `base_url`. We do not bother re-rooting absolute paths the user passes in.
+/// The URL of a built-in static asset `name` under `base_url`. Absolute
+/// paths the user passes in are not re-rooted.
+#[must_use]
 pub fn asset_url(base_url: &str, name: &str) -> String {
     let mut out = String::with_capacity(base_url.len() + name.len() + 1);
     out.push_str(base_url);
@@ -145,13 +163,14 @@ pub fn asset_url(base_url: &str, name: &str) -> String {
     out
 }
 
-/// Extracts a friendly site title for the default header. Falls back to the
-/// project directory name if the user did not set one.
-pub fn site_title(cfg: &BookConfig) -> &str {
-    if cfg.book.title.is_empty() {
+/// The site title for the default header: `[book] title`, or `"Brief site"`
+/// if the user did not set one.
+#[must_use]
+pub fn site_title(config: &BookConfig) -> &str {
+    if config.book.title.is_empty() {
         "Brief site"
     } else {
-        cfg.book.title.as_str()
+        config.book.title.as_str()
     }
 }
 

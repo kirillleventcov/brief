@@ -20,7 +20,9 @@ pub const EMPTY_SLUG_ID: &str = "section";
 
 /// One heading in document order, with the id it is emitted under.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Heading {
+    /// Heading level, 1 through 6.
     pub level: u8,
     /// Plain text of the heading (see `heading_text`).
     pub text: String,
@@ -35,6 +37,7 @@ pub struct Heading {
 /// GitHub's heading slug: lowercase, drop every character that is not a
 /// letter, digit, space, `-` or `_`, then turn each space into `-`. Runs of
 /// spaces are not collapsed, so `a  b` is `a--b`, as on GitHub.
+#[must_use]
 pub fn slugify(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     // Most headings are ASCII: skip `to_lowercase`'s intermediate copy.
@@ -62,6 +65,7 @@ pub fn slugify(text: &str) -> String {
 
 /// `true` if `s` is an id some heading can carry: non-empty and unchanged by
 /// `slugify`. Covers every explicit `{#id}` and every automatic id.
+#[must_use]
 pub fn is_heading_id(s: &str) -> bool {
     !s.is_empty() && slugify(s) == s
 }
@@ -70,6 +74,7 @@ pub fn is_heading_id(s: &str) -> bool {
 /// spans contribute their text; `@ref` contributes its title (its body is a
 /// path, not prose); footnote bodies render at the page foot and contribute
 /// nothing. Leading and trailing whitespace is trimmed.
+#[must_use]
 pub fn heading_text(content: &[Inline]) -> String {
     let mut out = String::new();
     push_text(content, &mut out);
@@ -115,6 +120,7 @@ fn push_text(nodes: &[Inline], out: &mut String) {
 
 /// The id a heading is emitted under: `anchor` if it has one, else the slug
 /// of its text, else `EMPTY_SLUG_ID`.
+#[must_use]
 pub fn heading_id(content: &[Inline], anchor: Option<&str>) -> String {
     match anchor {
         Some(a) => a.to_string(),
@@ -133,6 +139,7 @@ fn auto_id(text: &str) -> String {
 
 /// Every heading in `doc`, in document order, including headings nested in
 /// blockquotes, list items and block shortcodes.
+#[must_use]
 pub fn headings(doc: &Document) -> Vec<Heading> {
     let mut out = Vec::new();
     for b in &doc.blocks {
@@ -185,11 +192,13 @@ fn collect(block: &Block, out: &mut Vec<Heading>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::span::SourceMap;
+    use crate::{lexer, parser};
 
     fn parse(src: &str) -> Document {
-        let src = crate::span::SourceMap::new("t.brf", src);
-        let tokens = crate::lexer::lex(&src).expect("lex");
-        let (doc, diags) = crate::parser::parse(tokens, &src);
+        let src = SourceMap::new("t.brf", src);
+        let tokens = lexer::lex(&src).expect("lex");
+        let (doc, diags) = parser::parse(tokens, &src);
         assert!(diags.is_empty(), "{:?}", diags);
         doc
     }

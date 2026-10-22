@@ -8,18 +8,27 @@
 //! file gets the same verdict everywhere. `build_index` walks the project
 //! tree and collects the heading anchors that `@ref` is allowed to point at.
 
-use crate::ast::Document;
+use crate::ast::{Block, Document, Inline};
 use crate::config::{self, Config};
 use crate::diag::{Code, Diagnostic, Severity, render_all};
+use crate::resolve::{self, ResolveProject};
 use crate::shortcode::Registry;
 use crate::span::{SourceMap, Span};
-use crate::validate::ValidateOpts;
-use std::path::{Path, PathBuf};
+use crate::validate::{self, ValidateOptions};
+use crate::{lexer, parser, slug};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io;
+use std::path::{self, Path, PathBuf};
 
 /// Read a Brief source file the way every tool does: UTF-8, with a leading
 /// byte-order mark stripped.
-pub fn read_source(path: &Path) -> std::io::Result<String> {
-    let raw = std::fs::read_to_string(path)?;
+///
+/// # Errors
+///
+/// Returns the I/O error when the file cannot be read or is not UTF-8.
+pub fn read_source(path: &Path) -> io::Result<String> {
+    let raw = fs::read_to_string(path)?;
     Ok(match raw.strip_prefix('\u{feff}') {
         Some(rest) => rest.to_string(),
         None => raw,
@@ -29,6 +38,7 @@ pub fn read_source(path: &Path) -> std::io::Result<String> {
 /// The compile context for a file: its project root, the config that
 /// applies to it, and the shortcode registry built from that config.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Project {
     /// Canonical directory holding `brief.toml`, or `None` for a file that
     /// is not inside any project.
@@ -36,19 +46,26 @@ pub struct Project {
     /// The config file that was loaded: the explicit override if one was
     /// given, else `<root>/brief.toml`. `None` means built-in defaults.
     pub config_path: Option<PathBuf>,
+    /// The config that applies to the file.
     pub config: Config,
+    /// Built-in shortcodes plus those `config` declares.
     pub registry: Registry,
 }
 
 /// What `Project::check` produced for one source.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Checked {
     /// `None` when the source failed to lex; there is nothing to emit.
     pub doc: Option<Document>,
+    /// Every diagnostic the front-end reported, errors and warnings alike.
     pub diagnostics: Vec<Diagnostic>,
 }
 
 impl Checked {
+    /// Whether any diagnostic is an error, i.e. the source must not be
+    /// emitted.
+    #[must_use]
     pub fn has_errors(&self) -> bool {
         self.diagnostics
             .iter()
@@ -57,6 +74,7 @@ impl Checked {
 
     /// Project-relative paths of the broken files this source `@ref`s (the
     /// targets of its B0605 diagnostics), in source order, deduplicated.
+    #[must_use]
     pub fn broken_targets(&self) -> Vec<String> {
         let spans: BTreeSet<Span> = self
             .diagnostics
@@ -83,9 +101,10 @@ impl Checked {
 
     /// Render the diagnostics against `src`, then those of every broken
     /// file this source `@ref`s, each against its own source, so a B0605
-    /// arrives with the reason the target is broken. `index_diags` is what
-    /// `Project::index` returned; diagnostics of files this source does not
-    /// reference are never shown.
+    /// arrives with the reason the target is broken. `index_diags` is the
+    /// `IndexBuild::diagnostics` of `Project::index`; diagnostics of files
+    /// this source does not reference are never shown.
+    #[must_use]
     pub fn render(&self, src: &SourceMap, index_diags: &[FileDiagnostics]) -> String {
         let mut parts = vec![render_all(&self.diagnostics, src)];
         for target in self.broken_targets() {
@@ -103,11 +122,15 @@ impl Project {
     /// walking up to the nearest `brief.toml`. The working directory plays
     /// no part. `config_override` (a `--config` flag) replaces the config
     /// file but not the root, so `@ref` still resolves against the tree the
-    /// file lives in. A config file that fails to load is an error.
+    /// file lives in.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the config file when it fails to load.
     pub fn discover(input: &Path, config_override: Option<&Path>) -> Result<Project, String> {
         let abs = input
             .canonicalize()
-            .or_else(|_| std::path::absolute(input))
+            .or_else(|_| path::absolute(input))
             .unwrap_or_else(|_| input.to_path_buf());
         let root = discover_root(&abs);
         let config_path = config_override
@@ -123,6 +146,7 @@ impl Project {
     /// A project with an explicit root and config, for tools that locate
     /// their config some other way (brief-web's `book.toml`, the LSP's
     /// fallback after a broken `brief.toml`).
+    #[must_use]
     pub fn from_config(
         root: Option<PathBuf>,
         config_path: Option<PathBuf>,
@@ -138,12 +162,15 @@ impl Project {
     }
 
     /// No root, default config: built-in shortcodes only, `@ref` is B0604.
+    #[must_use]
     pub fn standalone() -> Project {
         Project::from_config(None, None, Config::default())
     }
 
-    pub fn validate_opts(&self) -> ValidateOpts {
-        ValidateOpts {
+    /// The validator options this project's `[compile]` table selects.
+    #[must_use]
+    pub fn validate_options(&self) -> ValidateOptions {
+        ValidateOptions {
             strict_heading_levels: self.config.compile.strict_heading_levels,
         }
     }
@@ -152,12 +179,14 @@ impl Project {
     /// that fail to lex or parse are indexed leniently and listed in
     /// `ProjectIndex::broken`; their diagnostics are returned for callers
     /// that report on the whole project (`brief check`, a site build).
-    pub fn index(&self) -> Option<(ProjectIndex, Vec<FileDiagnostics>)> {
+    #[must_use]
+    pub fn index(&self) -> Option<IndexBuild> {
         self.root.as_deref().map(build_index)
     }
 
     /// Project-relative, forward-slash path of `file`, in the form
     /// `ProjectIndex` keys use. `None` outside the root.
+    #[must_use]
     pub fn rel_path(&self, file: &Path) -> Option<String> {
         let root = self.root.as_deref()?;
         let abs = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
@@ -168,13 +197,14 @@ impl Project {
     /// this project's registry and options. `index` and `rel` (the file's
     /// project-relative path) enable `@ref` resolution; without an index,
     /// `@ref` reports B0604 exactly as it does outside a project.
+    #[must_use]
     pub fn check(
         &self,
         src: &SourceMap,
         index: Option<&ProjectIndex>,
         rel: Option<&str>,
     ) -> Checked {
-        let tokens = match crate::lexer::lex(src) {
+        let tokens = match lexer::lex(src) {
             Ok(t) => t,
             Err(diagnostics) => {
                 return Checked {
@@ -183,18 +213,18 @@ impl Project {
                 };
             }
         };
-        let (mut doc, mut diagnostics) = crate::parser::parse(tokens, src);
+        let (mut doc, mut diagnostics) = parser::parse(tokens, src);
         let current = PathBuf::from(rel.unwrap_or_default());
-        let resolve_project = index.map(|index| crate::resolve::ResolveProject {
+        let resolve_project = index.map(|index| ResolveProject {
             index,
             current: &current,
         });
-        diagnostics.extend(crate::resolve::resolve_with_project(
+        diagnostics.extend(resolve::resolve_with_project(
             &mut doc,
             &self.registry,
             resolve_project.as_ref(),
         ));
-        diagnostics.extend(crate::validate::validate(&doc, &self.validate_opts(), src));
+        diagnostics.extend(validate::validate(&doc, &self.validate_options(), src));
         Checked {
             doc: Some(doc),
             diagnostics,
@@ -208,6 +238,7 @@ impl Project {
 /// `start` may be a file or directory. If a file, its parent is the
 /// first directory considered. The search includes `start` itself if
 /// `start` is a directory.
+#[must_use]
 pub fn discover_root(start: &Path) -> Option<PathBuf> {
     let mut cur: PathBuf = if start.is_file() {
         start.parent()?.to_path_buf()
@@ -224,16 +255,17 @@ pub fn discover_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
-use std::collections::{BTreeMap, BTreeSet};
-
 /// Diagnostics emitted while indexing one project file, paired with the
 /// source so the consumer can render them at correct positions.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct FileDiagnostics {
     /// Project-relative path, the same key `ProjectIndex::anchors` uses.
     pub rel: String,
-    pub source: crate::span::SourceMap,
-    pub diagnostics: Vec<crate::diag::Diagnostic>,
+    /// The file's source, to render `diagnostics` against.
+    pub source: SourceMap,
+    /// What lexing or parsing the file reported.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 /// Snapshot of the project's `@ref` targets. Built once per compilation
@@ -252,11 +284,22 @@ pub struct ProjectIndex {
     pub broken: BTreeSet<String>,
 }
 
+/// What `build_index` produced: the index plus the diagnostics of every
+/// file that did not lex or parse cleanly.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct IndexBuild {
+    /// The project's `@ref` targets.
+    pub index: ProjectIndex,
+    /// Per-file diagnostics, each paired with the source that produced it.
+    pub diagnostics: Vec<FileDiagnostics>,
+}
+
 /// Walk the project tree and collect heading anchors per file.
 ///
 /// Skips:
-///   * hidden directories (name starts with `.`),
-///   * the `target/`, `dist/`, `node_modules/` directories.
+/// - hidden directories (name starts with `.`),
+/// - the `target/`, `dist/`, `node_modules/` directories.
 ///
 /// Files that fail to lex or parse are still indexed (with the anchors that
 /// parsed, or none after a lex error) and are listed in `broken`, so a
@@ -265,10 +308,8 @@ pub struct ProjectIndex {
 /// them so callers can render diagnostics at the correct positions. Callers
 /// must not treat these as errors in the file they are compiling: they
 /// belong to other files.
-pub fn build_index(root: &Path) -> (ProjectIndex, Vec<FileDiagnostics>) {
-    use crate::lexer;
-    use crate::parser;
-
+#[must_use]
+pub fn build_index(root: &Path) -> IndexBuild {
     let mut idx = ProjectIndex {
         root: root.to_path_buf(),
         ..Default::default()
@@ -308,7 +349,7 @@ pub fn build_index(root: &Path) -> (ProjectIndex, Vec<FileDiagnostics>) {
             }
             all_diags.push(FileDiagnostics {
                 rel: rel.clone(),
-                source: src.clone(),
+                source: src,
                 diagnostics: parse_diags,
             });
         }
@@ -316,12 +357,16 @@ pub fn build_index(root: &Path) -> (ProjectIndex, Vec<FileDiagnostics>) {
         idx.anchors.insert(rel, anchors);
     });
 
-    (idx, all_diags)
+    IndexBuild {
+        index: idx,
+        diagnostics: all_diags,
+    }
 }
 
 /// Every `.brf` file under `dir`, sorted, skipping the directories
 /// `build_index` skips. Each path is `dir` joined with the file's relative
 /// path, so a relative `dir` yields relative paths.
+#[must_use]
 pub fn brf_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     walk_brf_files(dir, &mut |p: &Path| out.push(p.to_path_buf()));
@@ -330,7 +375,7 @@ pub fn brf_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn walk_brf_files(root: &Path, visit: &mut dyn FnMut(&Path)) {
-    let rd = match std::fs::read_dir(root) {
+    let rd = match fs::read_dir(root) {
         Ok(rd) => rd,
         Err(_) => return,
     };
@@ -360,23 +405,25 @@ fn walk_brf_files(root: &Path, visit: &mut dyn FnMut(&Path)) {
 /// lists, and block shortcodes. This is the same set `build_index` records
 /// per file; exposed so callers holding an in-memory document (e.g. an
 /// editor buffer) can overlay a fresher anchor set over a disk-built index.
-pub fn collect_anchors(doc: &crate::ast::Document) -> BTreeSet<String> {
-    crate::slug::headings(doc)
-        .into_iter()
-        .map(|h| h.id)
-        .collect()
+#[must_use]
+pub fn collect_anchors(doc: &Document) -> BTreeSet<String> {
+    slug::headings(doc).into_iter().map(|h| h.id).collect()
 }
 
 /// A `@ref` invocation: its source span and the raw target text
 /// (`path.brf` or `path.brf#anchor`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RefSite {
+    /// Span of the whole `@ref` invocation.
     pub span: Span,
+    /// The target text as written in the invocation body.
     pub target: String,
 }
 
 /// Every `@ref` in `doc` whose body is a plain target, in source order,
 /// including those nested in lists, quotes, tables and shortcodes.
+#[must_use]
 pub fn collect_refs(doc: &Document) -> Vec<RefSite> {
     let mut out = Vec::new();
     for b in &doc.blocks {
@@ -385,8 +432,7 @@ pub fn collect_refs(doc: &Document) -> Vec<RefSite> {
     out
 }
 
-fn collect_refs_block(b: &crate::ast::Block, out: &mut Vec<RefSite>) {
-    use crate::ast::Block;
+fn collect_refs_block(b: &Block, out: &mut Vec<RefSite>) {
     match b {
         Block::Heading { content, .. } | Block::Paragraph { content, .. } => {
             collect_refs_inlines(content, out);
@@ -424,8 +470,7 @@ fn collect_refs_block(b: &crate::ast::Block, out: &mut Vec<RefSite>) {
     }
 }
 
-fn collect_refs_inlines(nodes: &[crate::ast::Inline], out: &mut Vec<RefSite>) {
-    use crate::ast::Inline;
+fn collect_refs_inlines(nodes: &[Inline], out: &mut Vec<RefSite>) {
     for n in nodes {
         match n {
             Inline::Bold { content, .. }
@@ -455,10 +500,11 @@ fn collect_refs_inlines(nodes: &[crate::ast::Inline], out: &mut Vec<RefSite>) {
 }
 
 fn to_forward_slash(p: &Path) -> String {
-    p.components()
+    let parts: Vec<_> = p
+        .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
+        .collect();
+    parts.join("/")
 }
 
 #[cfg(test)]
@@ -540,7 +586,10 @@ mod tests {
             "# Title {#top}\n\nSome text.\n\n## Subsection {#sub}\n",
         );
         write(&root.join("docs/b.brf"), "# Other Title {#other}\n");
-        let (idx, diags) = build_index(root);
+        let IndexBuild {
+            index: idx,
+            diagnostics: diags,
+        } = build_index(root);
         assert!(
             diags.iter().all(|fd| fd
                 .diagnostics
@@ -572,7 +621,10 @@ mod tests {
         write(&root.join("target/x.brf"), "# X {#x}\n");
         write(&root.join("dist/y.brf"), "# Y {#y}\n");
         write(&root.join(".hidden/z.brf"), "# Z {#z}\n");
-        let (idx, diags) = build_index(root);
+        let IndexBuild {
+            index: idx,
+            diagnostics: diags,
+        } = build_index(root);
         assert!(
             diags.iter().all(|fd| fd
                 .diagnostics
@@ -627,7 +679,7 @@ mod tests {
         write(&file, "x\n");
         let p = Project::discover(&file, Some(&other)).unwrap();
         assert_eq!(p.root.as_deref(), Some(root.as_path()));
-        assert!(p.validate_opts().strict_heading_levels);
+        assert!(p.validate_options().strict_heading_levels);
     }
 
     #[test]
@@ -648,7 +700,10 @@ mod tests {
         write(&root.join("good.brf"), "# G {#g}\n");
         write(&root.join("draft.brf"), "# D {#d}\n\n*unfinished\n");
         write(&root.join("tabbed.brf"), "a\tb\n");
-        let (idx, diags) = build_index(root);
+        let IndexBuild {
+            index: idx,
+            diagnostics: diags,
+        } = build_index(root);
         assert_eq!(
             idx.broken,
             BTreeSet::from(["draft.brf".to_string(), "tabbed.brf".to_string()])
@@ -669,7 +724,7 @@ mod tests {
         let guide = root.join("guide.brf");
         write(&guide, "# Guide\n\nText.\n");
         let p = Project::discover(&guide, None).unwrap();
-        let (idx, _) = p.index().unwrap();
+        let idx = p.index().unwrap().index;
         let src = SourceMap::new("guide.brf", read_source(&guide).unwrap());
         let checked = p.check(&src, Some(&idx), p.rel_path(&guide).as_deref());
         assert!(!checked.has_errors(), "{:?}", checked.diagnostics);
@@ -684,7 +739,7 @@ mod tests {
         let guide = root.join("guide.brf");
         write(&guide, "See @ref[draft.brf#d](the draft).\n");
         let p = Project::discover(&guide, None).unwrap();
-        let (idx, _) = p.index().unwrap();
+        let idx = p.index().unwrap().index;
         let src = SourceMap::new("guide.brf", read_source(&guide).unwrap());
         let checked = p.check(&src, Some(&idx), Some("guide.brf"));
         let codes: Vec<_> = checked.diagnostics.iter().map(|d| d.code).collect();
@@ -700,7 +755,7 @@ mod tests {
             &root.join("a.brf"),
             "# Getting Started\n\n## Install Steps {#setup}\n\n## What's *new*?\n",
         );
-        let (idx, _) = build_index(root);
+        let idx = build_index(root).index;
         assert_eq!(
             idx.anchors["a.brf"],
             BTreeSet::from([
@@ -720,7 +775,7 @@ mod tests {
         let page = root.join("sub/a.brf");
         write(&page, "See @ref[guide.brf#install-steps](the steps).\n");
         let p = Project::discover(&page, None).unwrap();
-        let (idx, _) = p.index().unwrap();
+        let idx = p.index().unwrap().index;
         let src = SourceMap::new("a.brf", read_source(&page).unwrap());
         let checked = p.check(&src, Some(&idx), p.rel_path(&page).as_deref());
         assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
@@ -743,7 +798,7 @@ mod tests {
             .check(&src, None, None)
             .diagnostics
             .iter()
-            .map(|d| d.code.as_str())
+            .map(|d| d.code.to_string())
             .collect();
         assert_eq!(codes, ["B0410", "B0506", "B0606"]);
     }
@@ -761,7 +816,10 @@ mod tests {
             "See @ref[draft.brf#d](one) and @ref[draft.brf](two).\n",
         );
         let p = Project::discover(&guide, None).unwrap();
-        let (idx, index_diags) = p.index().unwrap();
+        let IndexBuild {
+            index: idx,
+            diagnostics: index_diags,
+        } = p.index().unwrap();
         let src = SourceMap::new("guide.brf", read_source(&guide).unwrap());
         let checked = p.check(&src, Some(&idx), Some("guide.brf"));
         assert_eq!(checked.broken_targets(), vec!["draft.brf".to_string()]);
@@ -800,7 +858,10 @@ mod tests {
         let root = td.path();
         touch(&root.join("brief.toml"));
         write(&root.join("plain.brf"), "Just a paragraph.\n");
-        let (idx, diags) = build_index(root);
+        let IndexBuild {
+            index: idx,
+            diagnostics: diags,
+        } = build_index(root);
         assert!(
             diags.iter().all(|fd| fd
                 .diagnostics

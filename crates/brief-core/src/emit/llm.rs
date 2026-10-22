@@ -1,17 +1,31 @@
-use crate::ast::{Block, CodeAttrs, Document, Inline, Row, ShortArgs};
+//! LLM emitter: renders a [`Document`] in a compact, Markdown-like text form
+//! tuned for token count, optionally minifying fenced code blocks.
+
+use crate::ast::{Block, CodeAttrs, Document, Inline, ResolvedRef, Row, ShortcodeArgs, TaskState};
+use crate::emit::math;
 use crate::minify::{self, MinifyOptions, MinifyWarning};
 use crate::shortcode::Registry;
+use crate::span::Span;
+use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::{iter, mem, ptr};
 
 /// A minified code block longer than this many source lines triggers a B0702
 /// warning that the LLM consumer cannot reference original line numbers.
 const LONG_BLOCK_LINE_THRESHOLD: usize = 50;
 
+/// Knobs for [`render`]. Build with struct-update syntax over
+/// [`Options::default`].
 #[derive(Clone, Debug)]
-pub struct Opts {
+pub struct Options {
+    /// Drop the `*`, `_`, `+`, `~` markers around emphasized text and keep
+    /// only the text itself.
     pub strip_emphasis: bool,
+    /// Emit the `|---|` separator row under a table's header row.
     pub keep_table_rule: bool,
+    /// Include the `src` of `@image` next to its alt text.
     pub keep_asset_urls: bool,
+    /// Re-emit the document's `+++` frontmatter at the top of the output.
     pub keep_metadata: bool,
     /// Master toggle for code-block minification. When false, every code
     /// block is emitted verbatim regardless of tag or `@minify`.
@@ -23,15 +37,15 @@ pub struct Opts {
     pub preserve_code_fences: bool,
 }
 
-impl Default for Opts {
+impl Default for Options {
     fn default() -> Self {
-        // The Opts default is used in unit tests and in fall-back code paths
-        // when no `brief.toml` is on disk. Keeping it in sync with the
+        // The Options default is used in unit tests and in fall-back code
+        // paths when no `brief.toml` is on disk. Keeping it in sync with the
         // canonical default in `config::default_minify_languages` matters
         // because the LLM emit pass is the one that actually consults this
         // list to decide whether to attempt minification on a tag the
         // dispatcher knows about.
-        Opts {
+        Options {
             strip_emphasis: false,
             keep_table_rule: false,
             keep_asset_urls: false,
@@ -63,7 +77,26 @@ impl Default for Opts {
     }
 }
 
-pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> (String, Vec<String>) {
+/// The result of [`render`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[must_use]
+pub struct Output {
+    /// The rendered document.
+    pub text: String,
+    /// Code-block minification problems, pre-formatted as
+    /// `warning[B07xx]: …` / `error[B0704]: …` lines, in document order.
+    pub warnings: Vec<String>,
+}
+
+/// Renders `doc` in the LLM-oriented text form.
+///
+/// Shortcodes with an `llm` template in `registry` are expanded through it;
+/// the rest use the built-in rendering. Code blocks are minified according
+/// to `options`, the frontmatter `minify_code` key, and per-block
+/// attributes; minification never fails the render, it only adds
+/// [`Output::warnings`].
+pub fn render(doc: &Document, registry: &Registry, options: &Options) -> Output {
     let footnotes = collect_footnotes(doc);
     let mut out = String::new();
     let frontmatter_minify_code = doc
@@ -71,22 +104,22 @@ pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> (String, Vec<Strin
         .as_ref()
         .and_then(|m| m.get("minify_code"))
         .and_then(|v| v.as_bool());
-    if opts.keep_metadata {
-        if let Some(meta) = &doc.metadata {
-            // Re-serialize the metadata table to preserve it as Brief
-            // frontmatter at the top of the LLM output.
-            let body = toml::to_string(meta).unwrap_or_default();
-            out.push_str("+++\n");
-            out.push_str(&body);
-            if !body.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str("+++\n\n");
+    if options.keep_metadata
+        && let Some(meta) = &doc.metadata
+    {
+        // Re-serialize the metadata table to preserve it as Brief
+        // frontmatter at the top of the LLM output.
+        let body = toml::to_string(meta).unwrap_or_default();
+        out.push_str("+++\n");
+        out.push_str(&body);
+        if !body.ends_with('\n') {
+            out.push('\n');
         }
+        out.push_str("+++\n\n");
     }
-    let mut ctx = Ctx {
-        reg,
-        opts,
+    let mut ctx = Context {
+        registry,
+        options,
         counter: 0,
         in_footnote: false,
         warnings: Vec::new(),
@@ -99,10 +132,12 @@ pub fn render(doc: &Document, reg: &Registry, opts: &Opts) -> (String, Vec<Strin
         render_block(b, &mut ctx, &mut out, 0);
     }
     if !footnotes.is_empty() {
-        emit_footnotes_section(&footnotes, reg, opts, &doc.resolved_refs, &mut out);
+        emit_footnotes_section(&footnotes, registry, options, &doc.resolved_refs, &mut out);
     }
-    let out = collapse_newline_runs(out, &ctx.verbatim);
-    (out, ctx.warnings)
+    Output {
+        text: collapse_newline_runs(out, &ctx.verbatim),
+        warnings: ctx.warnings,
+    }
 }
 
 /// Collapse runs of 3+ newlines down to 2, except inside the `verbatim`
@@ -117,7 +152,8 @@ fn collapse_newline_runs(out: String, verbatim: &[(usize, usize)]) -> String {
     let mut nl_run = 0usize;
     let mut i = 0;
     let end = (bytes.len(), bytes.len());
-    for &(skip_from, skip_to) in verbatim.iter().chain(std::iter::once(&end)) {
+    let ranges = verbatim.iter().chain(iter::once(&end));
+    for &(skip_from, skip_to) in ranges {
         while i < skip_from {
             if bytes[i] == b'\n' {
                 nl_run += 1;
@@ -145,14 +181,14 @@ fn collapse_newline_runs(out: String, verbatim: &[(usize, usize)]) -> String {
     collapsed
 }
 
-struct Ctx<'a> {
-    reg: &'a Registry,
-    opts: &'a Opts,
+struct Context<'render> {
+    registry: &'render Registry,
+    options: &'render Options,
     counter: u32,
     in_footnote: bool,
     warnings: Vec<String>,
     frontmatter_minify_code: Option<bool>,
-    resolved_refs: &'a std::collections::BTreeMap<crate::span::Span, crate::ast::ResolvedRef>,
+    resolved_refs: &'render BTreeMap<Span, ResolvedRef>,
     /// The buffer that becomes the final output; compared by address only.
     /// A code body written into a scratch buffer has no known offset in the
     /// output (a blockquote re-prefixes every line, so no newline run can
@@ -164,11 +200,11 @@ struct Ctx<'a> {
     verbatim: Vec<(usize, usize)>,
 }
 
-fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String, indent: usize) {
-    let pad: String = std::iter::repeat(' ').take(indent).collect();
+fn render_block(b: &Block, ctx: &mut Context, out: &mut String, indent: usize) {
+    let pad = " ".repeat(indent);
     match b {
         Block::Heading { level, content, .. } => {
-            let hashes: String = std::iter::repeat('#').take(*level as usize).collect();
+            let hashes = "#".repeat(*level as usize);
             let _ = write!(out, "{} ", hashes);
             render_inline_seq(content, ctx, out);
             out.push('\n');
@@ -182,7 +218,6 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String, indent: usize) {
             out.push('\n');
         }
         Block::List { ordered, items, .. } => {
-            use crate::ast::TaskState;
             for (i, it) in items.iter().enumerate() {
                 if *ordered {
                     let _ = write!(out, "{}{}. ", pad, i + 1);
@@ -246,12 +281,12 @@ fn emit_code_block(
     lang: Option<&str>,
     body: &str,
     attrs: &CodeAttrs,
-    ctx: &mut Ctx,
+    ctx: &mut Context,
     out: &mut String,
 ) {
     let minified = try_minify(lang, body, attrs, ctx);
     let body_to_emit = minified.as_deref().unwrap_or(body);
-    if ctx.opts.preserve_code_fences {
+    if ctx.options.preserve_code_fences {
         out.push_str("```");
         if let Some(l) = lang {
             out.push_str(l);
@@ -260,16 +295,21 @@ fn emit_code_block(
     }
     let start = out.len();
     out.push_str(body_to_emit);
-    if std::ptr::eq(out, ctx.root) && out.len() > start {
+    if ptr::eq(out, ctx.root) && out.len() > start {
         ctx.verbatim.push((start, out.len()));
     }
     out.push('\n');
-    if ctx.opts.preserve_code_fences {
+    if ctx.options.preserve_code_fences {
         out.push_str("```\n");
     }
 }
 
-fn try_minify(lang: Option<&str>, body: &str, attrs: &CodeAttrs, ctx: &mut Ctx) -> Option<String> {
+fn try_minify(
+    lang: Option<&str>,
+    body: &str,
+    attrs: &CodeAttrs,
+    ctx: &mut Context,
+) -> Option<String> {
     if attrs.nominify {
         return None;
     }
@@ -285,7 +325,7 @@ fn try_minify(lang: Option<&str>, body: &str, attrs: &CodeAttrs, ctx: &mut Ctx) 
     // never opted in.
     if let Some(reason) = minify::refusal_reason(&lang_lc) {
         let in_allowlist = ctx
-            .opts
+            .options
             .minify_languages
             .iter()
             .any(|x| x.eq_ignore_ascii_case(&lang_lc));
@@ -306,7 +346,7 @@ fn try_minify(lang: Option<&str>, body: &str, attrs: &CodeAttrs, ctx: &mut Ctx) 
         if let Some(false) = ctx.frontmatter_minify_code {
             return None;
         }
-        if !ctx.opts.minify_code_blocks {
+        if !ctx.options.minify_code_blocks {
             return None;
         }
     }
@@ -314,7 +354,7 @@ fn try_minify(lang: Option<&str>, body: &str, attrs: &CodeAttrs, ctx: &mut Ctx) 
     // Allowlist gate. Even with @minify, only languages with registered
     // minifiers are processed; everything else falls back to verbatim.
     let in_allowlist = ctx
-        .opts
+        .options
         .minify_languages
         .iter()
         .any(|x| x.eq_ignore_ascii_case(&lang_lc));
@@ -359,13 +399,13 @@ fn try_minify(lang: Option<&str>, body: &str, attrs: &CodeAttrs, ctx: &mut Ctx) 
     }
 }
 
-fn render_table(header: &Row, rows: &[Row], ctx: &mut Ctx, out: &mut String) {
+fn render_table(header: &Row, rows: &[Row], ctx: &mut Context, out: &mut String) {
     // A literal `|` inside a cell (from a `\|` escape or inline code) would
     // read as a column separator in the flattened output; re-escape it so the
     // table keeps its column structure for the LLM consumer.
-    let render_cell = |c: &Vec<Inline>, ctx: &mut Ctx| -> String {
+    let render_cell = |c: &[Inline], ctx: &mut Context| -> String {
         let mut s = String::new();
-        render_inline_seq_to(c, ctx, &mut s);
+        render_inline_seq(c, ctx, &mut s);
         s.replace('|', "\\|")
     };
     let mut row_strs: Vec<Vec<String>> = Vec::new();
@@ -401,11 +441,10 @@ fn render_table(header: &Row, rows: &[Row], ctx: &mut Ctx, out: &mut String) {
             let _ = write!(out, " {:width$} |", cell, width = w);
         }
         out.push('\n');
-        if i == 0 && ctx.opts.keep_table_rule {
+        if i == 0 && ctx.options.keep_table_rule {
             out.push('|');
             for w in &widths {
-                let dashes: String = std::iter::repeat('-').take(*w + 2).collect();
-                out.push_str(&dashes);
+                out.push_str(&"-".repeat(*w + 2));
                 out.push('|');
             }
             out.push('\n');
@@ -415,37 +454,39 @@ fn render_table(header: &Row, rows: &[Row], ctx: &mut Ctx, out: &mut String) {
 
 fn render_block_shortcode_llm(
     name: &str,
-    args: &ShortArgs,
+    args: &ShortcodeArgs,
     children: &[Block],
-    ctx: &mut Ctx,
+    ctx: &mut Context,
     out: &mut String,
     indent: usize,
 ) {
-    if let Some(sc) = ctx.reg.get(name) {
-        if let Some(t) = &sc.template_llm {
-            // Record code bodies relative to `inner`, then shift them to
-            // wherever the template splices `{{content}}` into `out`.
-            let mut inner = String::new();
-            let outer_root = std::mem::replace(&mut ctx.root, &inner);
-            let outer_verbatim = std::mem::take(&mut ctx.verbatim);
-            for c in children {
-                render_block(c, ctx, &mut inner, indent);
-            }
-            ctx.root = outer_root;
-            let inner_verbatim = std::mem::replace(&mut ctx.verbatim, outer_verbatim);
-            let mut content_at = Vec::new();
-            let r = expand_template_llm_at(t, args, &inner, Some(&mut content_at));
-            if std::ptr::eq(out, ctx.root) {
-                let base = out.len();
-                for at in content_at {
-                    for &(s, e) in &inner_verbatim {
-                        ctx.verbatim.push((base + at + s, base + at + e));
-                    }
+    if let Some(t) = ctx
+        .registry
+        .get(name)
+        .and_then(|sc| sc.template_llm.as_ref())
+    {
+        // Record code bodies relative to `inner`, then shift them to
+        // wherever the template splices `{{content}}` into `out`.
+        let mut inner = String::new();
+        let outer_root = mem::replace(&mut ctx.root, &inner);
+        let outer_verbatim = mem::take(&mut ctx.verbatim);
+        for c in children {
+            render_block(c, ctx, &mut inner, indent);
+        }
+        ctx.root = outer_root;
+        let inner_verbatim = mem::replace(&mut ctx.verbatim, outer_verbatim);
+        let mut content_at = Vec::new();
+        let r = expand_template_llm_at(t, args, &inner, Some(&mut content_at));
+        if ptr::eq(out, ctx.root) {
+            let base = out.len();
+            for at in content_at {
+                for &(s, e) in &inner_verbatim {
+                    ctx.verbatim.push((base + at + s, base + at + e));
                 }
             }
-            out.push_str(&r);
-            return;
         }
+        out.push_str(&r);
+        return;
     }
     match name {
         "callout" => {
@@ -475,7 +516,7 @@ fn render_block_shortcode_llm(
         "math" => {
             // Verbatim TeX straight from the AST; rendering the body as a
             // paragraph would indent it and run it through inline output.
-            let _ = writeln!(out, "$${}$$", super::math_block_source(children).trim());
+            let _ = writeln!(out, "$${}$$", math::block_source(children).trim());
         }
         _ => {
             let _ = writeln!(out, "@{}", name);
@@ -487,17 +528,13 @@ fn render_block_shortcode_llm(
     }
 }
 
-fn render_inline_seq(seq: &[Inline], ctx: &mut Ctx, out: &mut String) {
+fn render_inline_seq(seq: &[Inline], ctx: &mut Context, out: &mut String) {
     for n in seq {
         render_inline(n, ctx, out);
     }
 }
 
-fn render_inline_seq_to(seq: &[Inline], ctx: &mut Ctx, out: &mut String) {
-    render_inline_seq(seq, ctx, out)
-}
-
-fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
+fn render_inline(node: &Inline, ctx: &mut Context, out: &mut String) {
     match node {
         Inline::Text { value, .. } => out.push_str(value),
         Inline::HardBreak { .. } => out.push('\n'),
@@ -518,17 +555,17 @@ fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
         } if name == "ref" => {
             let resolved = ctx.resolved_refs.get(span);
             let display = if let Some(r) = resolved {
-                r.display.clone()
+                r.display.as_str()
             } else if let Some(s) = args.keyword.get("title").and_then(|v| v.as_str()) {
-                s.to_string()
+                s
             } else if let Some(s) = args.positional.first().and_then(|v| v.as_str()) {
-                s.to_string()
+                s
             } else if let Some([Inline::Text { value, .. }]) = content.as_deref() {
-                value.clone()
+                value.as_str()
             } else {
-                String::new()
+                ""
             };
-            out.push_str(&display);
+            out.push_str(display);
         }
         Inline::Shortcode {
             name,
@@ -561,8 +598,8 @@ fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
     }
 }
 
-fn emph_wrap(content: &[Inline], ctx: &mut Ctx, out: &mut String, m: char) {
-    if ctx.opts.strip_emphasis {
+fn emph_wrap(content: &[Inline], ctx: &mut Context, out: &mut String, m: char) {
+    if ctx.options.strip_emphasis {
         render_inline_seq(content, ctx, out);
     } else {
         out.push(m);
@@ -573,9 +610,9 @@ fn emph_wrap(content: &[Inline], ctx: &mut Ctx, out: &mut String, m: char) {
 
 fn render_inline_shortcode_llm(
     name: &str,
-    args: &ShortArgs,
+    args: &ShortcodeArgs,
     content: Option<&[Inline]>,
-    ctx: &mut Ctx,
+    ctx: &mut Context,
     out: &mut String,
 ) {
     let inner_string = content.map(|c| {
@@ -583,12 +620,14 @@ fn render_inline_shortcode_llm(
         render_inline_seq(c, ctx, &mut s);
         s
     });
-    if let Some(sc) = ctx.reg.get(name) {
-        if let Some(t) = &sc.template_llm {
-            let r = expand_template_llm(t, args, inner_string.as_deref().unwrap_or(""));
-            out.push_str(&r);
-            return;
-        }
+    if let Some(t) = ctx
+        .registry
+        .get(name)
+        .and_then(|sc| sc.template_llm.as_ref())
+    {
+        let r = expand_template_llm(t, args, inner_string.as_deref().unwrap_or(""));
+        out.push_str(&r);
+        return;
     }
     match name {
         "link" => {
@@ -611,7 +650,7 @@ fn render_inline_shortcode_llm(
                 .get("alt")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if ctx.opts.keep_asset_urls {
+            if ctx.options.keep_asset_urls {
                 let src = args
                     .keyword
                     .get("src")
@@ -632,7 +671,7 @@ fn render_inline_shortcode_llm(
             let _ = write!(out, "[sup:{}]", inner_string.as_deref().unwrap_or(""));
         }
         "math" => {
-            let tex = content.map(super::math_source).unwrap_or_default();
+            let tex = content.map(math::inline_source).unwrap_or_default();
             let _ = write!(out, "${}$", tex);
         }
         _ => {
@@ -644,7 +683,7 @@ fn render_inline_shortcode_llm(
     }
 }
 
-fn collect_footnotes(doc: &Document) -> Vec<Vec<Inline>> {
+fn collect_footnotes(doc: &Document) -> Vec<&[Inline]> {
     let mut out = Vec::new();
     for b in &doc.blocks {
         collect_block(b, &mut out);
@@ -652,7 +691,7 @@ fn collect_footnotes(doc: &Document) -> Vec<Vec<Inline>> {
     out
 }
 
-fn collect_block(b: &Block, out: &mut Vec<Vec<Inline>>) {
+fn collect_block<'doc>(b: &'doc Block, out: &mut Vec<&'doc [Inline]>) {
     match b {
         Block::Heading { content, .. } | Block::Paragraph { content, .. } => {
             for n in content {
@@ -702,7 +741,7 @@ fn collect_block(b: &Block, out: &mut Vec<Vec<Inline>>) {
     }
 }
 
-fn collect_inline(node: &Inline, out: &mut Vec<Vec<Inline>>) {
+fn collect_inline<'doc>(node: &'doc Inline, out: &mut Vec<&'doc [Inline]>) {
     match node {
         Inline::Bold { content, .. }
         | Inline::Italic { content, .. }
@@ -715,7 +754,7 @@ fn collect_inline(node: &Inline, out: &mut Vec<Vec<Inline>>) {
         Inline::Shortcode { name, content, .. } => {
             if name == "footnote" {
                 if let Some(c) = content {
-                    out.push(c.clone());
+                    out.push(c);
                 }
                 return;
             }
@@ -730,10 +769,10 @@ fn collect_inline(node: &Inline, out: &mut Vec<Vec<Inline>>) {
 }
 
 fn emit_footnotes_section(
-    footnotes: &[Vec<Inline>],
-    reg: &Registry,
-    opts: &Opts,
-    resolved_refs: &std::collections::BTreeMap<crate::span::Span, crate::ast::ResolvedRef>,
+    footnotes: &[&[Inline]],
+    registry: &Registry,
+    options: &Options,
+    resolved_refs: &BTreeMap<Span, ResolvedRef>,
     out: &mut String,
 ) {
     if !out.ends_with('\n') {
@@ -743,9 +782,9 @@ fn emit_footnotes_section(
     for (i, body) in footnotes.iter().enumerate() {
         let n = i + 1;
         let _ = write!(out, "[^{}]: ", n);
-        let mut ctx = Ctx {
-            reg,
-            opts,
+        let mut ctx = Context {
+            registry,
+            options,
             counter: 0,
             in_footnote: true,
             warnings: Vec::new(),
@@ -759,7 +798,7 @@ fn emit_footnotes_section(
     }
 }
 
-fn expand_template_llm(tpl: &str, args: &ShortArgs, content: &str) -> String {
+fn expand_template_llm(tpl: &str, args: &ShortcodeArgs, content: &str) -> String {
     expand_template_llm_at(tpl, args, content, None)
 }
 
@@ -767,7 +806,7 @@ fn expand_template_llm(tpl: &str, args: &ShortArgs, content: &str) -> String {
 /// `{{content}}` substitution in the result.
 fn expand_template_llm_at(
     tpl: &str,
-    args: &ShortArgs,
+    args: &ShortcodeArgs,
     content: &str,
     mut content_at: Option<&mut Vec<usize>>,
 ) -> String {
@@ -776,27 +815,28 @@ fn expand_template_llm_at(
     let mut start = 0;
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{') {
-            if let Some(rel) = tpl[i + 2..].find("}}") {
-                // Literal text since the last placeholder is copied as a
-                // slice, which keeps multibyte UTF-8 intact (a byte-at-a-
-                // time `push(b as char)` would mangle it).
-                out.push_str(&tpl[start..i]);
-                let key = tpl[i + 2..i + 2 + rel].trim();
-                if key == "content" {
-                    if let Some(at) = content_at.as_deref_mut() {
-                        at.push(out.len());
-                    }
-                    out.push_str(content);
-                } else if let Some(rest) = key.strip_prefix("args.") {
-                    if let Some(v) = args.keyword.get(rest).and_then(|v| v.as_str()) {
-                        out.push_str(v);
-                    }
+        if bytes[i] == b'{'
+            && bytes.get(i + 1) == Some(&b'{')
+            && let Some(rel) = tpl[i + 2..].find("}}")
+        {
+            // Literal text since the last placeholder is copied as a
+            // slice, which keeps multibyte UTF-8 intact (a byte-at-a-
+            // time `push(b as char)` would mangle it).
+            out.push_str(&tpl[start..i]);
+            let key = tpl[i + 2..i + 2 + rel].trim();
+            if key == "content" {
+                if let Some(at) = content_at.as_deref_mut() {
+                    at.push(out.len());
                 }
-                i = i + 2 + rel + 2;
-                start = i;
-                continue;
+                out.push_str(content);
+            } else if let Some(rest) = key.strip_prefix("args.")
+                && let Some(v) = args.keyword.get(rest).and_then(|v| v.as_str())
+            {
+                out.push_str(v);
             }
+            i = i + 2 + rel + 2;
+            start = i;
+            continue;
         }
         i += 1;
     }
@@ -807,27 +847,32 @@ fn expand_template_llm_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::lex;
-    use crate::parser::parse;
+    use crate::ast::DefinitionItem;
+    use crate::project::ProjectIndex;
+    use crate::resolve::{self, ResolveProject};
     use crate::span::SourceMap;
+    use crate::{lexer, parser};
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
-    fn render_with(input: &str, opts: Opts) -> (String, Vec<String>) {
+    fn render_with(input: &str, options: Options) -> (String, Vec<String>) {
         let src = SourceMap::new("d.brf", input);
-        let toks = lex(&src).unwrap();
-        let (doc, diags) = parse(toks, &src);
+        let toks = lexer::lex(&src).unwrap();
+        let (doc, diags) = parser::parse(toks, &src);
         assert!(diags.is_empty(), "{:?}", diags);
         let reg = Registry::with_builtins();
-        render(&doc, &reg, &opts)
+        let Output { text, warnings } = render(&doc, &reg, &options);
+        (text, warnings)
     }
 
     fn render_default(input: &str) -> String {
-        render_with(input, Opts::default()).0
+        render_with(input, Options::default()).0
     }
 
-    fn opts_with_keep_metadata() -> Opts {
-        Opts {
+    fn opts_with_keep_metadata() -> Options {
+        Options {
             keep_metadata: true,
-            ..Opts::default()
+            ..Options::default()
         }
     }
 
@@ -872,7 +917,7 @@ mod tests {
     fn json_block_minified_by_default() {
         let (out, w) = render_with(
             "```json\n{\n  \"a\": 1,\n  \"b\": [1, 2, 3]\n}\n```\n",
-            Opts::default(),
+            Options::default(),
         );
         assert!(w.is_empty(), "unexpected warnings: {:?}", w);
         assert!(out.contains("{\"a\":1,\"b\":[1,2,3]}"), "{}", out);
@@ -886,7 +931,7 @@ mod tests {
     #[test]
     fn json_block_with_nominify_kept_verbatim() {
         let src = "```json @nominify\n{\n  \"a\": 1\n}\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(w.is_empty());
         assert!(
             out.contains("\"a\": 1"),
@@ -898,7 +943,7 @@ mod tests {
     #[test]
     fn invalid_json_falls_back_with_warning() {
         let src = "```json\n{ not valid }\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(out.contains("{ not valid }"), "verbatim body: {}", out);
         assert_eq!(w.len(), 1, "expected one B0701 warning");
         assert!(w[0].contains("B0701"));
@@ -907,7 +952,7 @@ mod tests {
     #[test]
     fn jsonl_block_minified() {
         let src = "```jsonl\n{\"a\": 1}\n{\"b\": 2}\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(w.is_empty(), "{:?}", w);
         assert!(out.contains("{\"a\":1}\n{\"b\":2}"), "{}", out);
     }
@@ -915,7 +960,7 @@ mod tests {
     #[test]
     fn rust_block_minified_in_v0_3() {
         let src = "```rust\nfn x() {\n    // hi\n    1\n}\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(w.is_empty(), "{:?}", w);
         assert!(out.contains("fn x(){1}"), "minified rust: {}", out);
         assert!(!out.contains("// hi"), "comment dropped: {}", out);
@@ -924,7 +969,7 @@ mod tests {
     #[test]
     fn js_block_preserves_newlines() {
         let src = "```javascript\nfunction add(a, b) {\n    return a + b;\n}\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(w.is_empty(), "{:?}", w);
         assert!(
             out.contains("function add(a,b){\nreturn a+b;\n}"),
@@ -936,7 +981,7 @@ mod tests {
     #[test]
     fn ts_alias_minifies() {
         let src = "```ts\nfunction f(x: number): string { return String(x); }\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(w.is_empty(), "{:?}", w);
         assert!(
             out.contains("function f(x:number):string{return String(x);}"),
@@ -948,7 +993,7 @@ mod tests {
     #[test]
     fn sql_block_minified() {
         let src = "```sql\nSELECT *\nFROM users\nWHERE id = 1;\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(w.is_empty(), "{:?}", w);
         assert!(
             out.contains("SELECT*FROM users WHERE id=1;"),
@@ -960,7 +1005,7 @@ mod tests {
     #[test]
     fn c_preprocessor_kept_on_own_line() {
         let src = "```c\n#include <stdio.h>\nint main() { return 0; }\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(w.is_empty(), "{:?}", w);
         assert!(
             out.contains("#include <stdio.h>\nint main(){return 0;}"),
@@ -972,7 +1017,7 @@ mod tests {
     #[test]
     fn cpp_alias_minifies_with_raw_string() {
         let src = "```cpp\nconst char* s = R\"x(hi)x\";\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(w.is_empty(), "{:?}", w);
         assert!(out.contains("R\"x(hi)x\""), "got: {}", out);
     }
@@ -980,7 +1025,7 @@ mod tests {
     #[test]
     fn java_block_minified() {
         let src = "```java\npublic class Foo {\n    @Override public void f() {}\n}\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(w.is_empty(), "{:?}", w);
         assert!(
             out.contains("public class Foo{@Override public void f(){}}"),
@@ -992,7 +1037,7 @@ mod tests {
     #[test]
     fn go_block_preserves_newlines() {
         let src = "```go\nfunc add(a, b int) int {\n    return a + b\n}\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(w.is_empty(), "{:?}", w);
         assert!(
             out.contains("func add(a,b int)int{\nreturn a+b\n}"),
@@ -1004,7 +1049,7 @@ mod tests {
     #[test]
     fn keep_comments_emits_b0703() {
         let src = "```rust @minify-keep-comments\nfn x() {\n    // hi\n    1\n}\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(out.contains("/* hi*/"), "comment preserved: {}", out);
         assert!(
             w.iter().any(|s| s.contains("B0703")),
@@ -1019,7 +1064,7 @@ mod tests {
         // `@minify` forcing the attempt, the LLM emit pass surfaces a
         // B0704 error and falls back to verbatim output.
         let src = "```python @minify\ndef f(x):\n    return x\n```\n";
-        let (out, w) = render_with(src, Opts::default());
+        let (out, w) = render_with(src, Options::default());
         assert!(out.contains("def f(x):\n    return x"), "verbatim: {}", out);
         assert!(
             w.iter().any(|s| s.contains("B0704")),
@@ -1031,11 +1076,11 @@ mod tests {
     #[test]
     fn refused_language_silent_without_optin() {
         // No `@minify`, default allowlist excludes python — no warning.
-        let opts = Opts {
+        let opts = Options {
             // Make sure python is NOT in the allowlist (default already
             // excludes it but be explicit for the test's intent).
             minify_languages: vec!["json".into()],
-            ..Opts::default()
+            ..Options::default()
         };
         let src = "```python\nx = 1\n```\n";
         let (_out, w) = render_with(src, opts);
@@ -1055,7 +1100,7 @@ mod tests {
         }
         body.push(']');
         let src = format!("```json\n{}\n```\n", body);
-        let (_out, w) = render_with(&src, Opts::default());
+        let (_out, w) = render_with(&src, Options::default());
         assert!(
             w.iter().any(|s| s.contains("B0702")),
             "B0702 emitted for long block: {:?}",
@@ -1066,7 +1111,7 @@ mod tests {
     #[test]
     fn frontmatter_minify_code_false_disables() {
         let src = "+++\nminify_code = false\n+++\n```json\n{\"a\": 1}\n```\n";
-        let (out, _) = render_with(src, Opts::default());
+        let (out, _) = render_with(src, Options::default());
         // Whitespace between key and value is preserved; the minifier did
         // not run.
         assert!(out.contains("\"a\": 1"), "verbatim under override: {}", out);
@@ -1076,16 +1121,16 @@ mod tests {
     fn frontmatter_override_can_be_force_minified() {
         // `@minify` on a block overrides the document-level disable.
         let src = "+++\nminify_code = false\n+++\n```json @minify\n{\"a\": 1}\n```\n";
-        let (out, _) = render_with(src, Opts::default());
+        let (out, _) = render_with(src, Options::default());
         assert!(out.contains("{\"a\":1}"), "minified anyway: {}", out);
     }
 
     #[test]
     fn config_disable_minification_globally() {
         let src = "```json\n{\"a\": 1}\n```\n";
-        let opts = Opts {
+        let opts = Options {
             minify_code_blocks: false,
-            ..Opts::default()
+            ..Options::default()
         };
         let (out, _) = render_with(src, opts);
         assert!(out.contains("\"a\": 1"), "disabled globally: {}", out);
@@ -1094,9 +1139,9 @@ mod tests {
     #[test]
     fn drop_fence_with_preserve_false() {
         let src = "```json\n{\"a\": 1}\n```\n";
-        let opts = Opts {
+        let opts = Options {
             preserve_code_fences: false,
-            ..Opts::default()
+            ..Options::default()
         };
         let (out, _) = render_with(src, opts);
         assert!(!out.contains("```"), "fence dropped: {}", out);
@@ -1105,15 +1150,9 @@ mod tests {
 
     #[test]
     fn ref_renders_display_text_only_in_llm_mode() {
-        use crate::project::ProjectIndex;
-        use crate::resolve::{ResolveProject, resolve_with_project};
-        use std::collections::BTreeSet;
-        use std::path::PathBuf;
-
         // Parse + resolve with project so resolved_refs is populated.
         let src = "See @ref[other.brf#x](the spec).\n";
         let mut doc = {
-            use crate::{lexer, parser, span::SourceMap};
             let s = SourceMap::new("t.brf", src);
             let tokens = lexer::lex(&s).expect("lex");
             let (d, _) = parser::parse(tokens, &s);
@@ -1126,11 +1165,11 @@ mod tests {
             index: &idx,
             current: &PathBuf::from("here.brf"),
         };
-        let reg = crate::shortcode::Registry::with_builtins();
-        let _ = resolve_with_project(&mut doc, &reg, Some(&p));
+        let reg = Registry::with_builtins();
+        let _ = resolve::resolve_with_project(&mut doc, &reg, Some(&p));
 
-        let opts = Opts::default();
-        let (out, _warnings) = render(&doc, &reg, &opts);
+        let opts = Options::default();
+        let out = render(&doc, &reg, &opts).text;
         assert!(out.contains("the spec"), "got: {}", out);
         assert!(
             !out.contains("other.brf"),
@@ -1147,26 +1186,23 @@ mod tests {
     #[test]
     fn unresolved_ref_in_llm_falls_back_to_display_text() {
         let doc = {
-            use crate::{lexer, parser, span::SourceMap};
             let s = SourceMap::new("t.brf", "See @ref[a.brf](just text).\n");
             let tokens = lexer::lex(&s).expect("lex");
             let (d, _) = parser::parse(tokens, &s);
             d
         };
-        let reg = crate::shortcode::Registry::with_builtins();
-        let opts = Opts::default();
-        let (out, _) = render(&doc, &reg, &opts);
+        let reg = Registry::with_builtins();
+        let opts = Options::default();
+        let out = render(&doc, &reg, &opts).text;
         assert!(out.contains("just text"), "got: {}", out);
         assert!(!out.contains("a.brf"));
     }
 
     #[test]
     fn dl_renders_verbatim_brief_form() {
-        use crate::ast::{Block, DefinitionItem, Document, Inline, ShortArgs};
-        use crate::span::Span;
         let doc = Document {
             blocks: vec![Block::DefinitionList {
-                args: ShortArgs::default(),
+                args: ShortcodeArgs::default(),
                 items: vec![
                     DefinitionItem {
                         term: vec![Inline::Text {
@@ -1197,8 +1233,8 @@ mod tests {
             resolved_refs: Default::default(),
         };
         let reg = Registry::with_builtins();
-        let opts = Opts::default();
-        let (out, _w) = render(&doc, &reg, &opts);
+        let opts = Options::default();
+        let out = render(&doc, &reg, &opts).text;
         assert!(out.contains("@dl\n"), "got: {}", out);
         assert!(out.contains("Term1\n: Def1.\n"), "got: {}", out);
         assert!(out.contains("Term2\n: Def2.\n"), "got: {}", out);

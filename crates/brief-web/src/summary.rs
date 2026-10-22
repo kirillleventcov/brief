@@ -10,14 +10,18 @@ use brief::span::Span;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// One top-level item of the navigation, in document order.
 #[derive(Clone, Debug)]
 pub enum Entry {
+    /// A sidebar section divider, from a `##`-or-deeper heading.
     Section(String),
     Page(PageEntry),
 }
 
+/// A page in the navigation, with its nested sub-pages.
 #[derive(Clone, Debug)]
 pub struct PageEntry {
+    /// Source-relative path of the page's `.brf` file.
     pub path: PathBuf,
     pub title: String,
     /// The entry's `@ref` in `SUMMARY.brf`, for diagnostics about the entry
@@ -27,6 +31,8 @@ pub struct PageEntry {
 }
 
 impl PageEntry {
+    /// This entry followed by all its descendants, depth-first.
+    #[must_use]
     pub fn flatten(&self) -> Vec<&PageEntry> {
         let mut out = Vec::new();
         self.flatten_into(&mut out);
@@ -50,7 +56,8 @@ impl PageEntry {
 /// separators, no `.` or `..` segments, ends in `.brf`) and names a file
 /// that exists under the source root. A `@ref` that did not resolve has its
 /// own diagnostic and contributes no entry.
-pub fn extract(doc: &Document) -> Result<Vec<Entry>, String> {
+#[must_use]
+pub fn extract(doc: &Document) -> Vec<Entry> {
     let resolved = &doc.resolved_refs;
     let mut entries = Vec::new();
     for block in &doc.blocks {
@@ -63,7 +70,7 @@ pub fn extract(doc: &Document) -> Result<Vec<Entry>, String> {
             }
             Block::List { items, .. } => {
                 for it in items {
-                    if let Some(p) = parse_list_item(it, resolved)? {
+                    if let Some(p) = parse_list_item(it, resolved) {
                         entries.push(Entry::Page(p));
                     }
                 }
@@ -72,32 +79,27 @@ pub fn extract(doc: &Document) -> Result<Vec<Entry>, String> {
             _ => {}
         }
     }
-    Ok(entries)
+    entries
 }
 
-fn parse_list_item(
-    item: &ListItem,
-    resolved: &BTreeMap<Span, ResolvedRef>,
-) -> Result<Option<PageEntry>, String> {
-    let Some(page) = find_page_shortcode(&item.content, resolved) else {
-        return Ok(None);
-    };
+fn parse_list_item(item: &ListItem, resolved: &BTreeMap<Span, ResolvedRef>) -> Option<PageEntry> {
+    let page = find_page_shortcode(&item.content, resolved)?;
     let mut children = Vec::new();
     for child in &item.children {
         if let Block::List { items, .. } = child {
             for sub in items {
-                if let Some(p) = parse_list_item(sub, resolved)? {
+                if let Some(p) = parse_list_item(sub, resolved) {
                     children.push(p);
                 }
             }
         }
     }
-    Ok(Some(PageEntry {
+    Some(PageEntry {
         path: page.path,
         title: page.title,
         span: page.span,
         children,
-    }))
+    })
 }
 
 struct ParsedPage {
@@ -135,6 +137,9 @@ fn find_page_shortcode(
     None
 }
 
+/// The plain text of `inlines`, with all formatting dropped and hard breaks
+/// turned into spaces.
+#[must_use]
 pub fn inline_text(inlines: &[Inline]) -> String {
     let mut out = String::new();
     for n in inlines {
@@ -145,8 +150,7 @@ pub fn inline_text(inlines: &[Inline]) -> String {
 
 fn push_inline_text(n: &Inline, out: &mut String) {
     match n {
-        Inline::Text { value, .. } => out.push_str(value),
-        Inline::InlineCode { value, .. } => out.push_str(value),
+        Inline::Text { value, .. } | Inline::InlineCode { value, .. } => out.push_str(value),
         Inline::Bold { content, .. }
         | Inline::Italic { content, .. }
         | Inline::Underline { content, .. }
@@ -156,24 +160,25 @@ fn push_inline_text(n: &Inline, out: &mut String) {
             }
         }
         Inline::HardBreak { .. } => out.push(' '),
-        Inline::Shortcode { content, .. } => {
-            if let Some(c) = content {
-                for n in c {
-                    push_inline_text(n, out);
-                }
+        Inline::Shortcode {
+            content: Some(c), ..
+        } => {
+            for n in c {
+                push_inline_text(n, out);
             }
         }
+        _ => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brief::project::{Project, ProjectIndex};
+    use brief::project::{Checked, Project, ProjectIndex};
     use brief::span::SourceMap;
 
     /// Check `src` as `SUMMARY.brf` in a project holding `files`.
-    fn check(src: &str, files: &[&str]) -> brief::project::Checked {
+    fn check(src: &str, files: &[&str]) -> Checked {
         let index = ProjectIndex {
             anchors: files
                 .iter()
@@ -205,12 +210,12 @@ mod tests {
             &["intro.brf", "advanced.brf"],
         );
         assert!(!checked.has_errors(), "{:?}", checked.diagnostics);
-        let entries = extract(&checked.doc.unwrap()).unwrap();
+        let entries = extract(&checked.doc.unwrap());
         let pages = pages(&entries);
         assert_eq!(pages.len(), 2);
-        assert_eq!(pages[0].path, std::path::PathBuf::from("intro.brf"));
+        assert_eq!(pages[0].path, PathBuf::from("intro.brf"));
         assert_eq!(pages[0].title, "Introduction");
-        assert_eq!(pages[1].path, std::path::PathBuf::from("advanced.brf"));
+        assert_eq!(pages[1].path, PathBuf::from("advanced.brf"));
         assert_eq!(pages[1].title, "Advanced");
     }
 
@@ -234,7 +239,7 @@ mod tests {
                 &["intro.brf"],
             );
             assert!(checked.has_errors(), "{} should not resolve", target);
-            let entries = extract(&checked.doc.unwrap()).unwrap();
+            let entries = extract(&checked.doc.unwrap());
             let paths: Vec<_> = pages(&entries).iter().map(|p| p.path.clone()).collect();
             assert_eq!(paths, vec![PathBuf::from("intro.brf")], "{}", target);
         }

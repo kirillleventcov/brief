@@ -1,11 +1,26 @@
-use crate::ast::{Block, Document, Inline, ListItem, Row, ShortArgs};
+//! HTML emitter: renders a [`Document`] as an HTML fragment (no `<html>`
+//! or `<body>` wrapper), with footnotes collected into a trailing section.
+
+use crate::ast::{Block, Document, Inline, ListItem, ResolvedRef, Row, ShortcodeArgs, TaskState};
+use crate::emit::math;
+use crate::resolve;
 use crate::shortcode::{ArgValue, Registry};
+use crate::slug;
+use crate::span::Span;
+use std::collections::BTreeMap;
 use std::fmt::Write;
 
-pub fn render(doc: &Document, reg: &Registry) -> String {
+/// Renders `doc` as an HTML fragment.
+///
+/// Shortcodes with an `html` template in `registry` are expanded through it;
+/// the rest use the built-in rendering. `@ref` targets become links only
+/// when `doc.resolved_refs` has an entry for them (i.e. after
+/// project-aware resolution); otherwise just the display text is emitted.
+#[must_use]
+pub fn render(doc: &Document, registry: &Registry) -> String {
     let footnotes = collect_footnotes(doc);
-    let mut ctx = Ctx {
-        reg,
+    let mut ctx = Context {
+        registry,
         counter: 0,
         in_footnote: false,
         resolved_refs: &doc.resolved_refs,
@@ -15,19 +30,19 @@ pub fn render(doc: &Document, reg: &Registry) -> String {
         render_block(b, &mut ctx, &mut out);
     }
     if !footnotes.is_empty() {
-        emit_footnotes_section(&footnotes, reg, &doc.resolved_refs, &mut out);
+        emit_footnotes_section(&footnotes, registry, &doc.resolved_refs, &mut out);
     }
     out
 }
 
-struct Ctx<'a> {
-    reg: &'a Registry,
+struct Context<'render> {
+    registry: &'render Registry,
     counter: u32,
     in_footnote: bool,
-    resolved_refs: &'a std::collections::BTreeMap<crate::span::Span, crate::ast::ResolvedRef>,
+    resolved_refs: &'render BTreeMap<Span, ResolvedRef>,
 }
 
-fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
+fn render_block(block: &Block, ctx: &mut Context, out: &mut String) {
     match block {
         Block::Heading {
             level,
@@ -35,7 +50,7 @@ fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
             anchor,
             ..
         } => {
-            let id = crate::slug::heading_id(content, anchor.as_deref());
+            let id = slug::heading_id(content, anchor.as_deref());
             let _ = write!(out, "<h{} id=\"{}\">", level, escape_attr(&id));
             render_inline_seq(content, ctx, out);
             let _ = writeln!(out, "</h{}>", level);
@@ -103,7 +118,8 @@ fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
             children,
             ..
         } if name == "math" => {
-            render_math(true, args, &super::math_block_source(children), ctx, out);
+            let tex = math::block_source(children);
+            render_math(/* display */ true, args, &tex, ctx, out);
         }
         Block::BlockShortcode {
             name,
@@ -123,8 +139,7 @@ fn render_block(block: &Block, ctx: &mut Ctx, out: &mut String) {
     }
 }
 
-fn render_item(it: &ListItem, ctx: &mut Ctx, out: &mut String) {
-    use crate::ast::TaskState;
+fn render_item(it: &ListItem, ctx: &mut Context, out: &mut String) {
     match it.task {
         None => out.push_str("<li>"),
         Some(state) => {
@@ -146,15 +161,22 @@ fn render_item(it: &ListItem, ctx: &mut Ctx, out: &mut String) {
     out.push_str("</li>\n");
 }
 
-fn render_table(args: &ShortArgs, header: &Row, rows: &[Row], ctx: &mut Ctx, out: &mut String) {
+fn render_table(
+    args: &ShortcodeArgs,
+    header: &Row,
+    rows: &[Row],
+    ctx: &mut Context,
+    out: &mut String,
+) {
     // The parser rejects align values outside this set, but the renderer
     // must stay safe on any AST it's handed: these strings land in a style
     // attribute, so only whitelisted values may pass.
     let aligns: Vec<&str> = if let Some(ArgValue::Array(a)) = args.keyword.get("align") {
         a.iter()
-            .map(|v| match v.as_str() {
-                Some(s @ ("left" | "right" | "center")) => s,
-                _ => "left",
+            .map(|v| {
+                v.as_str()
+                    .filter(|s| matches!(*s, "left" | "right" | "center"))
+                    .unwrap_or("left")
             })
             .collect()
     } else {
@@ -181,13 +203,13 @@ fn render_table(args: &ShortArgs, header: &Row, rows: &[Row], ctx: &mut Ctx, out
     out.push_str("</tbody>\n</table>\n");
 }
 
-fn render_inline_seq(seq: &[Inline], ctx: &mut Ctx, out: &mut String) {
+fn render_inline_seq(seq: &[Inline], ctx: &mut Context, out: &mut String) {
     for n in seq {
         render_inline(n, ctx, out);
     }
 }
 
-fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
+fn render_inline(node: &Inline, ctx: &mut Context, out: &mut String) {
     match node {
         Inline::Text { value, .. } => escape_html_into(out, value),
         Inline::HardBreak { .. } => out.push_str("<br>"),
@@ -252,8 +274,8 @@ fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
             content,
             ..
         } if name == "math" => {
-            let tex = super::math_source(content.as_deref().unwrap_or_default());
-            render_math(false, args, &tex, ctx, out);
+            let tex = math::inline_source(content.as_deref().unwrap_or_default());
+            render_math(/* display */ false, args, &tex, ctx, out);
         }
         Inline::Shortcode {
             name,
@@ -298,17 +320,19 @@ fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String) {
 
 fn render_shortcode_html(
     name: &str,
-    args: &ShortArgs,
+    args: &ShortcodeArgs,
     inner: Option<&str>,
-    ctx: &mut Ctx,
+    ctx: &mut Context,
     out: &mut String,
 ) {
-    if let Some(sc) = ctx.reg.get(name) {
-        if let Some(t) = &sc.template_html {
-            let r = expand_template(t, args, inner.unwrap_or(""));
-            out.push_str(&r);
-            return;
-        }
+    if let Some(t) = ctx
+        .registry
+        .get(name)
+        .and_then(|sc| sc.template_html.as_ref())
+    {
+        let r = expand_template(t, args, inner.unwrap_or(""));
+        out.push_str(&r);
+        return;
     }
     match name {
         "link" => {
@@ -319,7 +343,7 @@ fn render_shortcode_html(
                 .unwrap_or("#");
             // Resolve rejects these with B0410; a caller that renders
             // anyway still must not get a script-carrying href.
-            if crate::resolve::disallowed_scheme(url).is_some() {
+            if resolve::disallowed_scheme(url).is_some() {
                 out.push_str(inner.unwrap_or(""));
                 return;
             }
@@ -352,7 +376,7 @@ fn render_shortcode_html(
                 .get("alt")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let src = if crate::resolve::disallowed_scheme(src).is_some() {
+            let src = if resolve::disallowed_scheme(src).is_some() {
                 ""
             } else {
                 src
@@ -379,9 +403,9 @@ fn render_shortcode_html(
                 .get("summary")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let _ = write!(
+            let _ = writeln!(
                 out,
-                "<details><summary>{}</summary>{}</details>\n",
+                "<details><summary>{}</summary>{}</details>",
                 escape_html(summary),
                 inner.unwrap_or("")
             );
@@ -392,9 +416,9 @@ fn render_shortcode_html(
                 .get("kind")
                 .and_then(|v| v.as_str())
                 .unwrap_or("info");
-            let _ = write!(
+            let _ = writeln!(
                 out,
-                "<aside class=\"callout callout-{}\">{}</aside>\n",
+                "<aside class=\"callout callout-{}\">{}</aside>",
                 escape_attr(kind),
                 inner.unwrap_or("")
             );
@@ -415,9 +439,13 @@ fn render_shortcode_html(
 
 /// `@math` bodies are raw TeX: escaped exactly once, never rendered as
 /// Brief inline content or wrapped in `<p>`.
-fn render_math(display: bool, args: &ShortArgs, tex: &str, ctx: &Ctx, out: &mut String) {
+fn render_math(display: bool, args: &ShortcodeArgs, tex: &str, ctx: &Context, out: &mut String) {
     let tex = escape_html(tex);
-    if let Some(t) = ctx.reg.get("math").and_then(|sc| sc.template_html.as_ref()) {
+    if let Some(t) = ctx
+        .registry
+        .get("math")
+        .and_then(|sc| sc.template_html.as_ref())
+    {
         out.push_str(&expand_template(t, args, &tex));
         return;
     }
@@ -428,7 +456,7 @@ fn render_math(display: bool, args: &ShortArgs, tex: &str, ctx: &Ctx, out: &mut 
     }
 }
 
-fn collect_footnotes(doc: &Document) -> Vec<Vec<Inline>> {
+fn collect_footnotes(doc: &Document) -> Vec<&[Inline]> {
     let mut out = Vec::new();
     for b in &doc.blocks {
         collect_block(b, &mut out);
@@ -436,7 +464,7 @@ fn collect_footnotes(doc: &Document) -> Vec<Vec<Inline>> {
     out
 }
 
-fn collect_block(b: &Block, out: &mut Vec<Vec<Inline>>) {
+fn collect_block<'doc>(b: &'doc Block, out: &mut Vec<&'doc [Inline]>) {
     match b {
         Block::Heading { content, .. } | Block::Paragraph { content, .. } => {
             for n in content {
@@ -486,7 +514,7 @@ fn collect_block(b: &Block, out: &mut Vec<Vec<Inline>>) {
     }
 }
 
-fn collect_inline(node: &Inline, out: &mut Vec<Vec<Inline>>) {
+fn collect_inline<'doc>(node: &'doc Inline, out: &mut Vec<&'doc [Inline]>) {
     match node {
         Inline::Bold { content, .. }
         | Inline::Italic { content, .. }
@@ -499,7 +527,7 @@ fn collect_inline(node: &Inline, out: &mut Vec<Vec<Inline>>) {
         Inline::Shortcode { name, content, .. } => {
             if name == "footnote" {
                 if let Some(c) = content {
-                    out.push(c.clone());
+                    out.push(c);
                 }
                 // Don't recurse into the body: nested footnote refs inside
                 // a footnote body render as plain text and are not numbered.
@@ -516,55 +544,59 @@ fn collect_inline(node: &Inline, out: &mut Vec<Vec<Inline>>) {
 }
 
 fn emit_footnotes_section(
-    footnotes: &[Vec<Inline>],
-    reg: &Registry,
-    resolved_refs: &std::collections::BTreeMap<crate::span::Span, crate::ast::ResolvedRef>,
+    footnotes: &[&[Inline]],
+    registry: &Registry,
+    resolved_refs: &BTreeMap<Span, ResolvedRef>,
     out: &mut String,
 ) {
     out.push_str("<hr class=\"footnotes-sep\">\n<ol class=\"footnotes\">\n");
     for (i, body) in footnotes.iter().enumerate() {
         let n = i + 1;
         let _ = write!(out, "<li id=\"fn-{}\">", n);
-        let mut ctx = Ctx {
-            reg,
+        let mut ctx = Context {
+            registry,
             counter: 0,
             in_footnote: true,
             resolved_refs,
         };
         render_inline_seq(body, &mut ctx, out);
-        let _ = write!(
+        let _ = writeln!(
             out,
-            " <a href=\"#fn-ref-{}\" class=\"fn-back\">\u{21A9}</a></li>\n",
+            " <a href=\"#fn-ref-{}\" class=\"fn-back\">\u{21A9}</a></li>",
             n
         );
     }
     out.push_str("</ol>\n");
 }
 
-pub(crate) fn expand_template(tpl: &str, args: &ShortArgs, content: &str) -> String {
+/// Expands `{{content}}` and `{{args.<key>}}` placeholders in an HTML
+/// shortcode template. `content` is inserted as-is (already rendered HTML);
+/// argument values are HTML-escaped. Unknown keys expand to nothing.
+pub(crate) fn expand_template(tpl: &str, args: &ShortcodeArgs, content: &str) -> String {
     let mut out = String::new();
     let bytes = tpl.as_bytes();
     let mut start = 0;
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{') {
-            if let Some(rel) = tpl[i + 2..].find("}}") {
-                // Literal text since the last placeholder is copied as a
-                // slice, which keeps multibyte UTF-8 intact (a byte-at-a-
-                // time `push(b as char)` would mangle it).
-                out.push_str(&tpl[start..i]);
-                let key = tpl[i + 2..i + 2 + rel].trim();
-                if key == "content" {
-                    out.push_str(content);
-                } else if let Some(rest) = key.strip_prefix("args.") {
-                    if let Some(v) = args.keyword.get(rest).and_then(|v| v.as_str()) {
-                        escape_html_into(&mut out, v);
-                    }
-                }
-                i = i + 2 + rel + 2;
-                start = i;
-                continue;
+        if bytes[i] == b'{'
+            && bytes.get(i + 1) == Some(&b'{')
+            && let Some(rel) = tpl[i + 2..].find("}}")
+        {
+            // Literal text since the last placeholder is copied as a
+            // slice, which keeps multibyte UTF-8 intact (a byte-at-a-
+            // time `push(b as char)` would mangle it).
+            out.push_str(&tpl[start..i]);
+            let key = tpl[i + 2..i + 2 + rel].trim();
+            if key == "content" {
+                out.push_str(content);
+            } else if let Some(rest) = key.strip_prefix("args.")
+                && let Some(v) = args.keyword.get(rest).and_then(|v| v.as_str())
+            {
+                escape_html_into(&mut out, v);
             }
+            i = i + 2 + rel + 2;
+            start = i;
+            continue;
         }
         i += 1;
     }
@@ -606,14 +638,19 @@ fn escape_attr(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::lex;
-    use crate::parser::parse;
+    use crate::ast::DefinitionItem;
+    use crate::diag::Code;
+    use crate::project::ProjectIndex;
+    use crate::resolve::ResolveProject;
     use crate::span::SourceMap;
+    use crate::{lexer, parser};
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     fn render_html(input: &str) -> String {
         let src = SourceMap::new("d.brf", input);
-        let toks = lex(&src).unwrap();
-        let (doc, diags) = parse(toks, &src);
+        let toks = lexer::lex(&src).unwrap();
+        let (doc, diags) = parser::parse(toks, &src);
         assert!(diags.is_empty(), "{:?}", diags);
         let reg = Registry::with_builtins();
         render(&doc, &reg)
@@ -627,8 +664,7 @@ mod tests {
         assert!(out.contains("<h1 id=\"doc\">Doc</h1>"), "{}", out);
     }
 
-    fn parse_doc(s: &str) -> crate::ast::Document {
-        use crate::{lexer, parser, span::SourceMap};
+    fn parse_doc(s: &str) -> Document {
         let src = SourceMap::new("t.brf", s);
         let tokens = lexer::lex(&src).expect("lex");
         let (doc, _) = parser::parse(tokens, &src);
@@ -637,11 +673,6 @@ mod tests {
 
     #[test]
     fn ref_lowers_to_anchor_using_resolved_refs() {
-        use crate::project::ProjectIndex;
-        use crate::resolve::{ResolveProject, resolve_with_project};
-        use std::collections::BTreeSet;
-        use std::path::PathBuf;
-
         let src = "See @ref[other.brf#top](the top).\n".to_string();
         let mut doc = parse_doc(&src);
         let mut idx = ProjectIndex {
@@ -654,8 +685,8 @@ mod tests {
             index: &idx,
             current: &PathBuf::from("here.brf"),
         };
-        let reg = crate::shortcode::Registry::with_builtins();
-        let _ = resolve_with_project(&mut doc, &reg, Some(&p));
+        let reg = Registry::with_builtins();
+        let _ = resolve::resolve_with_project(&mut doc, &reg, Some(&p));
         let html = render(&doc, &reg);
         assert!(
             html.contains("<a href=\"other.html#top\">the top</a>"),
@@ -666,10 +697,6 @@ mod tests {
 
     #[test]
     fn ref_without_anchor_lowers_to_html_with_no_fragment() {
-        use crate::project::ProjectIndex;
-        use crate::resolve::{ResolveProject, resolve_with_project};
-        use std::collections::BTreeSet;
-        use std::path::PathBuf;
         let mut doc = parse_doc("See @ref[a/b.brf](title).\n");
         let mut idx = ProjectIndex::default();
         idx.anchors.insert("a/b.brf".to_string(), BTreeSet::new());
@@ -677,8 +704,8 @@ mod tests {
             index: &idx,
             current: &PathBuf::from("here.brf"),
         };
-        let reg = crate::shortcode::Registry::with_builtins();
-        let _ = resolve_with_project(&mut doc, &reg, Some(&p));
+        let reg = Registry::with_builtins();
+        let _ = resolve::resolve_with_project(&mut doc, &reg, Some(&p));
         let html = render(&doc, &reg);
         assert!(
             html.contains("<a href=\"a/b.html\">title</a>"),
@@ -707,9 +734,6 @@ mod tests {
     }
 
     fn render_ref_from(current: &str, src: &str, files: &[(&str, &[&str])]) -> String {
-        use crate::project::ProjectIndex;
-        use crate::resolve::{ResolveProject, resolve_with_project};
-        use std::path::PathBuf;
         let mut doc = parse_doc(src);
         let mut idx = ProjectIndex::default();
         for (path, anchors) in files {
@@ -722,8 +746,8 @@ mod tests {
             index: &idx,
             current: &PathBuf::from(current),
         };
-        let reg = crate::shortcode::Registry::with_builtins();
-        let diags = resolve_with_project(&mut doc, &reg, Some(&p));
+        let reg = Registry::with_builtins();
+        let diags = resolve::resolve_with_project(&mut doc, &reg, Some(&p));
         assert!(diags.is_empty(), "{:?}", diags);
         render(&doc, &reg)
     }
@@ -753,7 +777,7 @@ mod tests {
                 "x @link[q](https://e.com/?a=1&b=\"2\"<i>) @image(src: \"a&b.png\", alt: \"<\\\"\")\n",
             );
             let reg = Registry::with_builtins();
-            let diags = crate::resolve::resolve(&mut d, &reg);
+            let diags = resolve::resolve(&mut d, &reg);
             assert!(diags.is_empty(), "{:?}", diags);
             d
         };
@@ -770,14 +794,11 @@ mod tests {
         let mut doc =
             parse_doc("x @link[me](JavaScript:alert(1)) @image(src: \"data:x\", alt: \"a\")\n");
         let reg = Registry::with_builtins();
-        let codes: Vec<_> = crate::resolve::resolve(&mut doc, &reg)
+        let codes: Vec<_> = resolve::resolve(&mut doc, &reg)
             .iter()
             .map(|d| d.code)
             .collect();
-        assert_eq!(
-            codes,
-            [crate::diag::Code::UnsafeUrl, crate::diag::Code::UnsafeUrl]
-        );
+        assert_eq!(codes, [Code::UnsafeUrl, Code::UnsafeUrl]);
         assert_eq!(render(&doc, &reg), "<p>x me <img src=\"\" alt=\"a\"></p>\n");
     }
 
@@ -785,7 +806,7 @@ mod tests {
     fn unresolved_ref_falls_back_to_display_text() {
         // No resolve_with_project call → resolved_refs stays empty.
         let doc = parse_doc("See @ref[any.brf](fallback).\n");
-        let reg = crate::shortcode::Registry::with_builtins();
+        let reg = Registry::with_builtins();
         let html = render(&doc, &reg);
         assert!(html.contains("fallback"), "got: {}", html);
         assert!(
@@ -797,11 +818,9 @@ mod tests {
 
     #[test]
     fn dl_renders_as_dl_dt_dd() {
-        use crate::ast::{Block, DefinitionItem, Document, Inline, ShortArgs};
-        use crate::span::Span;
         let doc = Document {
             blocks: vec![Block::DefinitionList {
-                args: ShortArgs::default(),
+                args: ShortcodeArgs::default(),
                 items: vec![DefinitionItem {
                     term: vec![Inline::Text {
                         value: "Term".into(),

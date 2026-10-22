@@ -3,15 +3,15 @@
 //! template and write `dist/`.
 
 use brief::ast::{Block, Document};
-use brief::diag::{Code, Diagnostic, Severity, render_all};
+use brief::config::Config;
+use brief::diag::{self, Code, Diagnostic, Severity};
 use brief::emit::html;
-use brief::project::{Project, ProjectIndex, read_source};
+use brief::project::{self, Project, ProjectIndex};
 use brief::span::{SourceMap, Span};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::{error, fmt, fs, slice};
 
 use crate::config::BookConfig;
 use crate::summary::{self, Entry, PageEntry};
@@ -22,6 +22,7 @@ pub struct BuildOutcome {
     pub pages_built: usize,
     /// Rendered warnings, one per diagnostic, rustc-style with positions.
     pub warnings: Vec<String>,
+    /// Heading anchors of every `.brf` file under the source directory.
     pub project_index: ProjectIndex,
 }
 
@@ -37,8 +38,10 @@ pub struct BuildError {
     pub message: String,
 }
 
-impl From<String> for BuildError {
-    fn from(message: String) -> Self {
+impl BuildError {
+    /// An error with a one-line `message` and no rendered diagnostics.
+    #[must_use]
+    pub fn new(message: String) -> Self {
         BuildError {
             report: String::new(),
             message,
@@ -46,9 +49,15 @@ impl From<String> for BuildError {
     }
 }
 
+impl From<String> for BuildError {
+    fn from(message: String) -> Self {
+        BuildError::new(message)
+    }
+}
+
 impl From<&str> for BuildError {
     fn from(message: &str) -> Self {
-        message.to_string().into()
+        BuildError::new(message.to_string())
     }
 }
 
@@ -61,6 +70,10 @@ impl fmt::Display for BuildError {
     }
 }
 
+impl error::Error for BuildError {}
+
+/// Builds one brief-web project: `book.toml` plus the sources under its
+/// `[build] src`, rendered into `[build] out`.
 #[derive(Clone)]
 pub struct Builder {
     pub project_dir: PathBuf,
@@ -72,39 +85,50 @@ pub struct Builder {
 }
 
 /// A checked site page. Rendered only once the whole site is clean.
-struct CheckedPage<'a> {
-    entry: &'a PageEntry,
+struct CheckedPage<'entry> {
+    entry: &'entry PageEntry,
     doc: Document,
     out_path: PathBuf,
 }
 
 impl Builder {
-    pub fn new(project_dir: impl AsRef<Path>) -> Result<Self, String> {
-        let project_dir = project_dir.as_ref().to_path_buf();
-        let config = BookConfig::load_from_dir(&project_dir)?;
-        Ok(Builder {
-            project_dir,
-            config,
-            inject_reload: false,
-            deny_warnings: false,
-        })
+    /// A builder for the project in `project_dir`, configured from its
+    /// `book.toml`.
+    ///
+    /// Fails with a human-readable message if `book.toml` cannot be read or
+    /// parsed.
+    pub fn try_new(project_dir: &Path) -> Result<Self, String> {
+        let config = BookConfig::load_from_dir(project_dir)?;
+        Ok(Builder::from_config(project_dir, config))
     }
 
-    pub fn from_config(project_dir: impl AsRef<Path>, config: BookConfig) -> Self {
+    /// A builder for the project in `project_dir` with an already-loaded
+    /// `config`.
+    #[must_use]
+    pub fn from_config(project_dir: &Path, config: BookConfig) -> Self {
         Builder {
-            project_dir: project_dir.as_ref().to_path_buf(),
+            project_dir: project_dir.to_path_buf(),
             config,
             inject_reload: false,
             deny_warnings: false,
         }
     }
 
+    /// The source directory: `[build] src` under the project directory.
+    #[must_use]
     pub fn src_dir(&self) -> PathBuf {
         self.project_dir.join(&self.config.build.src)
     }
+
+    /// The output directory: `[build] out` under the project directory.
+    #[must_use]
     pub fn out_dir(&self) -> PathBuf {
         self.project_dir.join(&self.config.build.out)
     }
+
+    /// The theme directory: `[site] theme` if set, else `theme/` under the
+    /// project directory if it exists.
+    #[must_use]
     pub fn theme_dir(&self) -> Option<PathBuf> {
         self.config
             .site
@@ -117,6 +141,11 @@ impl Builder {
             })
     }
 
+    /// Check every site page and, only if the whole site is clean (and, with
+    /// `deny_warnings`, warning-free), render it into the output directory.
+    ///
+    /// On failure the output directory is left untouched; the error carries
+    /// every diagnostic, rendered.
     pub fn build(&self) -> Result<BuildOutcome, BuildError> {
         let src = self.src_dir();
         if !src.exists() {
@@ -127,18 +156,20 @@ impl Builder {
 
         // 1. The compile context: built-ins plus book.toml's shortcodes, with
         //    `@ref` rooted at the source directory.
-        let mut brief_cfg = brief::config::Config::default();
-        brief_cfg.shortcodes = self.config.shortcodes.clone();
+        let brief_config = Config {
+            shortcodes: self.config.shortcodes.clone(),
+            ..Config::default()
+        };
         let project = Project::from_config(
             Some(src.clone()),
             Some(self.project_dir.join("book.toml")),
-            brief_cfg,
+            brief_config,
         );
         // The index is lenient and its own diagnostics are dropped: a broken
         // draft no page links to must not fail the site, a `@ref` into one
         // is B0605 at the `@ref`, and a site page's errors are reported when
         // the page itself is checked below.
-        let (project_index, _) = project.index().unwrap_or_default();
+        let project_index = project.index().unwrap_or_default().index;
         let mut report = Report::default();
 
         // 2. Decide between single-page and multi-page mode.
@@ -163,7 +194,7 @@ impl Builder {
                 Some(doc) if !report.has_errors() => doc,
                 _ => return Err(report.into_error(&out)),
             };
-            let entries = summary::extract(&doc)?;
+            let entries = summary::extract(&doc);
             let mut seen = BTreeSet::new();
             for e in &entries {
                 if let Entry::Page(p) = e {
@@ -221,12 +252,12 @@ impl Builder {
 
         // 4. Check every page. Nothing is written until the whole site is
         //    clean, so `serve` keeps the last good output after a bad edit.
-        let mut pages: Vec<CheckedPage> = Vec::with_capacity(flat.len());
+        let mut pages: Vec<CheckedPage<'_>> = Vec::with_capacity(flat.len());
         for entry in flat {
             let rel = rel_key(&entry.path);
             let out_path = output_path(&out, Path::new(&source_path_to_url(&entry.path)))?;
             let abs = src.join(&entry.path);
-            let page_src = match read_source(&abs) {
+            let page_src = match project::read_source(&abs) {
                 Ok(text) => SourceMap::new(abs.to_string_lossy(), text),
                 Err(e) => {
                     report.add_site_error(
@@ -287,7 +318,7 @@ impl Builder {
         } else {
             ""
         };
-        let site_title = theme::site_title(&self.config).to_string();
+        let site_title = theme::site_title(&self.config);
         let mut rendered: Vec<(&Path, String)> = Vec::with_capacity(pages.len());
         for page in &pages {
             // Content hrefs are written as the emitter produced them: `@ref`
@@ -298,7 +329,7 @@ impl Builder {
             let ctx = PageContext {
                 title: &title,
                 description: &description,
-                site_title: &site_title,
+                site_title,
                 content_html: &body_html,
                 sidebar_html: &sidebar_html,
                 base_url: &self.config.site.base_url,
@@ -355,7 +386,7 @@ struct Report {
 impl Report {
     fn add(&mut self, rel: &str, src: &SourceMap, diags: &[Diagnostic]) {
         for d in diags {
-            let text = render_all(std::slice::from_ref(d), src);
+            let text = diag::render_all(slice::from_ref(d), src);
             match d.severity {
                 Severity::Error => self.note_error(rel),
                 Severity::Warning => {
@@ -429,7 +460,8 @@ fn render_site_error(
     label: &str,
     help: &str,
 ) -> String {
-    let (line, col) = src.line_col(span.start);
+    let position = src.line_column(span.start);
+    let (line, col) = (position.line, position.column);
     let line_text = src.line_text(line);
     let pad = " ".repeat(col - 1);
     let remaining = line_text.chars().count().saturating_sub(col - 1).max(1);
@@ -441,17 +473,19 @@ fn render_site_error(
 }
 
 fn load_source(path: &Path) -> Result<SourceMap, String> {
-    let text = read_source(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    let text =
+        project::read_source(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
     Ok(SourceMap::new(path.to_string_lossy(), text))
 }
 
 /// The forward-slash, source-relative key `ProjectIndex` and
 /// `ResolvedRef::target_path` use for a page.
 fn rel_key(path: &Path) -> String {
-    path.components()
+    let parts: Vec<_> = path
+        .components()
         .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+        .collect();
+    parts.join("/")
 }
 
 /// `rel` joined onto the output directory, refused unless it stays inside.
@@ -503,8 +537,6 @@ fn source_path_to_url(path: &Path) -> String {
         .to_string();
     if stripped == "index" {
         "index.html".to_string()
-    } else if stripped.ends_with("/index") {
-        format!("{}.html", stripped)
     } else {
         format!("{}.html", stripped)
     }
@@ -542,15 +574,15 @@ fn render_sidebar(entries: &[Entry], titles: &BTreeMap<PathBuf, String>) -> Stri
 }
 
 fn render_page_li(p: &PageEntry, titles: &BTreeMap<PathBuf, String>, out: &mut String) {
-    let title = titles
-        .get(&p.path)
-        .cloned()
-        .unwrap_or_else(|| p.title.clone());
+    let title = titles.get(&p.path).unwrap_or(&p.title);
     out.push_str("<li>");
     out.push_str("<a href=\"");
-    out.push_str(&escape_attr(&format!("/{}", source_path_to_url(&p.path))));
+    out.push_str(&theme::escape_text(&format!(
+        "/{}",
+        source_path_to_url(&p.path)
+    )));
     out.push_str("\">");
-    out.push_str(&escape_html(&title));
+    out.push_str(&escape_html(title));
     out.push_str("</a>");
     if !p.children.is_empty() {
         out.push_str("<ul>");
@@ -573,7 +605,7 @@ fn copy_assets(src: &Path, out: &Path) -> Result<(), String> {
                 walk(&path, src_root, out_root)?;
             } else {
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if name.ends_with(".brf") || name == "SUMMARY.brf" {
+                if name.ends_with(".brf") {
                     continue;
                 }
                 let rel = path
@@ -596,12 +628,12 @@ fn copy_assets(src: &Path, out: &Path) -> Result<(), String> {
 
 fn derive_page_title(doc: &Document, fallback: &str) -> String {
     for b in &doc.blocks {
-        if let Block::Heading { content, level, .. } = b {
-            if *level == 1 {
-                let t = summary::inline_text(content).trim().to_string();
-                if !t.is_empty() {
-                    return t;
-                }
+        if let Block::Heading { content, level, .. } = b
+            && *level == 1
+        {
+            let t = summary::inline_text(content).trim().to_string();
+            if !t.is_empty() {
+                return t;
             }
         }
     }
@@ -643,24 +675,9 @@ fn escape_html(s: &str) -> String {
     out
 }
 
-fn escape_attr(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     fn write(p: &Path, content: &str) {
         if let Some(parent) = p.parent() {
@@ -692,7 +709,7 @@ mod tests {
             "# Other Title\n\n## Section {#sec}\n\nbody.\n",
         );
 
-        let builder = Builder::new(project).unwrap();
+        let builder = Builder::try_new(project).unwrap();
         let outcome = builder.build().unwrap();
         assert!(outcome.pages_built >= 2);
         assert!(
@@ -728,7 +745,7 @@ mod tests {
     }
 
     fn build_err(project: &Path) -> BuildError {
-        match Builder::new(project).unwrap().build() {
+        match Builder::try_new(project).unwrap().build() {
             Ok(_) => panic!("expected the build to fail"),
             Err(e) => e,
         }
@@ -766,13 +783,13 @@ mod tests {
             "src/index.brf",
             "# Home\n\n@callout(kind: info)\nBody.\n@end\n",
         )]);
-        let outcome = Builder::new(td.path()).unwrap().build().unwrap();
+        let outcome = Builder::try_new(td.path()).unwrap().build().unwrap();
         assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
         assert!(outcome.warnings[0].contains("warning[B0408]"));
         assert!(outcome.warnings[0].contains("src/index.brf:3:1"));
 
         fs::remove_dir_all(td.path().join("dist")).unwrap();
-        let mut builder = Builder::new(td.path()).unwrap();
+        let mut builder = Builder::try_new(td.path()).unwrap();
         builder.deny_warnings = true;
         let err = match builder.build() {
             Ok(_) => panic!("warnings should fail under deny_warnings"),
@@ -790,7 +807,7 @@ mod tests {
     #[test]
     fn failed_rebuild_keeps_the_last_good_output() {
         let td = site(&[("src/index.brf", "# Home\n\nfirst version\n")]);
-        let builder = Builder::new(td.path()).unwrap();
+        let builder = Builder::try_new(td.path()).unwrap();
         builder.build().unwrap();
         write(
             &td.path().join("src/index.brf"),
@@ -808,7 +825,7 @@ mod tests {
             ("src/index.brf", "# Home\n\nText.\n"),
             ("src/wip.brf", "*unfinished\n"),
         ]);
-        let outcome = Builder::new(td.path()).unwrap().build().unwrap();
+        let outcome = Builder::try_new(td.path()).unwrap().build().unwrap();
         assert_eq!(outcome.pages_built, 1);
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
     }
@@ -901,7 +918,7 @@ mod tests {
                 "# Home\n\n@link[mail](mailto:a@example.com) and @bad[x]\n",
             ),
         ]);
-        let outcome = Builder::new(td.path()).unwrap().build().unwrap();
+        let outcome = Builder::try_new(td.path()).unwrap().build().unwrap();
         assert_eq!(outcome.pages_built, 1);
         let html = fs::read_to_string(td.path().join("dist/index.html")).unwrap();
         // An unclosed quote as the last one on the page used to panic the

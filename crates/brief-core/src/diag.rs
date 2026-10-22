@@ -1,13 +1,21 @@
-use crate::span::{SourceMap, Span};
-use std::fmt::Write;
+//! Compiler diagnostics: stable `B0NNN` codes, the [`Diagnostic`] record
+//! every pass reports, and rustc-style plain-text rendering.
 
+use crate::span::{LineColumn, SourceMap, Span};
+use std::fmt;
+
+/// How serious a [`Diagnostic`] is. Errors fail compilation; warnings do not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     Error,
     Warning,
 }
 
+/// A stable diagnostic code. The discriminant is the number shown as
+/// `B0NNN` (see the [`Display`](fmt::Display) impl); the hundreds digit is
+/// the compiler phase that reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Code {
     InvalidUtf8 = 101,
     TabCharacter = 102,
@@ -131,10 +139,8 @@ impl Code {
         Code::RefusedLanguage,
     ];
 
-    pub fn as_str(self) -> String {
-        format!("B{:04}", self as u32)
-    }
-
+    /// One-line summary shown in the diagnostic header.
+    #[must_use]
     pub fn message(self) -> &'static str {
         use Code::*;
         match self {
@@ -201,6 +207,7 @@ impl Code {
 
     /// Long-form explanation shown by `brief explain <CODE>` and in-editor
     /// hovers. Exhaustive: a new variant will not compile until it has one.
+    #[must_use]
     pub fn explain(self) -> &'static str {
         use Code::*;
         match self {
@@ -370,6 +377,15 @@ impl Code {
     }
 }
 
+/// Formats the code as shown to users, e.g. `B0104`.
+impl fmt::Display for Code {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "B{:04}", *self as u32)
+    }
+}
+
+/// One problem found in a source file: what (`code`), where (`span`), and
+/// optional extra text for the caret line (`label`) and a `help:` note.
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
     pub code: Code,
@@ -380,6 +396,8 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
+    /// An error-severity diagnostic with no label or help.
+    #[must_use]
     pub fn new(code: Code, span: Span) -> Self {
         Diagnostic {
             code,
@@ -389,6 +407,9 @@ impl Diagnostic {
             severity: Severity::Error,
         }
     }
+
+    /// A warning-severity diagnostic with no label or help.
+    #[must_use]
     pub fn warning(code: Code, span: Span) -> Self {
         Diagnostic {
             code,
@@ -398,41 +419,46 @@ impl Diagnostic {
             severity: Severity::Warning,
         }
     }
+
+    /// Sets the text printed after the carets.
+    #[must_use]
     pub fn label(mut self, s: impl Into<String>) -> Self {
         self.label = Some(s.into());
         self
     }
+
+    /// Sets the `help:` note printed below the source excerpt.
+    #[must_use]
     pub fn help(mut self, s: impl Into<String>) -> Self {
         self.help = Some(s.into());
         self
     }
 }
 
+/// Renders `diag` rustc-style: a header line, the file position, the source
+/// line with carets under the span, and the help note if any.
+#[must_use]
 pub fn render(diag: &Diagnostic, src: &SourceMap) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::new();
-    let (line, col) = src.line_col(diag.span.start);
+    let LineColumn { line, column: col } = src.line_column(diag.span.start);
     let prefix = match diag.severity {
         Severity::Error => "error",
         Severity::Warning => "warning",
     };
-    let _ = writeln!(
-        out,
-        "{}[{}]: {}",
-        prefix,
-        diag.code.as_str(),
-        diag.code.message()
-    );
+    let _ = writeln!(out, "{}[{}]: {}", prefix, diag.code, diag.code.message());
     let _ = writeln!(out, "  --> {}:{}:{}", src.path, line, col);
     let _ = writeln!(out, "   |");
     let line_text = src.line_text(line);
     let _ = writeln!(out, "{:>3} | {}", line, line_text);
-    let pad: String = std::iter::repeat(' ').take(col.saturating_sub(1)).collect();
+    let pad = " ".repeat(col.saturating_sub(1));
     let line_remaining = line_text
         .chars()
         .count()
         .saturating_sub(col.saturating_sub(1));
     let caret_len = (diag.span.len as usize).max(1).min(line_remaining.max(1));
-    let carets: String = std::iter::repeat('^').take(caret_len).collect();
+    let carets = "^".repeat(caret_len);
     let label = diag.label.as_deref().unwrap_or("");
     let _ = writeln!(out, "   | {}{} {}", pad, carets, label);
     if let Some(help) = &diag.help {
@@ -442,12 +468,11 @@ pub fn render(diag: &Diagnostic, src: &SourceMap) -> String {
     out
 }
 
+/// Renders every diagnostic with [`render`], separated by blank lines.
+#[must_use]
 pub fn render_all(diags: &[Diagnostic], src: &SourceMap) -> String {
-    diags
-        .iter()
-        .map(|d| render(d, src))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let rendered: Vec<String> = diags.iter().map(|d| render(d, src)).collect();
+    rendered.join("\n")
 }
 
 #[cfg(test)]
@@ -469,10 +494,10 @@ mod tests {
     #[test]
     fn ref_codes_render_with_correct_prefix() {
         use Code::*;
-        assert_eq!(RefMissingFile.as_str(), "B0601");
-        assert_eq!(RefMissingAnchor.as_str(), "B0602");
-        assert_eq!(RefBadTarget.as_str(), "B0603");
-        assert_eq!(RefNoProject.as_str(), "B0604");
+        assert_eq!(RefMissingFile.to_string(), "B0601");
+        assert_eq!(RefMissingAnchor.to_string(), "B0602");
+        assert_eq!(RefBadTarget.to_string(), "B0603");
+        assert_eq!(RefNoProject.to_string(), "B0604");
         assert!(RefMissingFile.message().contains("file"));
         assert!(RefMissingAnchor.message().contains("anchor"));
         assert!(RefBadTarget.message().contains("target"));
@@ -482,7 +507,7 @@ mod tests {
     #[test]
     fn bad_definition_list_code_renders() {
         use Code::*;
-        assert_eq!(BadDefinitionList.as_str(), "B0505");
+        assert_eq!(BadDefinitionList.to_string(), "B0505");
         assert!(BadDefinitionList.message().contains("definition list"));
     }
 }

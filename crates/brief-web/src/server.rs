@@ -6,71 +6,104 @@
 //! used during local development.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::ffi::OsString;
+use std::fs;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 /// Broadcast channel over which build completions are announced. Each
 /// connected SSE client owns one Receiver; the watcher thread pushes
 /// `ReloadEvent::Reload` into the broadcaster.
-#[derive(Clone)]
+///
+/// Clones share one subscriber list: the watcher thread broadcasts while
+/// every connection thread subscribes, so the list is behind `Arc<Mutex>`.
+#[derive(Clone, Default)]
 pub struct ReloadBroadcaster {
-    inner: Arc<Mutex<Vec<Sender<ReloadEvent>>>>,
+    subscribers: Arc<Mutex<Vec<Sender<ReloadEvent>>>>,
 }
 
+/// What the dev server tells connected browsers after a rebuild.
 #[derive(Clone, Debug)]
 pub enum ReloadEvent {
+    /// The site was rebuilt; reload the page.
     Reload,
+    /// The rebuild failed with this one-line message; the old output stays.
     BuildError(String),
 }
 
 impl ReloadBroadcaster {
+    /// A broadcaster with no subscribers.
+    #[must_use]
     pub fn new() -> Self {
-        ReloadBroadcaster {
-            inner: Arc::new(Mutex::new(Vec::new())),
-        }
+        Self::default()
     }
 
+    /// Register a new subscriber that receives every later broadcast.
+    ///
+    /// # Panics
+    ///
+    /// If another thread panicked while holding the subscriber list, which
+    /// only `push`/`retain`/`send` ever do and which do not panic.
+    #[must_use]
     pub fn subscribe(&self) -> Receiver<ReloadEvent> {
         let (tx, rx) = channel();
-        self.inner.lock().unwrap().push(tx);
+        self.subscribers
+            .lock()
+            .expect("subscriber list holders never panic")
+            .push(tx);
         rx
     }
 
+    /// Send `ev` to every live subscriber, dropping those that hung up.
+    ///
+    /// # Panics
+    ///
+    /// If another thread panicked while holding the subscriber list, which
+    /// only `push`/`retain`/`send` ever do and which do not panic.
     pub fn broadcast(&self, ev: ReloadEvent) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.retain(|tx| tx.send(ev.clone()).is_ok());
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .expect("subscriber list holders never panic");
+        subscribers.retain(|tx| tx.send(ev.clone()).is_ok());
     }
 }
 
+/// Where and what the dev server serves.
 pub struct ServerOptions {
     pub host: String,
     pub port: u16,
+    /// Directory served at `/`, normally the build output.
     pub root: PathBuf,
+    /// Source of the events sent to SSE clients.
     pub broadcaster: ReloadBroadcaster,
 }
 
 /// Start the dev server. Blocks the caller's thread by accepting connections;
 /// each connection runs on its own thread.
-pub fn run(opts: ServerOptions) -> Result<(), String> {
-    let bind = format!("{}:{}", opts.host, opts.port);
+///
+/// Fails with a human-readable message if the address cannot be bound.
+pub fn run(options: ServerOptions) -> Result<(), String> {
+    let bind = format!("{}:{}", options.host, options.port);
     let listener = TcpListener::bind(&bind).map_err(|e| format!("bind {}: {}", bind, e))?;
     listener
         .set_nonblocking(false)
         .map_err(|e| format!("set_nonblocking: {}", e))?;
     eprintln!(
         "brief-web: serving {} at http://{}",
-        opts.root.display(),
+        options.root.display(),
         bind
     );
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let root = opts.root.clone();
-                let bcast = opts.broadcaster.clone();
+                let root = options.root.clone();
+                let bcast = options.broadcaster.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle(stream, &root, &bcast) {
                         eprintln!("brief-web: connection error: {}", e);
@@ -83,15 +116,10 @@ pub fn run(opts: ServerOptions) -> Result<(), String> {
     Ok(())
 }
 
-fn handle(
-    mut stream: TcpStream,
-    root: &Path,
-    broadcaster: &ReloadBroadcaster,
-) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
-    let req = match read_request(&mut stream)? {
-        Some(r) => r,
-        None => return Ok(()),
+fn handle(mut stream: TcpStream, root: &Path, broadcaster: &ReloadBroadcaster) -> io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let Some(req) = read_request(&mut stream)? else {
+        return Ok(());
     };
 
     if req.path == "/__brief_web_events" {
@@ -123,7 +151,7 @@ fn handle(
     serve_file(&mut stream, &full)
 }
 
-fn handle_sse(mut stream: TcpStream, bcast: &ReloadBroadcaster) -> std::io::Result<()> {
+fn handle_sse(mut stream: TcpStream, bcast: &ReloadBroadcaster) -> io::Result<()> {
     let headers = "HTTP/1.1 200 OK\r\n\
         Content-Type: text/event-stream\r\n\
         Cache-Control: no-cache\r\n\
@@ -158,14 +186,12 @@ fn handle_sse(mut stream: TcpStream, bcast: &ReloadBroadcaster) -> std::io::Resu
     Ok(())
 }
 
+/// The parts of an HTTP request the server routes on.
 struct Request {
-    method: String,
     path: String,
-    #[allow(dead_code)]
-    headers: HashMap<String, String>,
 }
 
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     let n = reader.read_line(&mut line)?;
@@ -176,7 +202,6 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
     if parts.len() < 2 {
         return Ok(None);
     }
-    let method = parts[0].to_string();
     let path = parts[1].to_string();
     let mut headers = HashMap::new();
     loop {
@@ -197,15 +222,11 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
         let mut buf = vec![0u8; len.min(1 << 16)];
         let _ = reader.read_exact(&mut buf);
     }
-    Ok(Some(Request {
-        method,
-        path,
-        headers,
-    }))
+    Ok(Some(Request { path }))
 }
 
-fn serve_file(stream: &mut TcpStream, path: &Path) -> std::io::Result<()> {
-    let bytes = std::fs::read(path)?;
+fn serve_file(stream: &mut TcpStream, path: &Path) -> io::Result<()> {
+    let bytes = fs::read(path)?;
     let mime = mime_for(path);
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
@@ -218,12 +239,7 @@ fn serve_file(stream: &mut TcpStream, path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_simple(
-    stream: &mut TcpStream,
-    status: u16,
-    mime: &str,
-    body: &[u8],
-) -> std::io::Result<()> {
+fn write_simple(stream: &mut TcpStream, status: u16, mime: &str, body: &[u8]) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         403 => "Forbidden",
@@ -267,23 +283,23 @@ fn strip_query(p: &str) -> &str {
 }
 
 fn is_within(child: &Path, parent: &Path) -> bool {
-    let cc = match dunce_canon(child) {
-        Some(p) => p,
-        None => return false,
+    let Some(cc) = canonicalize_lenient(child) else {
+        return false;
     };
-    let pp = match dunce_canon(parent) {
-        Some(p) => p,
-        None => return false,
+    let Some(pp) = canonicalize_lenient(parent) else {
+        return false;
     };
     cc.starts_with(&pp)
 }
 
-fn dunce_canon(p: &Path) -> Option<PathBuf> {
+/// `p` canonicalized, or — when `p` does not exist — its nearest existing
+/// ancestor canonicalized with the missing tail re-attached.
+fn canonicalize_lenient(p: &Path) -> Option<PathBuf> {
     // We avoid pulling in the `dunce` crate; canonicalize is good enough on
     // unix targets and acceptable for a development-only server.
     p.canonicalize().ok().or_else(|| {
         // Walk parents until we find one that exists, then re-attach the tail.
-        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut tail: Vec<OsString> = Vec::new();
         let mut cur = p.to_path_buf();
         while !cur.exists() {
             let name = cur.file_name()?.to_os_string();
@@ -296,9 +312,4 @@ fn dunce_canon(p: &Path) -> Option<PathBuf> {
         }
         Some(anchor)
     })
-}
-
-#[allow(dead_code)]
-fn _quiet(req: &Request) -> &str {
-    &req.method
 }

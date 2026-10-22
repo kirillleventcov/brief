@@ -20,14 +20,33 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tower_lsp_server::{Client, LanguageServer, jsonrpc::Result, ls_types::*};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::{
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
+    CompletionTextEdit, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
+    MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, Position, Range,
+    ReferenceParams, ServerCapabilities, ServerInfo, SymbolKind, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
+};
+use tower_lsp_server::{Client, LanguageServer};
 use tracing::{info, warn};
 
 // The crate is named `brief-core` in Cargo.toml but the Rust crate name
 // (lib.name) is `brief` — match that.
-use brief::{diag::Severity, fmt, shortcode::ShortKindOpt};
+use brief::ast::Document;
+use brief::diag::{self, Severity};
+use brief::shortcode::{Registry, ShortcodeKind};
+use brief::span::SourceMap;
+use brief::{fmt, lexer, parser, project};
 
-use crate::analysis::{self, Analysis, BufferEntry, CompletionCtx, ProjectSnapshot};
+use crate::analysis::{
+    self, Analysis, BufferEntry, CompletionContext, HeadingInfo, ProjectSnapshot, RefTarget,
+    SymbolNode,
+};
 
 // ---------------------------------------------------------------------------
 // Span → LSP Range conversion (UTF-16)
@@ -54,7 +73,7 @@ fn byte_offset_to_lsp_position(text: &str, byte_offset: usize) -> Position {
             character = 0;
         } else {
             // UTF-16 code units: BMP plane → 1 unit, supplementary → 2 units.
-            let units = if (ch as u32) > 0xFFFF { 2 } else { 1 };
+            let units = if (ch as u32) > 0xffff { 2 } else { 1 };
             character += units;
         }
     }
@@ -79,9 +98,9 @@ fn span_to_lsp_range(text: &str, start: u32, len: u32) -> Range {
 // ---------------------------------------------------------------------------
 
 /// Convert one brief-core diagnostic into its LSP form against `text`.
-fn to_lsp_diagnostic(text: &str, d: &brief::diag::Diagnostic) -> Diagnostic {
+fn to_lsp_diagnostic(text: &str, d: &diag::Diagnostic) -> Diagnostic {
     let range = span_to_lsp_range(text, d.span.start, d.span.len);
-    let code_str = d.code.as_str();
+    let code_str = d.code.to_string();
     let message = match &d.label {
         Some(label) => format!("{}: {} ({})", code_str, label, d.code.message()),
         None => format!("{}: {}", code_str, d.code.message()),
@@ -116,24 +135,43 @@ struct DocState {
     entry: BufferEntry,
 }
 
-/// (buffer text, filesystem path, project snapshot, pipeline result) for
-/// one open document — what every request handler starts from.
-type AnalyzedDoc = (
-    String,
-    Option<PathBuf>,
-    Option<Arc<ProjectSnapshot>>,
-    Analysis,
-);
+/// One open document after a pipeline run — what every request handler
+/// starts from.
+struct AnalyzedDoc {
+    /// Buffer text the analysis ran on.
+    text: String,
+    /// Filesystem path, as in `DocState::path`.
+    path: Option<PathBuf>,
+    /// Project snapshot for the document's root, if it has one.
+    snapshot: Option<Arc<ProjectSnapshot>>,
+    analysis: Analysis,
+}
 
+/// Whether a request may reuse the cached project snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotMode {
+    /// Reuse the cached snapshot; build one only if nothing is cached.
+    Cached,
+    /// Rebuild the snapshot from disk (file open and save).
+    Rebuild,
+}
+
+/// The tower-lsp language server: open documents plus cached project
+/// snapshots, shared by concurrently running request handlers.
 #[derive(Debug)]
 pub struct Backend {
     client: Client,
     docs: DashMap<Uri, DocState>,
     /// Project snapshots keyed by root (the directory with `brief.toml`).
+    /// `Arc` because handlers run concurrently and keep using a snapshot
+    /// across `.await` points, after the `DashMap` guard must be released
+    /// (holding it would block writers); a rebuild swaps in a new `Arc`
+    /// without invalidating snapshots in use.
     snapshots: DashMap<PathBuf, Arc<ProjectSnapshot>>,
 }
 
 impl Backend {
+    /// Create a backend with no open documents that reports to `client`.
     pub fn new(client: Client) -> Self {
         Self {
             client,
@@ -147,15 +185,16 @@ impl Backend {
         Some(p.canonicalize().unwrap_or(p))
     }
 
-    /// Cached project snapshot for the root above `path`, rebuilding it
-    /// when `refresh` is set or nothing is cached yet.
-    fn snapshot_for(&self, path: &Path, refresh: bool) -> Option<Arc<ProjectSnapshot>> {
-        let root = brief::project::discover_root(path)?;
-        if !refresh && let Some(s) = self.snapshots.get(&root) {
-            return Some(s.clone());
+    /// Project snapshot for the root above `path`, per `mode`.
+    fn snapshot_for(&self, path: &Path, mode: SnapshotMode) -> Option<Arc<ProjectSnapshot>> {
+        let root = project::discover_root(path)?;
+        if mode == SnapshotMode::Cached
+            && let Some(s) = self.snapshots.get(&root)
+        {
+            return Some(Arc::clone(&s));
         }
-        let snap = Arc::new(analysis::load_snapshot(&root));
-        self.snapshots.insert(root, snap.clone());
+        let snap = Arc::new(ProjectSnapshot::load(&root));
+        self.snapshots.insert(root, Arc::clone(&snap));
         Some(snap)
     }
 
@@ -170,7 +209,7 @@ impl Backend {
             let Some(p) = &entry.value().path else {
                 continue;
             };
-            if let Some(rel) = analysis::rel_path(root, p) {
+            if let Some(rel) = analysis::relative_path(root, p) {
                 overlay.insert(rel, entry.value().entry.clone());
             }
         }
@@ -179,14 +218,12 @@ impl Backend {
 
     /// Run the full compile pipeline over an open document and refresh its
     /// cached anchors. Returns everything a handler needs.
-    fn analyze_doc(&self, uri: &Uri, refresh_snapshot: bool) -> Option<AnalyzedDoc> {
+    fn analyze_doc(&self, uri: &Uri, mode: SnapshotMode) -> Option<AnalyzedDoc> {
         let (text, path) = {
             let state = self.docs.get(uri)?;
             (state.text.clone(), state.path.clone())
         };
-        let snapshot = path
-            .as_deref()
-            .and_then(|p| self.snapshot_for(p, refresh_snapshot));
+        let snapshot = path.as_deref().and_then(|p| self.snapshot_for(p, mode));
         let overlay = match &snapshot {
             Some(s) => self.overlay_for(&s.root, uri),
             None => BTreeMap::new(),
@@ -196,12 +233,23 @@ impl Backend {
         if let Some(mut state) = self.docs.get_mut(uri) {
             state.entry = analysis.entry.clone();
         }
-        Some((text, path, snapshot, analysis))
+        Some(AnalyzedDoc {
+            text,
+            path,
+            snapshot,
+            analysis,
+        })
     }
 
     /// Analyze and push `textDocument/publishDiagnostics`.
-    async fn publish_diagnostics_for(&self, uri: Uri, refresh_snapshot: bool) {
-        let Some((text, _, snapshot, analysis)) = self.analyze_doc(&uri, refresh_snapshot) else {
+    async fn publish_diagnostics_for(&self, uri: Uri, mode: SnapshotMode) {
+        let Some(AnalyzedDoc {
+            text,
+            snapshot,
+            analysis,
+            ..
+        }) = self.analyze_doc(&uri, mode)
+        else {
             return;
         };
 
@@ -241,7 +289,7 @@ impl Backend {
                 return Some(entry.value().text.clone());
             }
         }
-        brief::project::read_source(path).ok()
+        project::read_source(path).ok()
     }
 
     /// Every open document under `root`, except `skip`.
@@ -253,7 +301,7 @@ impl Backend {
                 e.value()
                     .path
                     .as_deref()
-                    .is_some_and(|p| analysis::rel_path(root, p).is_some())
+                    .is_some_and(|p| analysis::relative_path(root, p).is_some())
             })
             .map(|e| e.key().clone())
             .collect()
@@ -261,11 +309,11 @@ impl Backend {
 
     /// Parse the file at `path` (buffer first, then disk). Best-effort:
     /// parse errors still yield a partial document.
-    fn parse_path(&self, path: &Path) -> Option<(String, brief::ast::Document)> {
+    fn parse_path(&self, path: &Path) -> Option<(String, Document)> {
         let text = self.text_for_path(path)?;
-        let src = brief::span::SourceMap::new(path.to_string_lossy(), text.clone());
-        let tokens = brief::lexer::lex(&src).ok()?;
-        let (doc, _) = brief::parser::parse(tokens, &src);
+        let src = SourceMap::new(path.to_string_lossy(), text.clone());
+        let tokens = lexer::lex(&src).ok()?;
+        let (doc, _) = parser::parse(tokens, &src);
         Some((text, doc))
     }
 }
@@ -343,7 +391,8 @@ impl LanguageServer for Backend {
         );
         // Rebuild the project snapshot on open so the index reflects the
         // state of the world when the user starts editing.
-        self.publish_diagnostics_for(uri, true).await;
+        self.publish_diagnostics_for(uri, SnapshotMode::Rebuild)
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -360,16 +409,20 @@ impl LanguageServer for Backend {
             }
             None => return,
         };
-        self.publish_diagnostics_for(uri.clone(), false).await;
+        self.publish_diagnostics_for(uri.clone(), SnapshotMode::Cached)
+            .await;
 
         // An edit that adds or drops anchors, or breaks or fixes the
         // buffer, changes the verdict on other open documents that `@ref`
         // it. Refresh them now rather than on their next keystroke.
         let changed = self.docs.get(&uri).is_some_and(|s| s.entry != before);
-        if changed && let Some(snapshot) = path.as_deref().and_then(|p| self.snapshot_for(p, false))
+        if changed
+            && let Some(snapshot) = path
+                .as_deref()
+                .and_then(|p| self.snapshot_for(p, SnapshotMode::Cached))
         {
             for u in self.docs_under(&snapshot.root, Some(&uri)) {
-                self.publish_diagnostics_for(u, false).await;
+                self.publish_diagnostics_for(u, SnapshotMode::Cached).await;
             }
         }
     }
@@ -384,12 +437,13 @@ impl LanguageServer for Backend {
         let Some(path) = self.docs.get(&uri).and_then(|s| s.path.clone()) else {
             return;
         };
-        let Some(snapshot) = self.snapshot_for(&path, true) else {
-            self.publish_diagnostics_for(uri, false).await;
+        let Some(snapshot) = self.snapshot_for(&path, SnapshotMode::Rebuild) else {
+            self.publish_diagnostics_for(uri, SnapshotMode::Cached)
+                .await;
             return;
         };
         for u in self.docs_under(&snapshot.root, None) {
-            self.publish_diagnostics_for(u, false).await;
+            self.publish_diagnostics_for(u, SnapshotMode::Cached).await;
         }
     }
 
@@ -409,7 +463,8 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
-        let Some((text, _, _, analysis)) = self.analyze_doc(uri, false) else {
+        let Some(AnalyzedDoc { text, analysis, .. }) = self.analyze_doc(uri, SnapshotMode::Cached)
+        else {
             warn!("brief-lsp: hover requested for unknown document {:?}", uri);
             return Ok(None);
         };
@@ -425,12 +480,11 @@ impl LanguageServer for Backend {
             cursor_byte >= s && cursor_byte <= e
         });
 
-        let hit = match hit {
-            Some(h) => h,
-            None => return Ok(None),
+        let Some(hit) = hit else {
+            return Ok(None);
         };
 
-        let code_str = hit.code.as_str();
+        let code_str = hit.code.to_string();
         let mut contents = format!("**{}**: {}", code_str, hit.code.message());
         if let Some(label) = &hit.label {
             contents.push_str("\n\n");
@@ -466,7 +520,13 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
 
-        let Some((text, _, snapshot, analysis)) = self.analyze_doc(uri, false) else {
+        let Some(AnalyzedDoc {
+            text,
+            snapshot,
+            analysis,
+            ..
+        }) = self.analyze_doc(uri, SnapshotMode::Cached)
+        else {
             return Ok(None);
         };
         let Some(doc) = &analysis.doc else {
@@ -480,7 +540,10 @@ impl LanguageServer for Backend {
         let Some(site) = analysis::ref_at(doc, cursor_byte) else {
             return Ok(None);
         };
-        let (target_path, anchor) = analysis::split_target(&site.target);
+        let RefTarget {
+            path: target_path,
+            anchor,
+        } = analysis::split_target(&site.target);
         let abs = snapshot.root.join(&target_path);
 
         let range = match anchor {
@@ -510,7 +573,13 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
 
-        let Some((text, path, snapshot, analysis)) = self.analyze_doc(uri, false) else {
+        let Some(AnalyzedDoc {
+            text,
+            path,
+            snapshot,
+            analysis,
+        }) = self.analyze_doc(uri, SnapshotMode::Cached)
+        else {
             return Ok(None);
         };
         let Some(doc) = &analysis.doc else {
@@ -524,16 +593,19 @@ impl LanguageServer for Backend {
 
         // The symbol under the cursor: either a @ref (its target) or an
         // anchored heading (all refs pointing at it).
-        let (target_path, target_anchor) = if let Some(site) = analysis::ref_at(doc, cursor_byte) {
+        let target = if let Some(site) = analysis::ref_at(doc, cursor_byte) {
             analysis::split_target(&site.target)
-        } else if let Some((_, anchor)) = analysis::heading_anchor_at(doc, cursor_byte) {
+        } else if let Some(anchor) = analysis::heading_anchor_at(doc, cursor_byte) {
             let Some(rel) = path
                 .as_deref()
-                .and_then(|p| analysis::rel_path(&snapshot.root, p))
+                .and_then(|p| analysis::relative_path(&snapshot.root, p))
             else {
                 return Ok(None);
             };
-            (rel, Some(anchor))
+            RefTarget {
+                path: rel,
+                anchor: Some(anchor),
+            }
         } else {
             return Ok(None);
         };
@@ -543,7 +615,7 @@ impl LanguageServer for Backend {
         let mut candidates: BTreeSet<String> = snapshot.index.anchors.keys().cloned().collect();
         for entry in self.docs.iter() {
             if let Some(p) = &entry.value().path
-                && let Some(rel) = analysis::rel_path(&snapshot.root, p)
+                && let Some(rel) = analysis::relative_path(&snapshot.root, p)
             {
                 candidates.insert(rel);
             }
@@ -558,9 +630,8 @@ impl LanguageServer for Backend {
             let Some(file_uri) = Uri::from_file_path(&abs) else {
                 continue;
             };
-            for site in analysis::collect_refs(&file_doc) {
-                let (p, a) = analysis::split_target(&site.target);
-                if p == target_path && a == target_anchor {
+            for site in project::collect_refs(&file_doc) {
+                if analysis::split_target(&site.target) == target {
                     locations.push(Location {
                         uri: file_uri.clone(),
                         range: span_to_lsp_range(&file_text, site.span.start, site.span.len),
@@ -570,9 +641,9 @@ impl LanguageServer for Backend {
         }
 
         if params.context.include_declaration
-            && let Some(anchor) = &target_anchor
+            && let Some(anchor) = &target.anchor
         {
-            let abs = snapshot.root.join(&target_path);
+            let abs = snapshot.root.join(&target.path);
             if let Some((decl_text, decl_doc)) = self.parse_path(&abs)
                 && let Some(span) = analysis::heading_span_for_anchor(&decl_doc, anchor)
                 && let Some(decl_uri) = Uri::from_file_path(&abs)
@@ -609,10 +680,12 @@ impl LanguageServer for Backend {
         let line_start = text[..cursor_byte].rfind('\n').map(|i| i + 1).unwrap_or(0);
         let line_prefix = &text[line_start..cursor_byte];
 
-        let Some(ctx) = analysis::completion_context(line_prefix) else {
+        let Some(context) = analysis::completion_context(line_prefix) else {
             return Ok(None);
         };
-        let snapshot = path.as_deref().and_then(|p| self.snapshot_for(p, false));
+        let snapshot = path
+            .as_deref()
+            .and_then(|p| self.snapshot_for(p, SnapshotMode::Cached));
 
         // Replace the partial word the user already typed.
         let edit_range = |prefix_len: usize| Range {
@@ -633,13 +706,13 @@ impl LanguageServer for Backend {
                 }
             };
 
-        let items: Vec<CompletionItem> = match ctx {
-            CompletionCtx::ShortcodeName { prefix } => {
+        let items: Vec<CompletionItem> = match context {
+            CompletionContext::ShortcodeName { prefix } => {
                 let fallback;
                 let registry = match &snapshot {
                     Some(s) => &s.project.registry,
                     None => {
-                        fallback = brief::shortcode::Registry::with_builtins();
+                        fallback = Registry::with_builtins();
                         &fallback
                     }
                 };
@@ -649,9 +722,9 @@ impl LanguageServer for Backend {
                     .filter(|(name, _)| name.starts_with(&prefix))
                     .map(|(name, sc)| {
                         let detail = match sc.kind {
-                            ShortKindOpt::Inline => "inline shortcode",
-                            ShortKindOpt::Block => "block shortcode",
-                            ShortKindOpt::Both => "inline or block shortcode",
+                            ShortcodeKind::Inline => "inline shortcode",
+                            ShortcodeKind::Block => "block shortcode",
+                            ShortcodeKind::Both => "inline or block shortcode",
                         };
                         item(
                             name,
@@ -662,14 +735,14 @@ impl LanguageServer for Backend {
                     })
                     .collect()
             }
-            CompletionCtx::RefPath { prefix } => {
+            CompletionContext::RefPath { prefix } => {
                 let Some(snapshot) = &snapshot else {
                     return Ok(None);
                 };
                 let mut paths: BTreeSet<String> = snapshot.index.anchors.keys().cloned().collect();
                 for entry in self.docs.iter() {
                     if let Some(p) = &entry.value().path
-                        && let Some(rel) = analysis::rel_path(&snapshot.root, p)
+                        && let Some(rel) = analysis::relative_path(&snapshot.root, p)
                     {
                         paths.insert(rel);
                     }
@@ -680,7 +753,7 @@ impl LanguageServer for Backend {
                     .map(|p| item(p, CompletionItemKind::FILE, None, prefix.len()))
                     .collect()
             }
-            CompletionCtx::RefAnchor {
+            CompletionContext::RefAnchor {
                 path: target,
                 prefix,
             } => {
@@ -694,7 +767,7 @@ impl LanguageServer for Backend {
                         .value()
                         .path
                         .as_deref()
-                        .and_then(|p| analysis::rel_path(&snapshot.root, p))
+                        .and_then(|p| analysis::relative_path(&snapshot.root, p))
                         .is_some_and(|rel| rel == target);
                     if matches {
                         anchors = Some(entry.value().entry.anchors.clone());
@@ -732,7 +805,8 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = &params.text_document.uri;
-        let Some((text, _, _, analysis)) = self.analyze_doc(uri, false) else {
+        let Some(AnalyzedDoc { text, analysis, .. }) = self.analyze_doc(uri, SnapshotMode::Cached)
+        else {
             return Ok(None);
         };
         let Some(doc) = &analysis.doc else {
@@ -743,14 +817,14 @@ impl LanguageServer for Backend {
         let tree = analysis::nest_headings(&headings);
 
         fn to_symbols(
-            nodes: &[analysis::SymbolNode],
-            headings: &[analysis::HeadingInfo],
+            nodes: &[SymbolNode],
+            headings: &[HeadingInfo],
             text: &str,
         ) -> Vec<DocumentSymbol> {
             nodes
                 .iter()
                 .map(|n| {
-                    let h = &headings[n.idx];
+                    let h = &headings[n.index];
                     let range = span_to_lsp_range(text, h.span.start, h.span.len);
                     let name = if h.text.is_empty() {
                         "(untitled)".to_string()
@@ -803,7 +877,7 @@ impl LanguageServer for Backend {
             }
         };
 
-        let opts = fmt::Opts::default();
+        let opts = fmt::Options::default();
         let formatted = fmt::format(&text, &opts);
 
         // If already canonical, return empty list (no edits needed).
@@ -858,7 +932,7 @@ fn column_to_byte_offset(line: &str, utf16_col: u32) -> usize {
         if remaining == 0 {
             return byte_idx;
         }
-        let units: u32 = if (ch as u32) > 0xFFFF { 2 } else { 1 };
+        let units: u32 = if (ch as u32) > 0xffff { 2 } else { 1 };
         if remaining < units {
             return byte_idx;
         }

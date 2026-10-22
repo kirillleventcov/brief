@@ -1,15 +1,14 @@
 //! `brief watch` — file/directory watcher that recompiles on change.
 //!
 //! Behavior:
-//!   - .brf change       → recompile that file, unless its output was
-//!                         already built from exactly this content.
-//!   - brief.toml change → recompile the files that project governs, with
-//!                         one refinement: if the only field that changed
-//!                         across the diff is a shortcode
-//!                         `template_html`/`template_llm` string, only files
-//!                         referencing those shortcodes recompile.
-//!   - 100ms debounce: a batch fires once events have been quiet that long.
-//!   - Whole-file recompile only. Block-level incremental is v0.4+.
+//! - `.brf` change: recompile that file, unless its output was already
+//!   built from exactly this content.
+//! - `brief.toml` change: recompile the files that project governs, with
+//!   one refinement: if the only field that changed across the diff is a
+//!   shortcode `template_html`/`template_llm` string, only files
+//!   referencing those shortcodes recompile.
+//! - 100ms debounce: a batch fires once events have been quiet that long.
+//! - Whole-file recompile only. Block-level incremental is v0.4+.
 //!
 //! Every file compiles in its own project (`Project::discover`: the nearest
 //! `brief.toml` above it, `--config` replacing its config) through the same
@@ -20,21 +19,29 @@
 use crate::config::Config;
 use crate::diag::Severity;
 use crate::emit::{html, llm};
-use crate::project::{FileDiagnostics, Project, ProjectIndex, discover_root, read_source};
+use crate::project::{self, IndexBuild, Project};
 use crate::span::SourceMap;
 
 use notify::event::{AccessKind, AccessMode, ModifyKind};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
+use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::Write;
+use std::io::{self, Stderr, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::time::Duration;
 
+/// How long, in milliseconds, events must stay quiet before a batch of
+/// changes is handled.
 pub const DEBOUNCE_MS: u64 = 100;
 
+/// An output format `brief watch` can write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Target {
     Html,
     Llm,
@@ -42,16 +49,9 @@ pub enum Target {
 }
 
 impl Target {
-    pub fn parse(s: &str) -> Option<Target> {
-        match s {
-            "html" => Some(Target::Html),
-            "llm" => Some(Target::Llm),
-            "json" => Some(Target::Json),
-            _ => None,
-        }
-    }
-
-    pub fn out_ext(self) -> &'static str {
+    /// File extension of this target's output, without the dot.
+    #[must_use]
+    pub fn extension(self) -> &'static str {
         match self {
             Target::Html => "html",
             Target::Llm => "txt",
@@ -60,16 +60,50 @@ impl Target {
     }
 }
 
+impl FromStr for Target {
+    type Err = ParseTargetError;
+
+    /// Parse a target name as given to `--target` or `compile.default_target`.
+    fn from_str(s: &str) -> Result<Target, ParseTargetError> {
+        match s {
+            "html" => Ok(Target::Html),
+            "llm" => Ok(Target::Llm),
+            "json" => Ok(Target::Json),
+            _ => Err(ParseTargetError),
+        }
+    }
+}
+
+/// A string named no known `Target`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParseTargetError;
+
+impl fmt::Display for ParseTargetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("unknown target (expected html, llm, json)")
+    }
+}
+
+impl Error for ParseTargetError {}
+
+/// Command-line options for the LLM target; `brief.toml` supplies the rest.
 #[derive(Clone, Debug, Default)]
-pub struct LlmOpts {
+pub struct LlmOptions {
+    /// Drop the markers around emphasized text, keeping only the text.
     pub strip_emphasis: bool,
+    /// Emit the `|---|` separator row under a table's header row.
     pub keep_table_rule: bool,
+    /// Include the `src` of `@image` next to its alt text.
     pub keep_asset_urls: bool,
+    /// Re-emit the document's `+++` frontmatter at the top of the output.
     pub keep_metadata: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct WatchOpts {
+/// Everything `run` needs: what to watch and how to compile it.
+#[derive(Clone, Debug, Default)]
+pub struct WatchOptions {
+    /// Files and directories to watch; directories are searched for `.brf`
+    /// files recursively.
     pub paths: Vec<PathBuf>,
     /// Explicit `--target`. `None` uses each file's project
     /// `compile.default_target`, then html, as `brief compile` does.
@@ -77,38 +111,37 @@ pub struct WatchOpts {
     /// `--config`: replaces every project's `brief.toml`. The root, and so
     /// `@ref` resolution, still comes from where each file lives.
     pub config_override: Option<PathBuf>,
-    pub llm_opts: LlmOpts,
+    /// Options used whenever a file compiles to the LLM target.
+    pub llm_options: LlmOptions,
     /// When true, suppress the clear-screen sequence between recompile runs.
     pub no_clear: bool,
 }
 
+/// The result of compiling one tracked file.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CompileOutcome {
+    /// The output at `dst` was written; `diagnostic_count` warnings were
+    /// reported along the way.
     Ok {
         src: PathBuf,
         dst: PathBuf,
-        diag_count: usize,
+        diagnostic_count: usize,
     },
-    LexError {
-        src: PathBuf,
-    },
-    Errors {
-        src: PathBuf,
-        count: usize,
-    },
-    IoError {
-        src: PathBuf,
-        msg: String,
-    },
+    /// The source did not lex; nothing was written.
+    LexError { src: PathBuf },
+    /// The source has `count` errors; nothing was written.
+    Errors { src: PathBuf, count: usize },
+    /// Reading the source or writing the output failed.
+    IoError { src: PathBuf, message: String },
     /// The file's `brief.toml` (or `--config`) does not load, or names an
     /// unknown default target.
-    BadConfig {
-        src: PathBuf,
-        msg: String,
-    },
+    BadConfig { src: PathBuf, message: String },
 }
 
+/// How a config edit affects the files it governs.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConfigDelta {
     /// Recompile every tracked file.
     All,
@@ -130,10 +163,16 @@ struct Built {
     config: Config,
 }
 
+/// The watch state: the tracked files and what each output was built
+/// from. `run` drives it from file-system events; tests drive it directly.
 pub struct Engine {
+    /// `--config`: replaces every project's `brief.toml`.
     pub config_override: Option<PathBuf>,
+    /// Explicit `--target`, or `None` for each project's default.
     pub target: Option<Target>,
-    pub llm_opts: LlmOpts,
+    /// Options used whenever a file compiles to the LLM target.
+    pub llm_options: LlmOptions,
+    /// Canonical paths of every tracked `.brf` file.
     pub files: BTreeSet<PathBuf>,
     /// When true, suppress the clear-screen sequence between recompile runs.
     pub no_clear: bool,
@@ -149,23 +188,27 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Track every `.brf` under `opts.paths`. A config that fails to load
-    /// is a startup error, the same verdict `brief compile` gives.
-    pub fn load(opts: &WatchOpts) -> Result<Self, String> {
-        let files: BTreeSet<PathBuf> = discover_brf(&opts.paths).into_iter().collect();
+    /// Track every `.brf` under `options.paths`.
+    ///
+    /// # Errors
+    ///
+    /// A config that fails to load is a startup error, the same verdict
+    /// `brief compile` gives.
+    pub fn load(options: &WatchOptions) -> Result<Self, String> {
+        let files: BTreeSet<PathBuf> = discover_brf(&options.paths).into_iter().collect();
         let mut seen: HashSet<Option<PathBuf>> = HashSet::new();
         for f in &files {
-            if seen.insert(discover_root(f)) {
-                Project::discover(f, opts.config_override.as_deref())?;
+            if seen.insert(project::discover_root(f)) {
+                Project::discover(f, options.config_override.as_deref())?;
             }
         }
         Ok(Engine {
-            config_override: opts.config_override.clone(),
-            target: opts.target,
-            llm_opts: opts.llm_opts.clone(),
+            config_override: options.config_override.clone(),
+            target: options.target,
+            llm_options: options.llm_options.clone(),
             files,
-            no_clear: opts.no_clear,
-            scope: opts
+            no_clear: options.no_clear,
+            scope: options
                 .paths
                 .iter()
                 .map(|p| canonicalize_or_clone(p))
@@ -176,15 +219,18 @@ impl Engine {
         })
     }
 
+    /// Track `p` from now on.
     pub fn add_file(&mut self, p: PathBuf) {
         self.files.insert(p);
     }
 
+    /// Compile every tracked file.
     pub fn compile_all<W: Write>(&mut self, log: &mut W) -> Vec<CompileOutcome> {
         let files: Vec<PathBuf> = self.files.iter().cloned().collect();
         self.compile_files(&files, log)
     }
 
+    /// Compile the single file at `path`, writing diagnostics to `log`.
     pub fn compile_one<W: Write>(&mut self, path: &Path, log: &mut W) -> CompileOutcome {
         self.compile_in(path, &mut HashMap::new(), log)
     }
@@ -206,17 +252,17 @@ impl Engine {
     fn compile_in<W: Write>(
         &mut self,
         path: &Path,
-        indexes: &mut HashMap<PathBuf, (ProjectIndex, Vec<FileDiagnostics>)>,
+        indexes: &mut HashMap<PathBuf, IndexBuild>,
         log: &mut W,
     ) -> CompileOutcome {
         let src_path = path.to_path_buf();
-        let source = match read_source(path) {
+        let source = match project::read_source(path) {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(log, "brief: cannot read {}: {}", path.display(), e);
                 return CompileOutcome::IoError {
                     src: src_path,
-                    msg: e.to_string(),
+                    message: e.to_string(),
                 };
             }
         };
@@ -229,21 +275,24 @@ impl Engine {
 
         let project = match Project::discover(path, self.config_override.as_deref()) {
             Ok(p) => p,
-            Err(msg) => {
+            Err(message) => {
                 self.built.remove(path);
-                return CompileOutcome::BadConfig { src: src_path, msg };
+                return CompileOutcome::BadConfig {
+                    src: src_path,
+                    message,
+                };
             }
         };
         let target = match (self.target, &project.config.compile.default_target) {
             (Some(t), _) => t,
             (None, None) => Target::Html,
-            (None, Some(name)) => match Target::parse(name) {
-                Some(t) => t,
-                None => {
+            (None, Some(name)) => match name.parse() {
+                Ok(t) => t,
+                Err(ParseTargetError) => {
                     self.built.remove(path);
                     return CompileOutcome::BadConfig {
                         src: src_path,
-                        msg: format!("unknown target `{}` (expected html, llm, json)", name),
+                        message: format!("unknown target `{name}` (expected html, llm, json)"),
                     };
                 }
             },
@@ -258,13 +307,13 @@ impl Engine {
             },
         );
 
-        let index = project.root.as_ref().map(|root| {
+        let index_build = project.root.as_ref().map(|root| {
             &*indexes
                 .entry(root.clone())
-                .or_insert_with(|| crate::project::build_index(root))
+                .or_insert_with(|| project::build_index(root))
         });
-        let (index, index_diags) = match index {
-            Some((idx, diags)) => (Some(idx), diags.as_slice()),
+        let (index, index_diags) = match index_build {
+            Some(build) => (Some(&build.index), build.diagnostics.as_slice()),
             None => (None, &[][..]),
         };
         let src = SourceMap::new(path.to_string_lossy(), source);
@@ -275,7 +324,7 @@ impl Engine {
             .iter()
             .filter(|d| d.severity == Severity::Error)
             .count();
-        let diag_count = checked.diagnostics.len();
+        let diagnostic_count = checked.diagnostics.len();
         let Some(doc) = checked.doc else {
             return CompileOutcome::LexError { src: src_path };
         };
@@ -289,31 +338,31 @@ impl Engine {
         let output = match target {
             Target::Html => html::render(&doc, &project.registry),
             Target::Llm => {
-                let cfg = &project.config.compile.llm;
-                let lopts = llm::Opts {
-                    strip_emphasis: self.llm_opts.strip_emphasis,
-                    keep_table_rule: self.llm_opts.keep_table_rule,
-                    keep_asset_urls: self.llm_opts.keep_asset_urls,
-                    keep_metadata: self.llm_opts.keep_metadata,
-                    minify_code_blocks: cfg.minify_code_blocks,
-                    minify_languages: cfg.minify_languages.clone(),
-                    preserve_code_fences: cfg.preserve_code_fences,
+                let config = &project.config.compile.llm;
+                let options = llm::Options {
+                    strip_emphasis: self.llm_options.strip_emphasis,
+                    keep_table_rule: self.llm_options.keep_table_rule,
+                    keep_asset_urls: self.llm_options.keep_asset_urls,
+                    keep_metadata: self.llm_options.keep_metadata,
+                    minify_code_blocks: config.minify_code_blocks,
+                    minify_languages: config.minify_languages.clone(),
+                    preserve_code_fences: config.preserve_code_fences,
                 };
-                let (out, warnings) = llm::render(&doc, &project.registry, &lopts);
-                for w in &warnings {
+                let rendered = llm::render(&doc, &project.registry, &options);
+                for w in &rendered.warnings {
                     let _ = writeln!(log, "brief: {}", w);
                 }
-                out
+                rendered.text
             }
             Target::Json => format!("{:#?}\n", doc),
         };
 
         let dst = output_path(path, target);
-        if let Err(e) = std::fs::write(&dst, &output) {
+        if let Err(e) = fs::write(&dst, &output) {
             let _ = writeln!(log, "brief: cannot write {}: {}", dst.display(), e);
             return CompileOutcome::IoError {
                 src: src_path,
-                msg: e.to_string(),
+                message: e.to_string(),
             };
         }
         self.outputs.insert(canonicalize_or_clone(&dst));
@@ -323,10 +372,13 @@ impl Engine {
         CompileOutcome::Ok {
             src: src_path,
             dst,
-            diag_count,
+            diagnostic_count,
         }
     }
 
+    /// The tracked files that reference any of `shortcodes`, as of their
+    /// last compile.
+    #[must_use]
     pub fn files_using(&self, shortcodes: &BTreeSet<String>) -> Vec<PathBuf> {
         self.files
             .iter()
@@ -346,7 +398,10 @@ impl Engine {
     /// rebuilding on that is wasted work at best and a feedback loop at
     /// worst.
     fn is_unchanged(&self, file: &Path) -> bool {
-        match (self.built.get(file).and_then(|b| b.hash), read_source(file)) {
+        match (
+            self.built.get(file).and_then(|b| b.hash),
+            project::read_source(file),
+        ) {
             (Some(hash), Ok(s)) => hash == content_hash(&s),
             _ => false,
         }
@@ -362,7 +417,7 @@ impl Engine {
             .iter()
             .map(|f| {
                 let project = projects
-                    .entry(discover_root(f))
+                    .entry(project::discover_root(f))
                     .or_insert_with(|| Project::discover(f, self.config_override.as_deref()));
                 let delta = match project {
                     Err(e) => Err(e.clone()),
@@ -402,8 +457,12 @@ fn content_hash(source: &str) -> u64 {
     h.finish()
 }
 
+/// Where `src`'s `target` output goes: next to it, with the `.brf`
+/// extension replaced (or the target's extension appended to any other
+/// name).
+#[must_use]
 pub fn output_path(src: &Path, target: Target) -> PathBuf {
-    let ext = target.out_ext();
+    let ext = target.extension();
     let mut p = src.to_path_buf();
     if p.extension().and_then(|s| s.to_str()) == Some("brf") {
         p.set_extension(ext);
@@ -421,6 +480,7 @@ pub fn output_path(src: &Path, target: Target) -> PathBuf {
 /// bare `@name` followed by whitespace. Used only to decide which files
 /// need recompilation when a template changes — false positives just cause
 /// a redundant recompile, never a missed one.
+#[must_use]
 pub fn scan_shortcode_uses(source: &str) -> HashSet<String> {
     let mut out = HashSet::new();
     let bytes = source.as_bytes();
@@ -458,10 +518,11 @@ pub fn scan_shortcode_uses(source: &str) -> HashSet<String> {
             let next = bytes.get(j).copied().unwrap_or(b' ');
             let next_ok =
                 matches!(next, b'(' | b'[' | b' ' | b'\t' | b'\n' | b'\r') || j == bytes.len();
-            if !prev_is_ident && next_ok {
-                if let Ok(name) = std::str::from_utf8(&bytes[start..j]) {
-                    out.insert(name.to_string());
-                }
+            if !prev_is_ident
+                && next_ok
+                && let Ok(name) = std::str::from_utf8(&bytes[start..j])
+            {
+                out.insert(name.to_string());
             }
         }
         i = j.max(i + 1);
@@ -469,6 +530,9 @@ pub fn scan_shortcode_uses(source: &str) -> HashSet<String> {
     out
 }
 
+/// How the edit from `old` to `new` affects the files they govern: a
+/// change to anything but shortcode templates is `ConfigDelta::All`.
+#[must_use]
 pub fn diff_config(old: &Config, new: &Config) -> ConfigDelta {
     if old.project != new.project || old.compile != new.compile {
         return ConfigDelta::All;
@@ -518,7 +582,7 @@ fn discover_brf(paths: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
+    let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -553,19 +617,25 @@ fn canonicalize_or_clone(p: &Path) -> PathBuf {
     // and re-joining the filename gives us a stable identity for lookup
     // against `engine.files` (whose entries were canonicalized at
     // discovery time, before any deletion).
-    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
-        if !parent.as_os_str().is_empty() {
-            if let Ok(parent_canon) = parent.canonicalize() {
-                return parent_canon.join(name);
-            }
-        }
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name())
+        && !parent.as_os_str().is_empty()
+        && let Ok(parent_canon) = parent.canonicalize()
+    {
+        return parent_canon.join(name);
     }
     p.to_path_buf()
 }
 
-pub fn run(opts: WatchOpts) -> Result<(), String> {
-    let mut log = std::io::stderr();
-    let mut engine = Engine::load(&opts)?;
+/// Watch `options.paths` until the event channel closes, recompiling on
+/// every change and logging to stderr.
+///
+/// # Errors
+///
+/// Returns a message when a config fails to load at startup or the file
+/// system watcher cannot be set up.
+pub fn run(options: WatchOptions) -> Result<(), String> {
+    let mut log = io::stderr();
+    let mut engine = Engine::load(&options)?;
 
     if engine.files.is_empty() {
         let _ = writeln!(log, "brief: no .brf files found in given paths");
@@ -587,7 +657,7 @@ pub fn run(opts: WatchOpts) -> Result<(), String> {
     })
     .map_err(|e| format!("watcher init failed: {e}"))?;
 
-    for (dir, mode) in watch_targets(&opts, &engine) {
+    for (dir, mode) in watch_targets(&options, &engine) {
         watcher
             .watch(&dir, mode)
             .map_err(|e| format!("watch {}: {e}", dir.display()))?;
@@ -606,7 +676,7 @@ pub fn run(opts: WatchOpts) -> Result<(), String> {
     let debounce = Duration::from_millis(DEBOUNCE_MS);
     while let Ok(first) = rx.recv() {
         let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
-        let mut absorb = |msg: Result<Vec<PathBuf>, String>, log: &mut std::io::Stderr| match msg {
+        let mut absorb = |msg: Result<Vec<PathBuf>, String>, log: &mut Stderr| match msg {
             Ok(paths) => changed.extend(paths),
             // Errors tend to be transient (a file vanishing mid-save); a
             // rebuild would not help.
@@ -634,10 +704,10 @@ pub fn run(opts: WatchOpts) -> Result<(), String> {
 /// platforms report file-only watches unreliably), plus the directories
 /// whose `brief.toml` (or `--config` file) governs a tracked file, so a
 /// config edit is seen even when it lives above the watched paths.
-fn watch_targets(opts: &WatchOpts, engine: &Engine) -> Vec<(PathBuf, RecursiveMode)> {
+fn watch_targets(options: &WatchOptions, engine: &Engine) -> Vec<(PathBuf, RecursiveMode)> {
     let mut recursive: Vec<PathBuf> = Vec::new();
     let mut flat: Vec<PathBuf> = Vec::new();
-    for p in &opts.paths {
+    for p in &options.paths {
         let canon = canonicalize_or_clone(p);
         if canon.is_file() {
             flat.extend(canon.parent().map(Path::to_path_buf));
@@ -648,7 +718,7 @@ fn watch_targets(opts: &WatchOpts, engine: &Engine) -> Vec<(PathBuf, RecursiveMo
     let roots: BTreeSet<PathBuf> = engine
         .files
         .iter()
-        .filter_map(|f| discover_root(f))
+        .filter_map(|f| project::discover_root(f))
         .collect();
     flat.extend(roots);
     if let Some(cfg) = &engine.config_override {
@@ -779,7 +849,8 @@ pub fn handle_change_paths<W: Write>(paths: &[PathBuf], engine: &mut Engine, log
         if all {
             messages.push("brief: config changed → recompiling all".to_string());
         } else if !templates.is_empty() {
-            let listed = templates.into_iter().collect::<Vec<_>>().join(", ");
+            let names: Vec<String> = templates.into_iter().collect();
+            let listed = names.join(", ");
             messages.push(format!(
                 "brief: template change ({}) → recompiling files using {}",
                 listed, listed
@@ -819,13 +890,13 @@ fn print_outcomes<W: Write>(outcomes: &[CompileOutcome], log: &mut W) {
             CompileOutcome::Ok {
                 src,
                 dst,
-                diag_count,
+                diagnostic_count,
             } => {
-                let suffix = if *diag_count > 0 {
+                let suffix = if *diagnostic_count > 0 {
                     format!(
                         " ({} note{})",
-                        diag_count,
-                        if *diag_count == 1 { "" } else { "s" }
+                        diagnostic_count,
+                        if *diagnostic_count == 1 { "" } else { "s" }
                     )
                 } else {
                     String::new()
@@ -850,8 +921,9 @@ fn print_outcomes<W: Write>(outcomes: &[CompileOutcome], log: &mut W) {
                     if *count == 1 { "" } else { "s" }
                 );
             }
-            CompileOutcome::IoError { src, msg } | CompileOutcome::BadConfig { src, msg } => {
-                let _ = writeln!(log, "brief: {} → FAILED: {}", src.display(), msg);
+            CompileOutcome::IoError { src, message }
+            | CompileOutcome::BadConfig { src, message } => {
+                let _ = writeln!(log, "brief: {} → FAILED: {}", src.display(), message);
             }
         }
     }
@@ -860,14 +932,14 @@ fn print_outcomes<W: Write>(outcomes: &[CompileOutcome], log: &mut W) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shortcode::{ArgSpec, ArgType, ShortKindOpt, Shortcode};
+    use crate::shortcode::{ArgSpec, ArgType, Shortcode, ShortcodeKind};
 
     fn cfg_with_shortcode(name: &str, tpl_html: Option<&str>, tpl_llm: Option<&str>) -> Config {
         let mut c = Config::default();
         c.shortcodes.insert(
             name.into(),
             Shortcode {
-                kind: ShortKindOpt::Inline,
+                kind: ShortcodeKind::Inline,
                 arguments: Default::default(),
                 template_html: tpl_html.map(str::to_string),
                 template_llm: tpl_llm.map(str::to_string),
@@ -896,7 +968,7 @@ mod tests {
     fn diff_config_kind_change_is_structural() {
         let a = cfg_with_shortcode("note", Some("x"), None);
         let mut b = cfg_with_shortcode("note", Some("x"), None);
-        b.shortcodes.get_mut("note").unwrap().kind = ShortKindOpt::Block;
+        b.shortcodes.get_mut("note").unwrap().kind = ShortcodeKind::Block;
         assert_eq!(diff_config(&a, &b), ConfigDelta::All);
     }
 
@@ -906,7 +978,7 @@ mod tests {
         a.shortcodes.insert(
             "note".into(),
             Shortcode {
-                kind: ShortKindOpt::Inline,
+                kind: ShortcodeKind::Inline,
                 arguments: Default::default(),
                 template_html: Some("x".into()),
                 template_llm: None,
@@ -1000,11 +1072,11 @@ mod tests {
         std::fs::create_dir_all(root.join("docs/deep")).unwrap();
         std::fs::write(root.join("docs/a.brf"), "# A\n").unwrap();
         std::fs::write(root.join("docs/deep/b.brf"), "# B\n").unwrap();
-        let opts = WatchOpts {
+        let opts = WatchOptions {
             paths: vec![root.join("docs"), root.join("docs/deep")],
             target: Some(Target::Html),
             config_override: None,
-            llm_opts: LlmOpts::default(),
+            llm_options: LlmOptions::default(),
             no_clear: true,
         };
         let engine = Engine::load(&opts).unwrap();
@@ -1039,11 +1111,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("doc.brf");
         std::fs::write(&f, "# Hello\n").unwrap();
-        let opts = WatchOpts {
-            paths: vec![dir.clone()],
+        let opts = WatchOptions {
+            paths: vec![dir],
             target: Some(Target::Html),
             config_override: None,
-            llm_opts: LlmOpts::default(),
+            llm_options: LlmOptions::default(),
             no_clear: true,
         };
         let mut engine = Engine::load(&opts).unwrap();
@@ -1082,11 +1154,11 @@ template_html = "<aside>{{content}}</aside>"
         )
         .unwrap();
 
-        let opts = WatchOpts {
-            paths: vec![dir.clone()],
+        let opts = WatchOptions {
+            paths: vec![dir],
             target: Some(Target::Html),
             config_override: None,
-            llm_opts: LlmOpts::default(),
+            llm_options: LlmOptions::default(),
             no_clear: false,
         };
         let mut engine = Engine::load(&opts).unwrap();
@@ -1108,11 +1180,11 @@ template_html = "<aside>{{content}}</aside>"
         let f = dir.join("doc.brf");
         std::fs::write(&f, "# Hello\n").unwrap();
 
-        let opts = WatchOpts {
-            paths: vec![dir.clone()],
+        let opts = WatchOptions {
+            paths: vec![dir],
             target: Some(Target::Html),
             config_override: None,
-            llm_opts: LlmOpts::default(),
+            llm_options: LlmOptions::default(),
             no_clear: false,
         };
         let mut engine = Engine::load(&opts).unwrap();
@@ -1128,7 +1200,7 @@ template_html = "<aside>{{content}}</aside>"
         // Simulate a subsequent file-change event.
         std::fs::write(&f, "# Hello again\n").unwrap();
         let mut log: Vec<u8> = Vec::new();
-        handle_change_paths(&[f.clone()], &mut engine, &mut log);
+        handle_change_paths(std::slice::from_ref(&f), &mut engine, &mut log);
         let out = String::from_utf8_lossy(&log);
         assert!(
             out.contains("\x1b[2J\x1b[H"),
@@ -1145,11 +1217,11 @@ template_html = "<aside>{{content}}</aside>"
         let f = dir.join("doc.brf");
         std::fs::write(&f, "# Hello\n").unwrap();
 
-        let opts = WatchOpts {
-            paths: vec![dir.clone()],
+        let opts = WatchOptions {
+            paths: vec![dir],
             target: Some(Target::Html),
             config_override: None,
-            llm_opts: LlmOpts::default(),
+            llm_options: LlmOptions::default(),
             no_clear: true,
         };
         let mut engine = Engine::load(&opts).unwrap();
@@ -1158,7 +1230,7 @@ template_html = "<aside>{{content}}</aside>"
 
         std::fs::write(&f, "# Hello again\n").unwrap();
         let mut log: Vec<u8> = Vec::new();
-        handle_change_paths(&[f.clone()], &mut engine, &mut log);
+        handle_change_paths(std::slice::from_ref(&f), &mut engine, &mut log);
         let out = String::from_utf8_lossy(&log);
         assert!(
             out.contains("doc.html"),
@@ -1180,11 +1252,11 @@ template_html = "<aside>{{content}}</aside>"
         let f = dir.join("doc.brf");
         std::fs::write(&f, "# Hello\n").unwrap();
 
-        let opts = WatchOpts {
-            paths: vec![dir.clone()],
+        let opts = WatchOptions {
+            paths: vec![dir],
             target: Some(Target::Html),
             config_override: None,
-            llm_opts: LlmOpts::default(),
+            llm_options: LlmOptions::default(),
             no_clear: false,
         };
         let mut engine = Engine::load(&opts).unwrap();
@@ -1216,11 +1288,11 @@ template_html = "<aside>{{content}}</aside>"
         std::fs::write(root.join("a.brf"), "# A {#x}\n").unwrap();
         std::fs::write(root.join("b.brf"), "@ref[a.brf#x](X)\n").unwrap();
 
-        let opts = WatchOpts {
+        let opts = WatchOptions {
             paths: vec![root.to_path_buf()],
             target: Some(Target::Html),
             config_override: None,
-            llm_opts: LlmOpts::default(),
+            llm_options: LlmOptions::default(),
             no_clear: true,
         };
         let mut engine = Engine::load(&opts).unwrap();

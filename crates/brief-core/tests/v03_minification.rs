@@ -7,29 +7,30 @@
 
 use brief::config::Config;
 use brief::emit::llm;
-use brief::lexer::lex;
-use brief::parser::parse;
-use brief::resolve::resolve;
+use brief::lexer;
+use brief::parser;
+use brief::resolve;
 use brief::shortcode::Registry;
 use brief::span::SourceMap;
-use brief::validate::{ValidateOpts, validate};
+use brief::validate::{self, ValidateOptions};
 
 fn render_llm(input: &str) -> (String, Vec<String>) {
     let src = SourceMap::new("doc.brf", input);
-    let toks = lex(&src).expect("lex ok");
-    let (mut doc, mut diags) = parse(toks, &src);
+    let toks = lexer::lex(&src).expect("lex ok");
+    let (mut doc, mut diags) = parser::parse(toks, &src);
     let cfg = Config::default();
     let registry = Registry::with_builtins();
-    diags.extend(resolve(&mut doc, &registry));
-    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+    diags.extend(resolve::resolve(&mut doc, &registry));
+    diags.extend(validate::validate(&doc, &ValidateOptions::default(), &src));
     assert!(diags.is_empty(), "compile diags: {:?}", diags);
-    let opts = llm::Opts {
+    let opts = llm::Options {
         minify_code_blocks: cfg.compile.llm.minify_code_blocks,
         minify_languages: cfg.compile.llm.minify_languages.clone(),
         preserve_code_fences: cfg.compile.llm.preserve_code_fences,
-        ..llm::Opts::default()
+        ..llm::Options::default()
     };
-    llm::render(&doc, &registry, &opts)
+    let rendered = llm::render(&doc, &registry, &opts);
+    (rendered.text, rendered.warnings)
 }
 
 #[test]
@@ -185,14 +186,15 @@ fn multi_language_document() {
     assert!(out.contains("let x=1;"), "js ok: {}", out);
 }
 
-fn render_llm_with(input: &str, registry: &Registry, opts: &llm::Opts) -> (String, Vec<String>) {
+fn render_llm_with(input: &str, registry: &Registry, opts: &llm::Options) -> (String, Vec<String>) {
     let src = SourceMap::new("doc.brf", input);
-    let toks = lex(&src).expect("lex ok");
-    let (mut doc, mut diags) = parse(toks, &src);
-    diags.extend(resolve(&mut doc, registry));
-    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+    let toks = lexer::lex(&src).expect("lex ok");
+    let (mut doc, mut diags) = parser::parse(toks, &src);
+    diags.extend(resolve::resolve(&mut doc, registry));
+    diags.extend(validate::validate(&doc, &ValidateOptions::default(), &src));
     assert!(diags.is_empty(), "compile diags: {:?}", diags);
-    llm::render(&doc, registry, opts)
+    let rendered = llm::render(&doc, registry, opts);
+    (rendered.text, rendered.warnings)
 }
 
 #[test]
@@ -252,19 +254,19 @@ fn nominify_code_body_newline_runs_kept() {
 #[test]
 fn unminified_code_body_newline_runs_kept() {
     let input = format!("```go\n{}\n```\n", GO_RAW_BODY);
-    let opts = llm::Opts {
+    let opts = llm::Options {
         minify_code_blocks: false,
-        ..llm::Opts::default()
+        ..llm::Options::default()
     };
     let (out, w) = render_llm_with(&input, &Registry::with_builtins(), &opts);
     assert!(w.is_empty(), "{:?}", w);
     assert_eq!(out, format!("```go\n{}\n```\n", GO_RAW_BODY));
 
     // Without fences the body sits directly between blocks.
-    let opts = llm::Opts {
+    let opts = llm::Options {
         minify_code_blocks: false,
         preserve_code_fences: false,
-        ..llm::Opts::default()
+        ..llm::Options::default()
     };
     let input = format!(
         "Before.\n\n```go\n\n\n\n{}\n\n\n\n```\n\nAfter.\n",
@@ -316,18 +318,18 @@ fn code_body_inside_containers_newline_runs_kept() {
 
 #[test]
 fn template_newline_runs_collapsed_around_verbatim_code_body() {
-    use brief::shortcode::{ShortKindOpt, Shortcode};
+    use brief::shortcode::{Shortcode, ShortcodeKind};
     let mut registry = Registry::with_builtins();
     registry.map.insert(
         "box".into(),
         Shortcode {
-            kind: ShortKindOpt::Block,
+            kind: ShortcodeKind::Block,
             template_llm: Some("[box]\n\n\n\n{{content}}\n\n\n\n[/box]\n".into()),
             ..Shortcode::default()
         },
     );
     let input = format!("@box\n```go @nominify\n{}\n```\n@end\n", GO_RAW_BODY);
-    let (out, w) = render_llm_with(&input, &registry, &llm::Opts::default());
+    let (out, w) = render_llm_with(&input, &registry, &llm::Options::default());
     assert!(w.is_empty(), "{:?}", w);
     assert_eq!(
         out,

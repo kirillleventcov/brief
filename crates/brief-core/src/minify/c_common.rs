@@ -3,44 +3,48 @@
 //! own lexer; a shared emitter consumes the stream to produce a minified
 //! string with minimal-but-safe whitespace.
 
-#![allow(dead_code)]
-
 use super::{MinifyError, MinifyOutput, MinifyWarning};
 
+/// Lexical category of a [`Token`], borrowing its text from the source.
 #[derive(Debug, Clone)]
-pub enum TokenKind<'a> {
+pub enum TokenKind<'src> {
     /// Identifier, keyword, or numeric literal — anything that requires a
     /// word-boundary against another adjacent word.
-    Word(&'a str),
+    Word(&'src str),
     /// Operator or punctuation. May be 1+ characters; multi-character forms
     /// like `===`, `??`, `=>`, `->`, `::` are emitted as a single Punct so
     /// the dangerous-pair table doesn't have to pull them apart again.
-    Punct(&'a str),
+    Punct(&'src str),
     /// String/char literal — emitted verbatim, including delimiters.
-    StrLit(&'a str),
+    StrLit(&'src str),
     /// `// …` line comment body (without the leading `//` or trailing
     /// newline). The minifier emits or drops based on `keep_comments`.
-    LineComment(&'a str),
+    LineComment(&'src str),
     /// `/* … */` block comment body (without the surrounding delimiters).
-    BlockComment(&'a str),
+    BlockComment(&'src str),
     /// JS template literal `` `…` `` — verbatim, including backticks.
-    Template(&'a str),
+    Template(&'src str),
     /// JS regex literal `/…/flags` — verbatim.
-    Regex(&'a str),
+    Regex(&'src str),
     /// C/C++ preprocessor line, including the leading `#` and trailing line
     /// continuations. Emitted on its own line.
-    Preproc(&'a str),
+    Preproc(&'src str),
     /// Significant newline (used by Strategy B emitters to preserve ASI).
     Newline,
 }
 
+/// One lexical token produced by a language tokenizer and consumed by the
+/// shared emitters.
 #[derive(Debug, Clone)]
-pub struct Token<'a> {
-    pub kind: TokenKind<'a>,
+pub struct Token<'src> {
+    /// What kind of token this is, with its source text.
+    pub kind: TokenKind<'src>,
 }
 
-impl<'a> Token<'a> {
-    pub fn new(kind: TokenKind<'a>) -> Self {
+impl<'src> Token<'src> {
+    /// Wraps `kind` in a token.
+    #[must_use]
+    pub fn new(kind: TokenKind<'src>) -> Self {
         Token { kind }
     }
 }
@@ -49,6 +53,7 @@ impl<'a> Token<'a> {
 /// against another word character with no whitespace, would form a different
 /// token. ASCII alnum, `_`, `$`. Non-ASCII identifiers in Rust/Java are
 /// allowed; we treat all alphabetic chars as words regardless of script.
+#[must_use]
 pub fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
@@ -57,6 +62,7 @@ pub fn is_word_char(c: char) -> bool {
 /// the token stream (form a multi-character operator, comment marker, or
 /// merge two words). The caller passes the last char of the previously
 /// emitted token and the first char of the next token.
+#[must_use]
 pub fn needs_space(prev: char, next: char) -> bool {
     if is_word_char(prev) && is_word_char(next) {
         return true;
@@ -105,12 +111,18 @@ fn first_char(s: &str) -> Option<char> {
 /// Wrap a comment body in `/* … */`, defusing any `*/` inside it. A line
 /// comment like `// see */ marker` would otherwise close the spliced block
 /// comment early and leak the tail as live tokens.
+#[must_use]
 pub fn safe_block_comment(body: &str) -> String {
     format!("/*{}*/", body.replace("*/", "* /"))
 }
 
 /// Emit a token stream stripping all whitespace and (default) all comments.
 /// Used by Rust, Java, SQL.
+///
+/// # Errors
+///
+/// Currently infallible; returns `Result` so it composes with the
+/// tokenizers' `?` chains.
 pub fn emit_aggressive(
     tokens: &[Token<'_>],
     opts_keep_comments: bool,
@@ -155,14 +167,16 @@ pub fn emit_aggressive(
             }
         }
     }
-    Ok(MinifyOutput {
-        body: out,
-        warnings,
-    })
+    Ok(MinifyOutput::new(out, warnings))
 }
 
 /// Emit a token stream preserving newlines (so JS/TS/Go ASI behavior is
 /// preserved). Horizontal whitespace and comments are still stripped.
+///
+/// # Errors
+///
+/// Currently infallible; returns `Result` so it composes with the
+/// tokenizers' `?` chains.
 pub fn emit_conservative(
     tokens: &[Token<'_>],
     opts_keep_comments: bool,
@@ -215,22 +229,18 @@ pub fn emit_conservative(
             }
         }
     }
-    Ok(MinifyOutput {
-        body: out,
-        warnings,
-    })
+    Ok(MinifyOutput::new(out, warnings))
 }
 
 fn push_with_space(out: &mut String, prev_emit_last: &mut Option<char>, s: &str) {
     if s.is_empty() {
         return;
     }
-    if let Some(prev) = *prev_emit_last {
-        if let Some(next) = first_char(s) {
-            if needs_space(prev, next) {
-                out.push(' ');
-            }
-        }
+    if let Some(prev) = *prev_emit_last
+        && let Some(next) = first_char(s)
+        && needs_space(prev, next)
+    {
+        out.push(' ');
     }
     out.push_str(s);
     *prev_emit_last = last_char(s);

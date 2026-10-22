@@ -5,14 +5,14 @@
 //! Brief-shaped fragments with a fixed-seed xorshift so failures replay.
 
 use brief::ast::{Block, Inline};
-use brief::diag::{Diagnostic, render_all};
+use brief::diag::{self, Diagnostic};
 use brief::emit::{html, llm};
-use brief::lexer::lex;
-use brief::parser::parse;
-use brief::resolve::resolve;
+use brief::lexer;
+use brief::parser;
+use brief::resolve;
 use brief::shortcode::Registry;
 use brief::span::{SourceMap, Span};
-use brief::validate::{ValidateOpts, validate};
+use brief::validate::{self, ValidateOptions};
 
 struct XorShift(u64);
 
@@ -171,6 +171,8 @@ fn check_inlines(src: &str, seq: &[Inline], errors: &mut Vec<String>) {
                     check_inlines(src, c, errors);
                 }
             }
+            // `Inline` is non-exhaustive; new variants need a case above.
+            _ => {}
         }
     }
 }
@@ -216,43 +218,45 @@ fn check_blocks(src: &str, blocks: &[Block], errors: &mut Vec<String>) {
                     check_inlines(src, &it.definition, errors);
                 }
             }
+            // `Block` is non-exhaustive; new variants need a case above.
+            _ => {}
         }
     }
 }
 
 fn check_diags(src: &SourceMap, diags: &[Diagnostic], errors: &mut Vec<String>) {
     for d in diags {
-        check(&src.source, d.span, d.code.as_str().as_str(), errors);
+        check(&src.source, d.span, d.code.to_string().as_str(), errors);
     }
     if errors.is_empty() {
         // Rendering slices the source by line and column; it must not panic.
-        let _ = render_all(diags, src);
+        let _ = diag::render_all(diags, src);
     }
 }
 
 #[test]
 fn spans_stay_in_bounds_and_on_char_boundaries() {
     let reg = Registry::with_builtins();
-    let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+    let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
     let mut errors = Vec::new();
     for _ in 0..4000 {
         let input = gen_doc(&mut rng);
         let src = SourceMap::new("o.brf", input.as_str());
-        let tokens = match lex(&src) {
+        let tokens = match lexer::lex(&src) {
             Ok(t) => t,
             Err(d) => {
                 check_diags(&src, &d, &mut errors);
                 continue;
             }
         };
-        let (mut doc, mut diags) = parse(tokens, &src);
-        diags.extend(resolve(&mut doc, &reg));
-        diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+        let (mut doc, mut diags) = parser::parse(tokens, &src);
+        diags.extend(resolve::resolve(&mut doc, &reg));
+        diags.extend(validate::validate(&doc, &ValidateOptions::default(), &src));
         check_blocks(&src.source, &doc.blocks, &mut errors);
         check_diags(&src, &diags, &mut errors);
         // Emitters must not panic on whatever AST the parser recovered.
         let _ = html::render(&doc, &reg);
-        let _ = llm::render(&doc, &reg, &llm::Opts::default());
+        let _ = llm::render(&doc, &reg, &llm::Options::default());
     }
     assert!(
         errors.is_empty(),

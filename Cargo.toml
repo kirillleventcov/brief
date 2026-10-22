@@ -18,3 +18,31 @@ lto           = true
 codegen-units = 1
 strip         = "symbols"
 panic         = "abort"
+
+# Lints backing the Google Rust style guide. Each crate opts in with
+# `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Prefer `expect` (or pattern matching) over `unwrap`; tests are exempt via
+# `clippy.toml`.
+unwrap_used                  = "warn"
+# No glob imports outside `use super::*` and `use Enum::*` in enum code.
+wildcard_imports             = "warn"
+# Prefer borrows over deep copies.
+redundant_clone              = "warn"
+implicit_clone               = "warn"
+# Accept `Option<&T>`, not `&Option<T>`.
+ref_option                   = "warn"
+# Prefer enums over bools in APIs.
+fn_params_excessive_bools    = "warn"
+# Prefer `format!` over `+` concatenation.
+string_add                   = "warn"
+# Prefer `for` loops over `Iterator::for_each`.
+needless_for_each            = "warn"
+# `#[must_use]` on pure functions and builder-style methods.
+must_use_candidate           = "warn"
+return_self_not_must_use     = "warn"
+# Document panic cases of public functions.
+missing_panics_doc           = "warn"

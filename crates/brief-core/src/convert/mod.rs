@@ -9,5 +9,5 @@
 mod to_brief;
 mod to_md;
 
-pub use to_brief::{ConvertResult, Diag, Hole, convert};
-pub use to_md::{MdDiag, MdHole, MdResult, to_markdown};
+pub use to_brief::{ConvertDiagnostic, ConvertResult, Hole, convert};
+pub use to_md::{MdDiagnostic, MdHole, MdResult, to_markdown};

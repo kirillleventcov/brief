@@ -1,40 +1,22 @@
+//! Output backends: HTML for browsers and a compact text form for LLMs.
+//!
+//! Both emitters take a parsed (and ideally resolved) [`Document`] plus the
+//! shortcode [`Registry`] whose templates override the built-in rendering.
+
 pub mod html;
 pub mod llm;
+mod math;
 
-use crate::ast::{Block, Document, Inline};
+use crate::ast::Document;
 use crate::shortcode::Registry;
 
-pub fn to_html(doc: &Document, reg: &Registry) -> String {
-    html::render(doc, reg)
+/// Renders `doc` as an HTML fragment. Same as [`html::render`].
+#[must_use]
+pub fn to_html(doc: &Document, registry: &Registry) -> String {
+    html::render(doc, registry)
 }
 
-pub fn to_llm(doc: &Document, reg: &Registry, opts: &llm::Opts) -> (String, Vec<String>) {
-    llm::render(doc, reg, opts)
-}
-
-/// The TeX source of an inline `@math[...]`. The parser keeps math bodies
-/// verbatim as plain text, so emitters must output this as-is (escaped once
-/// for HTML) rather than run it through inline rendering.
-pub(crate) fn math_source(content: &[Inline]) -> String {
-    let mut out = String::new();
-    for n in content {
-        if let Inline::Text { value, .. } = n {
-            out.push_str(value);
-        }
-    }
-    out
-}
-
-/// The TeX source of a block `@math ... @end` (one text paragraph).
-pub(crate) fn math_block_source(children: &[Block]) -> String {
-    let mut out = String::new();
-    for c in children {
-        if let Block::Paragraph { content, .. } = c {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&math_source(content));
-        }
-    }
-    out
+/// Renders `doc` in the LLM-oriented text form. Same as [`llm::render`].
+pub fn to_llm(doc: &Document, registry: &Registry, options: &llm::Options) -> llm::Output {
+    llm::render(doc, registry, options)
 }

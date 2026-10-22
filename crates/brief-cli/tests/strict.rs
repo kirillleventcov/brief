@@ -1,30 +1,32 @@
-use std::path::Path;
+use brief::diag::{self, Severity};
+use brief::span::SourceMap;
+use brief::{convert, lexer, parser};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn brief_bin() -> std::path::PathBuf {
+fn brief_bin() -> PathBuf {
     // `cargo test` exposes `CARGO_BIN_EXE_brief` — the binary cargo
     // just built for this crate.
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_brief"))
+    PathBuf::from(env!("CARGO_BIN_EXE_brief"))
 }
 
 /// Convert a Markdown fixture and run the same self-test the CLI does
 /// in strict mode. Returns `Ok(brief_source)` if the output compiled,
 /// `Err(rendered_diagnostics)` otherwise.
 fn convert_and_strict_check(md: &str, name: &str) -> Result<String, String> {
-    let result = brief::convert::convert(md, name);
-    let src = brief::span::SourceMap::new(name.to_string(), result.brief_source.clone());
-    let diags = match brief::lexer::lex(&src) {
-        Ok(toks) => brief::parser::parse(toks, &src).1,
+    let result = convert::convert(md, name);
+    let src = SourceMap::new(name.to_string(), result.brief_source.clone());
+    let diags = match lexer::lex(&src) {
+        Ok(toks) => parser::parse(toks, &src).1,
         Err(d) => d,
     };
-    let any_error = diags
-        .iter()
-        .any(|d| d.severity == brief::diag::Severity::Error);
+    let any_error = diags.iter().any(|d| d.severity == Severity::Error);
     if any_error {
         Err(format!(
             "convert→compile failed for {}:\n{}\n--- brief output ---\n{}",
             name,
-            brief::diag::render_all(&diags, &src),
+            diag::render_all(&diags, &src),
             result.brief_source
         ))
     } else {
@@ -36,15 +38,14 @@ fn convert_and_strict_check(md: &str, name: &str) -> Result<String, String> {
 fn corpus_strict_all_patterns_round_trip() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/strict");
     let mut checked = 0usize;
-    for entry in std::fs::read_dir(&dir).expect("fixtures dir") {
+    for entry in fs::read_dir(&dir).expect("fixtures dir") {
         let path = entry.expect("dir entry").path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let md = std::fs::read_to_string(&path).expect("read fixture");
-        match convert_and_strict_check(&md, &path.to_string_lossy()) {
-            Ok(_) => {}
-            Err(report) => panic!("fixture {}: {}", path.display(), report),
+        let md = fs::read_to_string(&path).expect("read fixture");
+        if let Err(report) = convert_and_strict_check(&md, &path.to_string_lossy()) {
+            panic!("fixture {}: {}", path.display(), report);
         }
         checked += 1;
     }
@@ -64,7 +65,7 @@ fn cli_no_strict_flag_is_accepted() {
     // `strict_self_test` definition in `main.rs`.
     let dir = tempfile::tempdir().unwrap();
     let md_path = dir.path().join("ok.md");
-    std::fs::write(&md_path, "# ok\n").unwrap();
+    fs::write(&md_path, "# ok\n").unwrap();
     let out = Command::new(brief_bin())
         .arg("convert")
         .arg("--no-strict")

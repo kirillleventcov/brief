@@ -22,3 +22,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "brief-web"
 path = "src/main.rs"
+
+[lints]
+workspace = true

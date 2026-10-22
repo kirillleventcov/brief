@@ -1,6 +1,6 @@
 #![no_main]
 
-use brief::inline::parse_args;
+use brief::inline;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -16,7 +16,7 @@ fuzz_target!(|data: &[u8]| {
     s.push('(');
     s.push_str(tail);
     let mut cursor = 0usize;
-    if let Err(d) = parse_args(&s, &mut cursor, 0) {
+    if let Err(d) = inline::parse_args(&s, &mut cursor, 0) {
         let end = d.span.end();
         assert!(
             end <= s.len() && s.is_char_boundary(d.span.start as usize) && s.is_char_boundary(end)

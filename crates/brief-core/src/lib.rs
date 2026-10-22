@@ -1,3 +1,6 @@
+//! Brief markup compiler: lexing, parsing, validation and rendering of
+//! `.brf` documents to HTML and LLM-oriented text, plus Markdown conversion.
+
 pub mod ast;
 pub mod config;
 pub mod convert;

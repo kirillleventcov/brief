@@ -1,7 +1,13 @@
+//! Shortcode declarations: the argument value model, the per-shortcode
+//! schema loaded from `brief.toml`, and the [`Registry`] of built-ins plus
+//! user-declared shortcodes that resolve checks invocations against.
+
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
+/// A parsed shortcode argument value.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ArgValue {
     Ident(String),
     Int(i64),
@@ -10,6 +16,8 @@ pub enum ArgValue {
 }
 
 impl ArgValue {
+    /// The user-facing name of this value's type, for diagnostics.
+    #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
             ArgValue::Ident(_) => "ident",
@@ -19,6 +27,8 @@ impl ArgValue {
         }
     }
 
+    /// The text of a string or identifier value; `None` for other types.
+    #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
             ArgValue::Str(s) | ArgValue::Ident(s) => Some(s.as_str()),
@@ -27,8 +37,11 @@ impl ArgValue {
     }
 }
 
+/// The declared type of a shortcode argument (`type = "..."` in
+/// `brief.toml`).
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ArgType {
     String,
     Int,
@@ -36,6 +49,7 @@ pub enum ArgType {
     Array,
 }
 
+/// Schema of one shortcode argument.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ArgSpec {
@@ -43,52 +57,59 @@ pub struct ArgSpec {
     pub ty: ArgType,
     #[serde(default)]
     pub required: bool,
+    /// 1-based position when the argument may be passed positionally.
     #[serde(default)]
     pub position: Option<usize>,
+    /// The only values the argument accepts, if restricted.
     #[serde(default)]
     pub oneof: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+/// Where a shortcode may be used: inline (`@name[...]`), as a block
+/// (`@name ... @end`), or both.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum ShortKindOpt {
+pub enum ShortcodeKind {
+    #[default]
     Inline,
     Block,
     Both,
 }
 
-impl Default for ShortKindOpt {
-    fn default() -> Self {
-        ShortKindOpt::Inline
-    }
-}
-
+/// Declaration of one shortcode: its form, arguments and optional output
+/// templates.
 #[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Shortcode {
     #[serde(default)]
-    pub kind: ShortKindOpt,
+    pub kind: ShortcodeKind,
     #[serde(default)]
     pub arguments: BTreeMap<String, ArgSpec>,
+    /// Template for HTML output; `None` uses the built-in rendering.
     #[serde(default)]
     pub template_html: Option<String>,
+    /// Template for LLM output; `None` uses the built-in rendering.
     #[serde(default)]
     pub template_llm: Option<String>,
 }
 
+/// Every known shortcode by name. Extending it with user declarations
+/// replaces built-ins of the same name.
 #[derive(Clone, Debug, Default)]
 pub struct Registry {
     pub map: BTreeMap<String, Shortcode>,
 }
 
 impl Registry {
+    /// A registry holding only the built-in shortcodes.
+    #[must_use]
     pub fn with_builtins() -> Self {
         let mut m = BTreeMap::new();
 
         m.insert(
             "link".into(),
             Shortcode {
-                kind: ShortKindOpt::Inline,
+                kind: ShortcodeKind::Inline,
                 arguments: {
                     let mut a = BTreeMap::new();
                     a.insert(
@@ -119,7 +140,7 @@ impl Registry {
         m.insert(
             "image".into(),
             Shortcode {
-                kind: ShortKindOpt::Inline,
+                kind: ShortcodeKind::Inline,
                 arguments: {
                     let mut a = BTreeMap::new();
                     a.insert(
@@ -149,7 +170,7 @@ impl Registry {
         m.insert(
             "kbd".into(),
             Shortcode {
-                kind: ShortKindOpt::Inline,
+                kind: ShortcodeKind::Inline,
                 ..Default::default()
             },
         );
@@ -160,7 +181,7 @@ impl Registry {
         m.insert(
             "sub".into(),
             Shortcode {
-                kind: ShortKindOpt::Inline,
+                kind: ShortcodeKind::Inline,
                 ..Default::default()
             },
         );
@@ -168,7 +189,7 @@ impl Registry {
         m.insert(
             "sup".into(),
             Shortcode {
-                kind: ShortKindOpt::Inline,
+                kind: ShortcodeKind::Inline,
                 ..Default::default()
             },
         );
@@ -178,7 +199,7 @@ impl Registry {
         m.insert(
             "details".into(),
             Shortcode {
-                kind: ShortKindOpt::Block,
+                kind: ShortcodeKind::Block,
                 arguments: {
                     let mut a = BTreeMap::new();
                     a.insert(
@@ -199,7 +220,7 @@ impl Registry {
         m.insert(
             "dl".into(),
             Shortcode {
-                kind: ShortKindOpt::Block,
+                kind: ShortcodeKind::Block,
                 ..Default::default()
             },
         );
@@ -207,7 +228,7 @@ impl Registry {
         m.insert(
             "t".into(),
             Shortcode {
-                kind: ShortKindOpt::Block,
+                kind: ShortcodeKind::Block,
                 arguments: {
                     let mut a = BTreeMap::new();
                     a.insert(
@@ -228,7 +249,7 @@ impl Registry {
         m.insert(
             "code".into(),
             Shortcode {
-                kind: ShortKindOpt::Block,
+                kind: ShortcodeKind::Block,
                 arguments: {
                     let mut a = BTreeMap::new();
                     a.insert(
@@ -249,7 +270,7 @@ impl Registry {
         m.insert(
             "callout".into(),
             Shortcode {
-                kind: ShortKindOpt::Block,
+                kind: ShortcodeKind::Block,
                 arguments: {
                     let mut a = BTreeMap::new();
                     a.insert(
@@ -276,7 +297,7 @@ impl Registry {
         m.insert(
             "math".into(),
             Shortcode {
-                kind: ShortKindOpt::Both,
+                kind: ShortcodeKind::Both,
                 ..Default::default()
             },
         );
@@ -284,7 +305,7 @@ impl Registry {
         m.insert(
             "footnote".into(),
             Shortcode {
-                kind: ShortKindOpt::Inline,
+                kind: ShortcodeKind::Inline,
                 ..Default::default()
             },
         );
@@ -292,7 +313,7 @@ impl Registry {
         m.insert(
             "ref".into(),
             Shortcode {
-                kind: ShortKindOpt::Inline,
+                kind: ShortcodeKind::Inline,
                 arguments: {
                     let mut a = BTreeMap::new();
                     a.insert(
@@ -314,14 +335,16 @@ impl Registry {
         Registry { map: m }
     }
 
+    /// The declaration of shortcode `name`, if registered.
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&Shortcode> {
         self.map.get(name)
     }
+}
 
-    pub fn extend(&mut self, other: BTreeMap<String, Shortcode>) {
-        for (k, v) in other {
-            self.map.insert(k, v);
-        }
+impl Extend<(String, Shortcode)> for Registry {
+    fn extend<I: IntoIterator<Item = (String, Shortcode)>>(&mut self, iter: I) {
+        self.map.extend(iter);
     }
 }
 
@@ -333,7 +356,7 @@ mod tests {
     fn ref_is_a_builtin_inline_shortcode() {
         let reg = Registry::with_builtins();
         let sc = reg.get("ref").expect("@ref must be a built-in");
-        assert!(matches!(sc.kind, ShortKindOpt::Inline));
+        assert!(matches!(sc.kind, ShortcodeKind::Inline));
         let title = sc.arguments.get("title").expect("title arg");
         assert!(title.required);
         assert_eq!(title.position, Some(1));
@@ -344,7 +367,7 @@ mod tests {
     fn dl_is_a_builtin_block_shortcode() {
         let reg = Registry::with_builtins();
         let sc = reg.get("dl").expect("@dl must be a built-in");
-        assert!(matches!(sc.kind, ShortKindOpt::Block));
+        assert!(matches!(sc.kind, ShortcodeKind::Block));
         assert!(sc.arguments.is_empty(), "@dl takes no arguments in v0.3");
     }
 }

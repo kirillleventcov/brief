@@ -5,17 +5,18 @@
 //! converter accepts and the compiler parses cleanly — the same invariant
 //! `brief convert doc.brf` enforces via its strict self-test.
 
-use brief::convert::{convert, to_markdown};
+use brief::convert;
 use brief::diag::Severity;
-use brief::lexer::lex;
-use brief::parser::parse;
-use brief::resolve::resolve;
+use brief::lexer;
+use brief::parser;
+use brief::resolve;
 use brief::shortcode::Registry;
 use brief::span::SourceMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 fn collect_brf(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("read corpus dir") {
+    for entry in fs::read_dir(dir).expect("read corpus dir") {
         let path = entry.expect("dir entry").path();
         if path.is_dir() {
             collect_brf(&path, out);
@@ -38,11 +39,11 @@ fn repo_brief_corpus_round_trips_through_markdown() {
 
     let reg = Registry::with_builtins();
     for file in files {
-        let text = std::fs::read_to_string(&file).expect("read corpus file");
+        let text = fs::read_to_string(&file).expect("read corpus file");
         let src = SourceMap::new(file.to_string_lossy(), text);
         let tokens =
-            lex(&src).unwrap_or_else(|d| panic!("{} does not lex: {:?}", file.display(), d));
-        let (mut doc, parse_diags) = parse(tokens, &src);
+            lexer::lex(&src).unwrap_or_else(|d| panic!("{} does not lex: {:?}", file.display(), d));
+        let (mut doc, parse_diags) = parser::parse(tokens, &src);
         let parse_errors: Vec<_> = parse_diags
             .iter()
             .filter(|d| d.severity == Severity::Error)
@@ -56,12 +57,12 @@ fn repo_brief_corpus_round_trips_through_markdown() {
         // Resolver diagnostics are ignored on purpose: outside a project
         // `@ref` raises B0604, and the docs' custom shortcodes are not in
         // the builtin registry. Neither stops the emitter.
-        let _ = resolve(&mut doc, &reg);
+        let _ = resolve::resolve(&mut doc, &reg);
 
-        let md = to_markdown(&doc, &reg, &src);
-        let back = convert(&md.markdown, "roundtrip.md");
+        let md = convert::to_markdown(&doc, &reg, &src);
+        let back = convert::convert(&md.markdown, "roundtrip.md");
         let src2 = SourceMap::new("roundtrip.brf", back.brief_source.clone());
-        let tokens2 = lex(&src2).unwrap_or_else(|d| {
+        let tokens2 = lexer::lex(&src2).unwrap_or_else(|d| {
             panic!(
                 "{}: round-tripped Brief does not lex: {:?}\n--- markdown ---\n{}",
                 file.display(),
@@ -69,7 +70,7 @@ fn repo_brief_corpus_round_trips_through_markdown() {
                 md.markdown
             )
         });
-        let (_, diags2) = parse(tokens2, &src2);
+        let (_, diags2) = parser::parse(tokens2, &src2);
         let errors: Vec<_> = diags2
             .iter()
             .filter(|d| d.severity == Severity::Error)

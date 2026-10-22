@@ -1,19 +1,41 @@
-use crate::ast::{Block, CodeAttrs, Document, Inline, ListItem, Row, ShortArgs, TaskState};
+//! Builds the [`Document`] block tree from the lexer's line tokens.
+
+use crate::ast::{
+    Block, CodeAttrs, DefinitionItem, Document, Inline, ListItem, Row, ShortcodeArgs, TaskState,
+};
 use crate::diag::{Code, Diagnostic};
-use crate::inline::{Seg, parse_args, parse_inline, parse_inline_joined};
+use crate::inline::{self, Seg};
+use crate::shortcode::ArgValue;
 use crate::span::{SourceMap, Span};
 use crate::token::{Token, TokenKind};
+use std::mem;
 use std::ops::Range;
+use toml::Table;
 
+/// Parses the tokens [`crate::lexer::lex`] produced for `src` into a
+/// document, alongside every diagnostic found. Parsing never stops at the
+/// first error: malformed constructs are reported and skipped or degraded
+/// to empty paragraphs.
+///
+/// # Panics
+///
+/// Panics if `tokens` does not end with a [`TokenKind::Eof`] token, which
+/// `lex` always appends.
+#[must_use]
 pub fn parse(tokens: Vec<Token>, src: &SourceMap) -> (Document, Vec<Diagnostic>) {
-    let (metadata, fm_consumed, fm_body, fm_diags) = parse_frontmatter(&tokens, src);
+    let Frontmatter {
+        metadata,
+        consumed,
+        body,
+        diags,
+    } = parse_frontmatter(&tokens, src);
     let mut p = Parser {
         src,
         toks: tokens,
-        pos: fm_consumed,
-        diags: fm_diags,
+        pos: consumed,
+        diags,
         depth: 0,
-        verbatim: fm_body.into_iter().collect(),
+        verbatim: body.into_iter().collect(),
         seg_buf: Vec::new(),
     };
     let mut blocks = p.parse_blocks(0, None);
@@ -46,24 +68,34 @@ pub fn parse(tokens: Vec<Token>, src: &SourceMap) -> (Document, Vec<Diagnostic>)
     )
 }
 
-fn parse_frontmatter(
-    toks: &[Token],
-    src: &SourceMap,
-) -> (
-    Option<toml::Table>,
-    usize,
-    Option<Range<usize>>,
-    Vec<Diagnostic>,
-) {
-    // Returns (metadata, tokens_consumed, body_tokens, diagnostics).
-    //
+/// Outcome of `parse_frontmatter`.
+struct Frontmatter {
+    metadata: Option<Table>,
+    /// Tokens consumed, including both `+++` lines.
+    consumed: usize,
+    /// Token range of the TOML body, if the frontmatter was closed.
+    body: Option<Range<usize>>,
+    diags: Vec<Diagnostic>,
+}
+
+impl Frontmatter {
+    fn none() -> Self {
+        Frontmatter {
+            metadata: None,
+            consumed: 0,
+            body: None,
+            diags: Vec::new(),
+        }
+    }
+}
+
+fn parse_frontmatter(toks: &[Token], src: &SourceMap) -> Frontmatter {
     // Frontmatter must be the very first content. We detect it by checking
     // that the first token is `Line("+++")` at byte offset 0 with indent 0.
     // If anything else comes first (a Blank, a comment, an indented `+++`,
-    // or a non-`+++` line), there is no frontmatter and we return
-    // (None, 0, empty).
+    // or a non-`+++` line), there is no frontmatter.
     if toks.is_empty() {
-        return (None, 0, None, Vec::new());
+        return Frontmatter::none();
     }
     let first = &toks[0];
     let opens = match first.kind {
@@ -73,7 +105,7 @@ fn parse_frontmatter(
         _ => false,
     };
     if !opens {
-        return (None, 0, None, Vec::new());
+        return Frontmatter::none();
     }
 
     // Body starts at the first byte after `+++\n` (or `+++\r\n`).
@@ -92,7 +124,12 @@ fn parse_frontmatter(
                     Diagnostic::new(Code::UnterminatedFrontmatter, first.span)
                         .label("frontmatter opened with `+++` is never closed"),
                 );
-                return (None, idx, None, diags);
+                return Frontmatter {
+                    metadata: None,
+                    consumed: idx,
+                    body: None,
+                    diags,
+                };
             }
             TokenKind::Line
                 if toks[idx].indent == 0 && &src.source[toks[idx].span.range()] == "+++" =>
@@ -103,8 +140,15 @@ fn parse_frontmatter(
                 // TOML is opaque to Brief: its tabs are not Brief's to ban.
                 let body_toks = Some(1..idx);
                 idx += 1; // consume the closing `+++`
-                match toml::from_str::<toml::Table>(body) {
-                    Ok(t) => return (Some(t), idx, body_toks, diags),
+                match toml::from_str::<Table>(body) {
+                    Ok(t) => {
+                        return Frontmatter {
+                            metadata: Some(t),
+                            consumed: idx,
+                            body: body_toks,
+                            diags,
+                        };
+                    }
                     Err(e) => {
                         let (off, len) = match e.span() {
                             Some(r) => (body_start + r.start, r.end - r.start),
@@ -125,7 +169,12 @@ fn parse_frontmatter(
                         diags.push(
                             Diagnostic::new(Code::FrontmatterToml, span).label(e.to_string()),
                         );
-                        return (None, idx, body_toks, diags);
+                        return Frontmatter {
+                            metadata: None,
+                            consumed: idx,
+                            body: body_toks,
+                            diags,
+                        };
                     }
                 }
             }
@@ -138,7 +187,12 @@ fn parse_frontmatter(
         Diagnostic::new(Code::UnterminatedFrontmatter, first.span)
             .label("frontmatter opened with `+++` is never closed"),
     );
-    (None, idx, None, diags)
+    Frontmatter {
+        metadata: None,
+        consumed: idx,
+        body: None,
+        diags,
+    }
 }
 
 /// Blocks may nest via list children, block shortcodes, and blockquote
@@ -147,8 +201,8 @@ fn parse_frontmatter(
 /// overflow instead of a diagnostic.
 pub(crate) const MAX_NESTING_DEPTH: usize = 64;
 
-struct Parser<'a> {
-    src: &'a SourceMap,
+struct Parser<'src> {
+    src: &'src SourceMap,
     toks: Vec<Token>,
     pos: usize,
     diags: Vec<Diagnostic>,
@@ -161,14 +215,14 @@ struct Parser<'a> {
     seg_buf: Vec<Seg>,
 }
 
-impl<'a> Parser<'a> {
+impl<'src> Parser<'src> {
     fn peek(&self) -> &Token {
         &self.toks[self.pos]
     }
     /// Text of a `Line` token, sliced from the source. The returned slice
-    /// borrows from the `SourceMap` (lifetime `'a`), not from `self`, so it
-    /// stays valid across `&mut self` calls.
-    fn line(&self, tok: &Token) -> &'a str {
+    /// borrows from the `SourceMap` (lifetime `'src`), not from `self`, so
+    /// it stays valid across `&mut self` calls.
+    fn line(&self, tok: &Token) -> &'src str {
         &self.src.source[tok.span.range()]
     }
     /// The whole source line of token `idx` with only its terminator (`\n`
@@ -176,7 +230,7 @@ impl<'a> Parser<'a> {
     /// read this; everything else reads the lexer's trimmed `line`. The
     /// lexer emits one token per line, so the next token starts right
     /// after this line's newline.
-    fn raw_line(&self, idx: usize) -> &'a str {
+    fn raw_line(&self, idx: usize) -> &'src str {
         let src = self.src.source.as_str();
         let start = self.toks[idx].span.start as usize;
         let next = self
@@ -259,10 +313,10 @@ impl<'a> Parser<'a> {
                     if indent < base_indent {
                         break;
                     }
-                    if let Some(min) = end_at_indent_below {
-                        if indent < min {
-                            break;
-                        }
+                    if let Some(min) = end_at_indent_below
+                        && indent < min
+                    {
+                        break;
                     }
                     if self.line(&tok)[indent as usize..].trim() == "@end" {
                         break;
@@ -295,10 +349,10 @@ impl<'a> Parser<'a> {
                     if indent < base_indent {
                         break;
                     }
-                    if let Some(min) = end_at_indent_below {
-                        if indent < min {
-                            break;
-                        }
+                    if let Some(min) = end_at_indent_below
+                        && indent < min
+                    {
+                        break;
                     }
                     let trimmed = &self.line(&tok)[indent as usize..];
 
@@ -477,7 +531,8 @@ impl<'a> Parser<'a> {
             &mut self.diags,
         );
 
-        let (content, idiags) = parse_inline(heading_text, tok.span.start + text_offset as u32);
+        let (content, idiags) =
+            inline::parse_inline(heading_text, tok.span.start + text_offset as u32);
         self.diags.extend(idiags);
         Block::Heading {
             level,
@@ -495,13 +550,13 @@ impl<'a> Parser<'a> {
         // Hold the first line as a source slice and only spill into the
         // owned `text` accumulator when a second line (or a hard break)
         // makes joining unavoidable.
-        let mut single: Option<&'a str> = None;
+        let mut single: Option<&'src str> = None;
         // (end of the line's text in `text`, source offset of its `\`).
         let mut hard_breaks: Vec<(usize, usize)> = Vec::new();
         // Where each joined line starts in `text` and in the source. The
         // buffer is reused across paragraphs to keep allocation off the
         // common path.
-        let mut segs = std::mem::take(&mut self.seg_buf);
+        let mut segs = mem::take(&mut self.seg_buf);
         segs.clear();
         // Source offset just past the previous line's hard-break `\`.
         let mut after_backslash: Option<u32> = None;
@@ -568,7 +623,7 @@ impl<'a> Parser<'a> {
         if let Some(s) = single {
             self.seg_buf = segs;
             let base = first.span.start + first.indent as u32;
-            let (content, d) = parse_inline(s, base);
+            let (content, d) = inline::parse_inline(s, base);
             self.diags.extend(d);
             return Block::Paragraph { content, span };
         }
@@ -576,7 +631,7 @@ impl<'a> Parser<'a> {
         let mut cursor = 0usize;
         for &(hb, backslash) in &hard_breaks {
             let chunk = &text[cursor..hb];
-            let (mut inl, d) = parse_inline_joined(chunk, cursor, &segs);
+            let (mut inl, d) = inline::parse_inline_joined(chunk, cursor, &segs);
             self.diags.extend(d);
             content.append(&mut inl);
             content.push(Inline::HardBreak {
@@ -585,7 +640,7 @@ impl<'a> Parser<'a> {
             cursor = hb;
         }
         let chunk = &text[cursor..];
-        let (mut inl, d) = parse_inline_joined(chunk, cursor, &segs);
+        let (mut inl, d) = inline::parse_inline_joined(chunk, cursor, &segs);
         self.diags.extend(d);
         content.append(&mut inl);
         self.seg_buf = segs;
@@ -681,7 +736,7 @@ impl<'a> Parser<'a> {
                 } else {
                     (None, after_marker, 0u32)
                 };
-            let (content, d) = parse_inline(
+            let (content, d) = inline::parse_inline(
                 item_text,
                 tok.span.start + indent as u32 + 2 + content_offset,
             );
@@ -747,7 +802,7 @@ impl<'a> Parser<'a> {
                 } else {
                     (None, after_marker, 0u32)
                 };
-            let (content, d) = parse_inline(
+            let (content, d) = inline::parse_inline(
                 item_text,
                 tok.span.start + indent as u32 + marker_len as u32 + content_offset,
             );
@@ -774,7 +829,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_blockquote(&mut self, indent: u16) -> Block {
-        let mut lines: Vec<QuoteLine<'a>> = Vec::new();
+        let mut lines: Vec<QuoteLine<'src>> = Vec::new();
         let start = self.peek().span;
         loop {
             if self.at_eof() {
@@ -838,15 +893,15 @@ impl<'a> Parser<'a> {
         let trimmed = &line[indent as usize..];
         let mut cursor = 2usize;
         let args = if trimmed.as_bytes().get(cursor) == Some(&b'(') {
-            match parse_args(trimmed, &mut cursor, directive.span.start + indent as u32) {
+            match inline::parse_args(trimmed, &mut cursor, directive.span.start + indent as u32) {
                 Ok(a) => a,
                 Err(d) => {
                     self.diags.push(d);
-                    ShortArgs::default()
+                    ShortcodeArgs::default()
                 }
             }
         } else {
-            ShortArgs::default()
+            ShortcodeArgs::default()
         };
         let mut rows: Vec<Row> = Vec::new();
         loop {
@@ -885,7 +940,7 @@ impl<'a> Parser<'a> {
             let mut parsed_cells: Vec<Vec<Inline>> = Vec::new();
             for c in split.cells {
                 let base = tok.span.start as usize + subslice_offset(row_line, c);
-                let (inl, d) = parse_inline(c, base as u32);
+                let (inl, d) = inline::parse_inline(c, base as u32);
                 self.diags.extend(d);
                 parsed_cells.push(inl);
             }
@@ -918,7 +973,7 @@ impl<'a> Parser<'a> {
                 );
             }
         }
-        if let Some(crate::shortcode::ArgValue::Array(a)) = args.keyword.get("align") {
+        if let Some(ArgValue::Array(a)) = args.keyword.get("align") {
             if a.len() != cols {
                 self.diags.push(
                     Diagnostic::new(Code::AlignArrayLength, directive.span).label(format!(
@@ -957,40 +1012,37 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_definition_list(&mut self, indent: u16) -> Block {
-        use crate::ast::DefinitionItem;
         let directive = *self.peek();
         let line = self.line(&directive);
         self.pos += 1;
         let trimmed = &line[indent as usize..];
         let mut cursor = 3usize;
         let args = if trimmed.as_bytes().get(cursor) == Some(&b'(') {
-            match parse_args(trimmed, &mut cursor, directive.span.start + indent as u32) {
+            match inline::parse_args(trimmed, &mut cursor, directive.span.start + indent as u32) {
                 Ok(a) => a,
                 Err(d) => {
                     self.diags.push(d);
-                    ShortArgs::default()
+                    ShortcodeArgs::default()
                 }
             }
         } else {
-            ShortArgs::default()
+            ShortcodeArgs::default()
         };
 
         let mut items: Vec<DefinitionItem> = Vec::new();
         let mut pending_term: Option<(Vec<Inline>, Span)> = None;
-        // (text accumulator, where each joined line starts in it and in the
-        // source, span covering the definition's lines).
-        let mut pending_def: Option<(String, Vec<Seg>, Span)> = None;
+        let mut pending_def: Option<PendingDef> = None;
         let cont_indent = indent + 2;
         let mut end_span = directive.span;
 
         // Closes any open definition into items, paired with the pending term.
         let finalize_def = |items: &mut Vec<DefinitionItem>,
                             pending_term: &mut Option<(Vec<Inline>, Span)>,
-                            pending_def: &mut Option<(String, Vec<Seg>, Span)>,
+                            pending_def: &mut Option<PendingDef>,
                             diags: &mut Vec<Diagnostic>| {
-            if let Some((text, segs, span)) = pending_def.take() {
+            if let Some(PendingDef { text, segs, span }) = pending_def.take() {
                 let term_pair = pending_term.take();
-                let (def_inl, dd) = parse_inline_joined(&text, 0, &segs);
+                let (def_inl, dd) = inline::parse_inline_joined(&text, 0, &segs);
                 diags.extend(dd);
                 if let Some((term, t_span)) = term_pair {
                     let pair_span = t_span.join(span);
@@ -1040,13 +1092,13 @@ impl<'a> Parser<'a> {
                     {
                         // Continuation of the active definition.
                         let body = &s[cont_indent as usize..];
-                        pd.0.push(' ');
-                        pd.1.push(Seg {
-                            joined: pd.0.len() as u32,
+                        pd.text.push(' ');
+                        pd.segs.push(Seg {
+                            joined: pd.text.len() as u32,
                             source: tok.span.start + cont_indent as u32,
                         });
-                        pd.0.push_str(body);
-                        pd.2 = pd.2.join(tok.span);
+                        pd.text.push_str(body);
+                        pd.span = pd.span.join(tok.span);
                         self.pos += 1;
                         continue;
                     }
@@ -1114,8 +1166,11 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                         let source = tok.span.start + indent as u32 + 2;
-                        pending_def =
-                            Some((rest.to_string(), vec![Seg { joined: 0, source }], tok.span));
+                        pending_def = Some(PendingDef {
+                            text: rest.to_string(),
+                            segs: vec![Seg { joined: 0, source }],
+                            span: tok.span,
+                        });
                         self.pos += 1;
                     } else if body.starts_with(':') {
                         self.diags.push(
@@ -1138,7 +1193,7 @@ impl<'a> Parser<'a> {
                             );
                         }
                         let base = tok.span.start + indent as u32;
-                        let (term, td) = parse_inline(body, base);
+                        let (term, td) = inline::parse_inline(body, base);
                         self.diags.extend(td);
                         pending_term = Some((term, tok.span));
                         self.pos += 1;
@@ -1191,10 +1246,10 @@ impl<'a> Parser<'a> {
             cursor += 1;
         }
         let name = trimmed[name_start..cursor].to_string();
-        let mut args = ShortArgs::default();
+        let mut args = ShortcodeArgs::default();
         let mut arg_err = None;
         if bytes.get(cursor) == Some(&b'(') {
-            match parse_args(trimmed, &mut cursor, tok.span.start + indent as u32) {
+            match inline::parse_args(trimmed, &mut cursor, tok.span.start + indent as u32) {
                 Ok(a) => args = a,
                 Err(d) => {
                     // Resume after the line's last `)` so a directive with a
@@ -1246,7 +1301,12 @@ impl<'a> Parser<'a> {
     /// block. The body must never go through `parse_blocks`/`parse_inline`;
     /// that would reject ordinary code (`*ptr` reads as emphasis) and
     /// double-escape the rest.
-    fn parse_code_shortcode_body(&mut self, indent: u16, open: &Token, args: ShortArgs) -> Block {
+    fn parse_code_shortcode_body(
+        &mut self,
+        indent: u16,
+        open: &Token,
+        args: ShortcodeArgs,
+    ) -> Block {
         let lang = self.code_shortcode_lang(args, open.span);
         let body_start = self.pos;
         let mut body = String::new();
@@ -1291,7 +1351,7 @@ impl<'a> Parser<'a> {
     /// markup would eat TeX's backslashes and `_`/`*`. The body becomes a
     /// single text paragraph so emitters can recover the source exactly.
     /// Trailing whitespace is dropped as on any Brief line; TeX ignores it.
-    fn parse_math_block_body(&mut self, indent: u16, open: &Token, args: ShortArgs) -> Block {
+    fn parse_math_block_body(&mut self, indent: u16, open: &Token, args: ShortcodeArgs) -> Block {
         let mut body = String::new();
         let mut body_span: Option<Span> = None;
         let mut end_span = open.span;
@@ -1340,7 +1400,7 @@ impl<'a> Parser<'a> {
     /// `@code` becomes a `CodeBlock` before the resolver ever sees it, so its
     /// arguments must be checked here: one optional `lang`, positional or
     /// keyword, string or ident.
-    fn code_shortcode_lang(&mut self, args: ShortArgs, span: Span) -> Option<String> {
+    fn code_shortcode_lang(&mut self, args: ShortcodeArgs, span: Span) -> Option<String> {
         let mut lang: Option<String> = None;
         for (i, v) in args.positional.iter().enumerate() {
             if i > 0 {
@@ -1397,11 +1457,22 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// A definition being accumulated in an `@dl` block, before it is paired
+/// with its term.
+struct PendingDef {
+    /// The definition's lines joined with single spaces.
+    text: String,
+    /// Where each joined line starts in `text` and in the source.
+    segs: Vec<Seg>,
+    /// Covers the definition's lines.
+    span: Span,
+}
+
 /// One `>` line: its nesting depth, the text after the markers, and that
 /// text's source offset.
-struct QuoteLine<'a> {
+struct QuoteLine<'src> {
     depth: usize,
-    body: &'a str,
+    body: &'src str,
     base: u32,
     span: Span,
 }
@@ -1430,7 +1501,7 @@ fn build_blockquote(
             full_span.join(span)
         };
         if d == depth {
-            let (content, inline_diags) = parse_inline(body, base);
+            let (content, inline_diags) = inline::parse_inline(body, base);
             diags.extend(inline_diags);
             paras.push(Block::Paragraph { content, span });
             i += 1;
@@ -1570,15 +1641,10 @@ fn parse_heading_anchor<'a>(
     base: u32,
     diags: &mut Vec<Diagnostic>,
 ) -> (&'a str, Option<String>) {
-    // Quick exit: if there's no `{#` anywhere, no anchor syntax is possible.
-    if !text.contains("{#") {
-        return (text, None);
-    }
-
     // Find the last `{#` occurrence (there can be at most one anchor block).
-    let hash_open = match text.rfind("{#") {
-        Some(i) => i,
-        None => return (text, None),
+    // With no `{#` anywhere, no anchor syntax is possible.
+    let Some(hash_open) = text.rfind("{#") else {
+        return (text, None);
     };
 
     // Check if the `}` at end-of-line closes this `{#`.
@@ -1587,12 +1653,9 @@ fn parse_heading_anchor<'a>(
     // Case C: no `}` after the `{#` at all → the `{#` is inside text, leave alone.
 
     let after_hash = &text[hash_open..];
-    let rbrace = match after_hash.find('}') {
-        Some(i) => i,
-        None => {
-            // `{#` with no closing `}` anywhere → plain text, no error.
-            return (text, None);
-        }
+    let Some(rbrace) = after_hash.find('}') else {
+        // `{#` with no closing `}` anywhere → plain text, no error.
+        return (text, None);
     };
 
     let candidate = &after_hash[..rbrace + 1]; // e.g. `{#abc}`
@@ -1614,19 +1677,11 @@ fn parse_heading_anchor<'a>(
     // Validate: exactly one space before `{`.
     let before = &text[..hash_open];
 
-    let malformed = if before.is_empty() {
-        // No content before `{#...}` → no space before `{`.
-        true
-    } else {
-        let last_ch = before.chars().last().unwrap();
-        if last_ch != ' ' {
-            // No space before `{`
-            true
-        } else {
-            // Check for double space (before ends with "  ")
-            let before_trim = &before[..before.len() - 1];
-            before_trim.ends_with(' ')
-        }
+    let malformed = match before.strip_suffix(' ') {
+        // Exactly one space before `{`, not two.
+        Some(rest) => rest.ends_with(' '),
+        // Nothing, or no space, before `{`.
+        None => true,
     };
 
     // Extract the name (everything between `{#` and `}`).
@@ -1740,8 +1795,8 @@ fn subslice_offset(outer: &str, inner: &str) -> usize {
 /// in whatever frame it wants `unclosed_backtick_at` to be relative to —
 /// see the doc comment on that field.
 #[derive(Debug)]
-pub(crate) struct RowSplit<'a> {
-    pub(crate) cells: Vec<&'a str>,
+pub(crate) struct RowSplit<'line> {
+    pub(crate) cells: Vec<&'line str>,
     /// `Some(byte_offset)` if a backtick code span opened in this row
     /// and never closed. The offset is relative to **the input slice
     /// passed to `split_cells`** (i.e. the same `&str` whose address
@@ -1834,11 +1889,11 @@ pub(crate) fn split_cells(line: &str) -> RowSplit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::lex;
+    use crate::lexer;
 
     fn p(s: &str) -> (Document, Vec<Diagnostic>) {
         let src = SourceMap::new("d.brf", s);
-        let toks = lex(&src).unwrap();
+        let toks = lexer::lex(&src).unwrap();
         parse(toks, &src)
     }
 
@@ -1890,10 +1945,10 @@ mod tests {
     fn paragraph_join() {
         let (doc, d) = p("one\ntwo\n");
         assert!(d.is_empty());
-        if let Block::Paragraph { content, .. } = &doc.blocks[0] {
-            if let Inline::Text { value, .. } = &content[0] {
-                assert_eq!(value, "one two");
-            }
+        if let Block::Paragraph { content, .. } = &doc.blocks[0]
+            && let Inline::Text { value, .. } = &content[0]
+        {
+            assert_eq!(value, "one two");
         }
     }
 
@@ -2005,7 +2060,7 @@ mod tests {
         // the row's column count.
         let (doc, d) = p("@t\n| Op | Meaning\n| `|>` | pipeline\n");
         assert!(d.is_empty(), "{:?}", d);
-        if let crate::ast::Block::Table { rows, .. } = &doc.blocks[0] {
+        if let Block::Table { rows, .. } = &doc.blocks[0] {
             assert_eq!(rows.len(), 1, "{:?}", rows);
             assert_eq!(rows[0].cells.len(), 2);
         } else {
@@ -2017,7 +2072,7 @@ mod tests {
     fn table_pipe_inside_double_backtick_span_is_not_a_separator() {
         let (doc, d) = p("@t\n| A | B\n| ``a ` b | c`` | d\n");
         assert!(d.is_empty(), "{:?}", d);
-        if let crate::ast::Block::Table { rows, .. } = &doc.blocks[0] {
+        if let Block::Table { rows, .. } = &doc.blocks[0] {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].cells.len(), 2);
         } else {
@@ -2353,11 +2408,11 @@ mod tests {
     /// (code, line, column) of each diagnostic, in emission order.
     fn at(s: &str) -> Vec<(Code, usize, usize)> {
         let src = SourceMap::new("d.brf", s);
-        let (_, d) = parse(lex(&src).unwrap(), &src);
+        let (_, d) = parse(lexer::lex(&src).unwrap(), &src);
         d.iter()
             .map(|x| {
-                let (l, c) = src.line_col(x.span.start);
-                (x.code, l, c)
+                let pos = src.line_column(x.span.start);
+                (x.code, pos.line, pos.column)
             })
             .collect()
     }
@@ -2529,7 +2584,7 @@ mod tests {
         let src = "@t\n| A | B\n| x | @kbd(é)[y]\n";
         assert_eq!(at(src), vec![(Code::BadArgSyntax, 3, 12)]);
         let s = SourceMap::new("d.brf", src);
-        let (_, d) = parse(lex(&s).unwrap(), &s);
+        let (_, d) = parse(lexer::lex(&s).unwrap(), &s);
         assert_eq!(&src[d[0].span.range()], "é");
     }
 
@@ -2567,7 +2622,7 @@ mod tests {
         let src = "# T\n\n@callout(kind: é)\nx\n@end\n";
         assert_eq!(at(src), vec![(Code::BadArgSyntax, 3, 16)]);
         let s = SourceMap::new("d.brf", src);
-        let (_, d) = parse(lex(&s).unwrap(), &s);
+        let (_, d) = parse(lexer::lex(&s).unwrap(), &s);
         assert_eq!(&src[d[0].span.range()], "é");
         assert_eq!(
             at("x\n\n@t(align: é)\n| A\n"),

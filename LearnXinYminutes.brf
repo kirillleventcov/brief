@@ -252,8 +252,8 @@ header. There is NO separator row.
 
 @t
 | Name | Age | City
-| John | 30 | NYC
-| Jane | 25 | LA
+| John | 30  | NYC
+| Jane | 25  | LA
 
 The trailing `|` is optional. Cells are trimmed of leading and trailing
 whitespace. Every row must have the same number of cells as the header
@@ -267,8 +267,8 @@ Column alignment is set on the directive:
 
 @t(align: [left, right, center])
 | Name | Score | Status
-| Ada | 1024 | active
-| Bob | 42 | idle
+| Ada  | 1024  | active
+| Bob  | 42    | idle
 
 Alignment array length must match the column count (B0504).
 
@@ -288,20 +288,20 @@ one is an error (B0401).
 Built-in shortcodes that ship with the reference compiler:
 
 @t
-| Name | Form | Purpose
-| link | inline | hyperlink
-| image | inline | image
-| kbd | inline | keyboard input
-| sub | inline | subscript (replaces inline `<sub>`)
-| sup | inline | superscript (replaces inline `<sup>`)
-| details | block | collapsible block (replaces `<details>/<summary>`)
-| dl | block | definition list (see §5a)
-| t | block | tables (special-cased)
-| code | block | same as triple-backtick fence
-| callout | block | boxed note
-| math | both | LaTeX math, inline or block
+| Name     | Form   | Purpose
+| link     | inline | hyperlink
+| image    | inline | image
+| kbd      | inline | keyboard input
+| sub      | inline | subscript (replaces inline `<sub>`)
+| sup      | inline | superscript (replaces inline `<sup>`)
+| details  | block  | collapsible block (replaces `<details>/<summary>`)
+| dl       | block  | definition list (see §5a)
+| t        | block  | tables (special-cased)
+| code     | block  | same as triple-backtick fence
+| callout  | block  | boxed note
+| math     | both   | LaTeX math, inline or block
 | footnote | inline | footnote text
-| ref | inline | cross-document reference (path#anchor → display text)
+| ref      | inline | cross-document reference (path#anchor → display text)
 
 Inline HTML has no general escape hatch in Brief. The four built-ins
 above (`@kbd`, `@sub`, `@sup`, `@details`) cover the inline tags that

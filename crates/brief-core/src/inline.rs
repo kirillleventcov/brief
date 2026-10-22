@@ -1,9 +1,8 @@
-use crate::ast::{Inline, ShortArgs};
+use crate::ast::{Inline, ShortcodeArgs};
 use crate::diag::{Code, Diagnostic};
 use crate::parser::MAX_NESTING_DEPTH;
 use crate::shortcode::ArgValue;
 use crate::span::Span;
-use std::collections::BTreeMap;
 
 /// One source line's share of a string built by joining several lines
 /// (paragraph or definition continuations with a single space): bytes from
@@ -16,6 +15,10 @@ pub(crate) struct Seg {
     pub(crate) source: u32,
 }
 
+/// Parse one line of inline Brief markup (emphasis, code, shortcodes,
+/// links). `base` is the line's byte offset in the source, so returned
+/// spans are absolute. Returns the nodes and any diagnostics.
+#[must_use]
 pub fn parse_inline(line: &str, base: u32) -> (Vec<Inline>, Vec<Diagnostic>) {
     parse_inline_joined(
         line,
@@ -64,10 +67,10 @@ pub(crate) fn parse_inline_joined(
     (nodes, p.diags)
 }
 
-struct Parser<'a> {
-    src: &'a str,
+struct Parser<'src> {
+    src: &'src str,
     origin: usize,
-    segs: &'a [Seg],
+    segs: &'src [Seg],
     pos: usize,
     diags: Vec<Diagnostic>,
     /// Emphasis kinds open around `pos` within the current shortcode body,
@@ -124,7 +127,7 @@ fn emph_bit(marker: u8) -> u8 {
     }
 }
 
-impl<'a> Parser<'a> {
+impl Parser<'_> {
     fn span(&self, start: usize, len: usize) -> Span {
         // Single-line input, by far the common case: a plain offset.
         if let [seg] = self.segs {
@@ -379,7 +382,7 @@ impl<'a> Parser<'a> {
             }
         }
         let name = self.src[name_start..cursor].to_string();
-        let mut args = ShortArgs::default();
+        let mut args = ShortcodeArgs::default();
         if bytes.get(cursor) == Some(&b'(') {
             match parse_args(self.src, &mut cursor, 0) {
                 Ok(a) => args = a,
@@ -633,14 +636,13 @@ pub(crate) fn is_open_marker_at(bytes: &[u8], pos: usize) -> bool {
 /// Parse a `(...)` argument list starting at `*cursor`. `src` is the text
 /// the cursor indexes and `base` is its offset in the source, so diagnostic
 /// spans come back absolute.
-pub fn parse_args(src: &str, cursor: &mut usize, base: u32) -> Result<ShortArgs, Diagnostic> {
+pub fn parse_args(src: &str, cursor: &mut usize, base: u32) -> Result<ShortcodeArgs, Diagnostic> {
     let bytes = src.as_bytes();
     if bytes.get(*cursor) != Some(&b'(') {
-        return Ok(ShortArgs::default());
+        return Ok(ShortcodeArgs::default());
     }
     *cursor += 1;
-    let mut args = ShortArgs::default();
-    let mut keys_seen: BTreeMap<String, ()> = BTreeMap::new();
+    let mut args = ShortcodeArgs::default();
     skip_ws(src, cursor);
     if bytes.get(*cursor) == Some(&b')') {
         *cursor += 1;
@@ -658,7 +660,7 @@ pub fn parse_args(src: &str, cursor: &mut usize, base: u32) -> Result<ShortArgs,
                 let v = read_value(src, cursor).ok_or_else(|| {
                     Diagnostic::new(Code::BadArgSyntax, char_span(src, *cursor, base))
                 })?;
-                if keys_seen.insert(name.clone(), ()).is_some() {
+                if args.keyword.contains_key(&name) {
                     return Err(Diagnostic::new(
                         Code::DuplicateKwarg,
                         Span::new(base as usize + arg_start, name.len()),

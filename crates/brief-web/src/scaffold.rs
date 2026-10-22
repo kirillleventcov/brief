@@ -3,28 +3,38 @@
 use std::fs;
 use std::path::Path;
 
-pub struct ScaffoldOpts {
+/// What `brief-web init` should generate.
+#[derive(Clone, Debug, Default)]
+pub struct ScaffoldOptions {
+    /// Generate a multi-page skeleton with `SUMMARY.brf` instead of a single
+    /// `index.brf`.
     pub multi_page: bool,
+    /// Overwrite files that already exist instead of refusing.
     pub force: bool,
 }
 
-pub fn create(dir: &Path, opts: &ScaffoldOpts) -> Result<(), String> {
+/// Write a project skeleton (`book.toml`, `src/`, `.gitignore`) into `dir`,
+/// creating it if needed.
+///
+/// Fails with a human-readable message if a file already exists and
+/// `options.force` is unset, or on any I/O error.
+pub fn create(dir: &Path, options: &ScaffoldOptions) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
     let src = dir.join("src");
     fs::create_dir_all(&src).map_err(|e| format!("cannot create {}: {}", src.display(), e))?;
 
-    write(&dir.join("book.toml"), BOOK_TOML, opts.force)?;
+    write(&dir.join("book.toml"), BOOK_TOML, options.force)?;
 
-    if opts.multi_page {
-        write(&src.join("SUMMARY.brf"), SUMMARY_BRF, opts.force)?;
-        write(&src.join("index.brf"), INDEX_MULTI_BRF, opts.force)?;
+    if options.multi_page {
+        write(&src.join("SUMMARY.brf"), SUMMARY_BRF, options.force)?;
+        write(&src.join("index.brf"), INDEX_MULTI_BRF, options.force)?;
         write(
             &src.join("getting-started.brf"),
             GETTING_STARTED_BRF,
-            opts.force,
+            options.force,
         )?;
     } else {
-        write(&src.join("index.brf"), INDEX_SINGLE_BRF, opts.force)?;
+        write(&src.join("index.brf"), INDEX_SINGLE_BRF, options.force)?;
     }
 
     let gitignore = dir.join(".gitignore");

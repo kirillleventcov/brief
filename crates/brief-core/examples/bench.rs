@@ -15,20 +15,25 @@ use std::time::Instant;
 use brief::emit::{html, llm};
 use brief::shortcode::Registry;
 use brief::span::SourceMap;
-use brief::validate::ValidateOpts;
+use brief::validate::ValidateOptions;
 use brief::{fmt, lexer, parser, resolve, validate};
+use std::env;
+use std::fs;
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let mut args = env::args().skip(1);
     let path = args.next().expect("usage: bench <file.brf> [iters]");
-    let iters: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(10);
+    let iters: usize = args
+        .next()
+        .map(|s| s.parse().expect("iters must be a positive integer"))
+        .unwrap_or(10);
 
-    let raw = std::fs::read_to_string(&path).expect("read input");
+    let raw = fs::read_to_string(&path).expect("read input");
     let bytes = raw.len();
     let src = SourceMap::new(path.clone(), raw.clone());
     let registry = Registry::default();
-    let vopts = ValidateOpts::default();
-    let lopts = llm::Opts::default();
+    let vopts = ValidateOptions::default();
+    let lopts = llm::Options::default();
 
     let mib = bytes as f64 / (1024.0 * 1024.0);
     println!(
@@ -68,7 +73,7 @@ fn main() {
     report("parse", best);
 
     // resolve + validate
-    let (doc0, _) = parser::parse(tokens.clone(), &src);
+    let (doc0, _) = parser::parse(tokens, &src);
     let mut best = f64::MAX;
     for _ in 0..iters {
         let mut doc = doc0.clone();
@@ -81,7 +86,7 @@ fn main() {
     report("res+val", best);
 
     // fully resolved doc for emitters
-    let mut doc = doc0.clone();
+    let mut doc = doc0;
     let _ = resolve::resolve(&mut doc, &registry);
 
     let mut best = f64::MAX;
@@ -98,11 +103,11 @@ fn main() {
         let t = Instant::now();
         let out = llm::render(black_box(&doc), &registry, &lopts);
         best = best.min(t.elapsed().as_secs_f64());
-        black_box(out);
+        let _ = black_box(out);
     }
     report("emit-llm", best);
 
-    let fopts = fmt::Opts::default();
+    let fopts = fmt::Options::default();
     let mut best = f64::MAX;
     for _ in 0..iters {
         let t = Instant::now();

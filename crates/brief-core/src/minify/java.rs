@@ -13,12 +13,18 @@
 //! Strategy: aggressive (Strategy A). Java requires explicit semicolons,
 //! so newlines can be stripped freely.
 
-use super::c_common::{Token, TokenKind, emit_aggressive};
+use super::c_common::{self, Token, TokenKind};
 use super::{MinifyError, MinifyOptions, MinifyOutput};
 
+/// Minify Java source, stripping all non-required whitespace.
+///
+/// # Errors
+///
+/// Returns [`MinifyError`] on unterminated comments, text blocks, or
+/// string/char literals.
 pub fn minify(source: &str, opts: &MinifyOptions) -> Result<MinifyOutput, MinifyError> {
     let toks = tokenize(source)?;
-    emit_aggressive(&toks, opts.keep_comments)
+    c_common::emit_aggressive(&toks, opts.keep_comments)
 }
 
 fn tokenize(src: &str) -> Result<Vec<Token<'_>>, MinifyError> {
@@ -100,7 +106,7 @@ fn tokenize(src: &str) -> Result<Vec<Token<'_>>, MinifyError> {
         }
         // Annotation `@<ident>`. The `@` is part of the token so it stays
         // bound to the ident on emit (no risk of `@ Override` rendering).
-        if c == b'@' && peek(bytes, i + 1).map_or(false, is_ident_start_byte) {
+        if c == b'@' && peek(bytes, i + 1).is_some_and(is_ident_start_byte) {
             let mut j = i + 1;
             while j < bytes.len() && is_ident_continue_byte(bytes[j]) {
                 j += 1;
@@ -115,7 +121,7 @@ fn tokenize(src: &str) -> Result<Vec<Token<'_>>, MinifyError> {
             i += n;
             continue;
         }
-        let n = scan_multi_punct(bytes, i);
+        let n = scan_multi_punct(src, i);
         out.push(Token::new(TokenKind::Punct(&src[i..i + n])));
         i += n;
     }
@@ -196,15 +202,9 @@ fn scan_word(src: &str, i: usize) -> usize {
     j - i
 }
 
-fn scan_multi_punct(bytes: &[u8], i: usize) -> usize {
-    let three = bytes
-        .get(i..i + 3)
-        .map(|s| std::str::from_utf8(s).unwrap_or(""))
-        .unwrap_or("");
-    let two = bytes
-        .get(i..i + 2)
-        .map(|s| std::str::from_utf8(s).unwrap_or(""))
-        .unwrap_or("");
+fn scan_multi_punct(src: &str, i: usize) -> usize {
+    let three = src.get(i..i + 3).unwrap_or("");
+    let two = src.get(i..i + 2).unwrap_or("");
     if matches!(three, "<<=" | ">>=" | ">>>" | "..." | "->>") {
         return 3;
     }
@@ -231,7 +231,7 @@ fn scan_multi_punct(bytes: &[u8], i: usize) -> usize {
     ) {
         return 2;
     }
-    let c = char_at(unsafe { std::str::from_utf8_unchecked(bytes) }, i);
+    let c = char_at(src, i);
     c.len_utf8()
 }
 

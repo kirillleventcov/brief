@@ -4,10 +4,17 @@
 //! `Hole` codes raised. Order of holes within a single conversion is not
 //! asserted unless explicitly stated.
 
-use brief::convert::{Hole, convert};
+use brief::ast::Block;
+use brief::convert::{self, Hole};
+use brief::lexer;
+use brief::parser;
+use brief::resolve;
+use brief::shortcode::Registry;
+use brief::span::SourceMap;
+use brief::validate::{self, ValidateOptions};
 
 fn run(md: &str) -> (String, Vec<Hole>) {
-    let r = convert(md, "test.md");
+    let r = convert::convert(md, "test.md");
     let holes: Vec<Hole> = r.diagnostics.iter().map(|d| d.hole).collect();
     (r.brief_source, holes)
 }
@@ -536,21 +543,19 @@ fn heading_anchor_passthrough() {
 
 #[test]
 fn converted_heading_anchor_round_trips_through_compiler() {
-    use brief::lexer::lex;
-    use brief::parser::parse;
-    use brief::span::SourceMap;
     let md = "# Top {#top}\n\n## Sub {#some-sub}\n\nbody\n";
-    let r = convert(md, "in.md");
+    let r = convert::convert(md, "in.md");
     let src = SourceMap::new("in.brf", r.brief_source.clone());
-    let toks = lex(&src).expect("lex");
-    let (doc, diags) = parse(toks, &src);
+    let toks = lexer::lex(&src).expect("lex");
+    let (doc, diags) = parser::parse(toks, &src);
     assert!(diags.is_empty(), "{:?}\n---\n{}", diags, r.brief_source);
     let mut anchors: Vec<String> = Vec::new();
     for b in &doc.blocks {
-        if let brief::ast::Block::Heading { anchor, .. } = b {
-            if let Some(a) = anchor {
-                anchors.push(a.clone());
-            }
+        if let Block::Heading {
+            anchor: Some(a), ..
+        } = b
+        {
+            anchors.push(a.clone());
         }
     }
     assert_eq!(anchors, vec!["top".to_string(), "some-sub".to_string()]);
@@ -558,20 +563,14 @@ fn converted_heading_anchor_round_trips_through_compiler() {
 
 #[test]
 fn converted_inline_shortcodes_round_trip_through_compiler() {
-    use brief::lexer::lex;
-    use brief::parser::parse;
-    use brief::resolve::resolve;
-    use brief::shortcode::Registry;
-    use brief::span::SourceMap;
-    use brief::validate::{ValidateOpts, validate};
     let md = "press <kbd>Ctrl+C</kbd> to abort. x<sup>2</sup> + y<sub>0</sub>\n";
-    let r = convert(md, "in.md");
+    let r = convert::convert(md, "in.md");
     let src = SourceMap::new("in.brf", &r.brief_source);
-    let toks = lex(&src).expect("lex");
-    let (mut doc, mut diags) = parse(toks, &src);
+    let toks = lexer::lex(&src).expect("lex");
+    let (mut doc, mut diags) = parser::parse(toks, &src);
     let reg = Registry::with_builtins();
-    diags.extend(resolve(&mut doc, &reg));
-    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+    diags.extend(resolve::resolve(&mut doc, &reg));
+    diags.extend(validate::validate(&doc, &ValidateOptions::default(), &src));
     assert!(
         diags.is_empty(),
         "diags:\n{:#?}\n---\n{}",
@@ -582,20 +581,14 @@ fn converted_inline_shortcodes_round_trip_through_compiler() {
 
 #[test]
 fn converted_details_round_trips_through_compiler() {
-    use brief::lexer::lex;
-    use brief::parser::parse;
-    use brief::resolve::resolve;
-    use brief::shortcode::Registry;
-    use brief::span::SourceMap;
-    use brief::validate::{ValidateOpts, validate};
     let md = "<details><summary>Why</summary>Because reasons.</details>\n";
-    let r = convert(md, "in.md");
+    let r = convert::convert(md, "in.md");
     let src = SourceMap::new("in.brf", &r.brief_source);
-    let toks = lex(&src).expect("lex");
-    let (mut doc, mut diags) = parse(toks, &src);
+    let toks = lexer::lex(&src).expect("lex");
+    let (mut doc, mut diags) = parser::parse(toks, &src);
     let reg = Registry::with_builtins();
-    diags.extend(resolve(&mut doc, &reg));
-    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+    diags.extend(resolve::resolve(&mut doc, &reg));
+    diags.extend(validate::validate(&doc, &ValidateOptions::default(), &src));
     assert!(
         diags.is_empty(),
         "diags:\n{:#?}\n---\n{}",
@@ -666,13 +659,6 @@ fn dollar_without_pair_is_text() {
     assert!(holes.is_empty(), "{:?}", holes);
 }
 
-use brief::lexer::lex;
-use brief::parser::parse;
-use brief::resolve::resolve;
-use brief::shortcode::Registry;
-use brief::span::SourceMap;
-use brief::validate::{ValidateOpts, validate};
-
 #[test]
 fn convert_simple_dl() {
     let md = "Term\n:   Definition.\n";
@@ -704,13 +690,13 @@ fn convert_dl_multiple_defs_emits_hole() {
 #[test]
 fn roundtrip_sample_compiles_clean() {
     let md = include_str!("fixtures/sample.md");
-    let result = convert(md, "sample.md");
+    let result = convert::convert(md, "sample.md");
     let src = SourceMap::new("sample.brf", &result.brief_source);
-    let tokens = lex(&src).expect("lex must succeed");
-    let (mut doc, mut diags) = parse(tokens, &src);
+    let tokens = lexer::lex(&src).expect("lex must succeed");
+    let (mut doc, mut diags) = parser::parse(tokens, &src);
     let reg = Registry::with_builtins();
-    diags.extend(resolve(&mut doc, &reg));
-    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+    diags.extend(resolve::resolve(&mut doc, &reg));
+    diags.extend(validate::validate(&doc, &ValidateOptions::default(), &src));
     assert!(
         diags.is_empty(),
         "converter produced invalid Brief:\n--- BRIEF ---\n{}\n--- DIAGS ---\n{:#?}",
@@ -750,18 +736,18 @@ fn link_without_title_no_kwarg() {
 fn link_with_title_roundtrips_through_compiler() {
     // The produced @link(title: "...")[text](url) form must parse and compile clean.
     let md = "[doc](https://example.com \"the title\")\n";
-    let result = convert(md, "test.md");
+    let result = convert::convert(md, "test.md");
     assert!(
         result.brief_source.contains("@link(title: \"the title\")"),
         "brief: {}",
         result.brief_source
     );
     let src = SourceMap::new("t.brf", &result.brief_source);
-    let tokens = lex(&src).expect("lex must succeed");
-    let (mut doc, mut diags) = parse(tokens, &src);
+    let tokens = lexer::lex(&src).expect("lex must succeed");
+    let (mut doc, mut diags) = parser::parse(tokens, &src);
     let reg = Registry::with_builtins();
-    diags.extend(resolve(&mut doc, &reg));
-    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+    diags.extend(resolve::resolve(&mut doc, &reg));
+    diags.extend(validate::validate(&doc, &ValidateOptions::default(), &src));
     assert!(
         diags.is_empty(),
         "converted Brief with title failed to compile:\n---\n{}\n---\n{:#?}",
@@ -831,13 +817,13 @@ fn gfm_all_five_alert_kinds_roundtrip() {
         ("> [!WARNING]\n> body\n", "warning"),
         ("> [!CAUTION]\n> body\n", "caution"),
     ] {
-        let result = convert(kind, "test.md");
+        let result = convert::convert(kind, "test.md");
         let src = SourceMap::new("t.brf", &result.brief_source);
-        let tokens = lex(&src).expect("lex must succeed");
-        let (mut doc, mut diags) = parse(tokens, &src);
+        let tokens = lexer::lex(&src).expect("lex must succeed");
+        let (mut doc, mut diags) = parser::parse(tokens, &src);
         let reg = Registry::with_builtins();
-        diags.extend(resolve(&mut doc, &reg));
-        diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+        diags.extend(resolve::resolve(&mut doc, &reg));
+        diags.extend(validate::validate(&doc, &ValidateOptions::default(), &src));
         assert!(
             diags.is_empty(),
             "GFM alert roundtrip failed:\n---\n{}\n---\n{:#?}",
@@ -909,11 +895,11 @@ fn inline_code_with_backtick_value_space_padded() {
 
 fn assert_compiles(brief_source: &str) {
     let src = SourceMap::new("out.brf", brief_source);
-    let tokens = lex(&src).expect("lex must succeed");
-    let (mut doc, mut diags) = parse(tokens, &src);
+    let tokens = lexer::lex(&src).expect("lex must succeed");
+    let (mut doc, mut diags) = parser::parse(tokens, &src);
     let reg = Registry::with_builtins();
-    diags.extend(resolve(&mut doc, &reg));
-    diags.extend(validate(&doc, &ValidateOpts::default(), &src));
+    diags.extend(resolve::resolve(&mut doc, &reg));
+    diags.extend(validate::validate(&doc, &ValidateOptions::default(), &src));
     assert!(
         diags.is_empty(),
         "converter produced invalid Brief:\n--- BRIEF ---\n{}\n--- DIAGS ---\n{:#?}",
@@ -927,7 +913,7 @@ const UNCLOSED_DETAILS_HOLE: &str = "// TODO[B-hole:html-block]: unclosed `<deta
 #[test]
 fn unclosed_details_keeps_rest_of_document() {
     let md = "Intro.\n\n<details><summary>S</summary>\n\nBody\n\n# Heading\n\nMore.\n";
-    let r = convert(md, "test.md");
+    let r = convert::convert(md, "test.md");
     assert_eq!(
         r.brief_source,
         format!(

@@ -12,9 +12,11 @@
 //! before diffing. This is brittle if `Span`'s `Debug` output ever changes,
 //! but it's a focused enough test to be worth that fragility.
 
-use brief::lexer;
-use brief::parser;
+use brief::fmt;
+use brief::project;
 use brief::span::SourceMap;
+use brief::{lexer, parser};
+use std::fs;
 use std::path::Path;
 
 /// What the compiler front-end makes of `source`: the span-stripped AST
@@ -73,7 +75,10 @@ fn strip_spans(s: &str) -> String {
             i = j;
         } else {
             // Copy the whole UTF-8 sequence, not a single byte.
-            let ch = s[i..].chars().next().unwrap();
+            let ch = s[i..]
+                .chars()
+                .next()
+                .expect("i < s.len() on a char boundary");
             out.push(ch);
             i += ch.len_utf8();
         }
@@ -82,8 +87,8 @@ fn strip_spans(s: &str) -> String {
 }
 
 fn assert_semantic_preserved(label: &str, src: &str) {
-    let opts = brief::fmt::Opts::default();
-    let formatted = brief::fmt::format(src, &opts);
+    let opts = brief::fmt::Options::default();
+    let formatted = fmt::format(src, &opts);
     let raw_doc = parse_doc_string(src);
     let fmt_doc = parse_doc_string(&formatted);
     assert_eq!(
@@ -97,9 +102,9 @@ fn assert_semantic_preserved(label: &str, src: &str) {
 /// idempotent, and when the input lexes, the formatted source parses to
 /// the same AST with the same diagnostics.
 fn assert_fmt_contract(label: &str, src: &str) {
-    let opts = brief::fmt::Opts::default();
-    let once = brief::fmt::format(src, &opts);
-    let twice = brief::fmt::format(&once, &opts);
+    let opts = brief::fmt::Options::default();
+    let once = fmt::format(src, &opts);
+    let twice = fmt::format(&once, &opts);
     assert_eq!(once, twice, "[{}] format() is not idempotent", label);
     let Some(before) = parse_summary(src) else {
         return;
@@ -260,14 +265,14 @@ fn contract_holds_for_every_repo_source() {
     // Every `.brf` in the workspace: the docs, the examples,
     // LearnXinYminutes, test fixtures and the fuzz corpus.
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let files = brief::project::brf_files(&root);
+    let files = project::brf_files(&root);
     assert!(
         files.len() > 20,
         "expected the repo corpus, found {} files",
         files.len()
     );
     for path in files {
-        let raw = std::fs::read_to_string(&path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
         assert_fmt_contract(&path.display().to_string(), &raw);
     }
 }
@@ -276,9 +281,9 @@ fn contract_holds_for_every_repo_source() {
 fn semantic_preserved_for_real_repo_doc() {
     // The flagship corpus file. If this passes, the formatter is
     // semantically transparent for representative real inputs.
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("LearnXinYminutes.brf");
-    let raw = std::fs::read_to_string(&p).unwrap();
+    let raw = fs::read_to_string(&p).unwrap();
     assert_semantic_preserved("LearnXinYminutes.brf", &raw);
 }

@@ -27,12 +27,19 @@
 //!
 //! Strategy: conservative (Strategy B). Newlines preserved.
 
-use super::c_common::{Token, TokenKind, emit_conservative};
+use super::c_common::{self, Token, TokenKind};
 use super::{MinifyError, MinifyOptions, MinifyOutput};
 
+/// Minify JavaScript or TypeScript source, preserving newlines so automatic
+/// semicolon insertion is unaffected.
+///
+/// # Errors
+///
+/// Returns [`MinifyError`] on unterminated comments, string, template, or
+/// regex literals.
 pub fn minify(source: &str, opts: &MinifyOptions) -> Result<MinifyOutput, MinifyError> {
     let toks = tokenize(source)?;
-    emit_conservative(&toks, opts.keep_comments)
+    c_common::emit_conservative(&toks, opts.keep_comments)
 }
 
 /// What a `{` opened — decides whether the matching `}` ends a statement
@@ -115,7 +122,7 @@ fn tokenize(src: &str) -> Result<Vec<Token<'_>>, MinifyError> {
             i += n;
             continue;
         }
-        let n = scan_multi_punct(bytes, i);
+        let n = scan_multi_punct(src, i);
         let punct = &src[i..i + n];
         if punct == "{" {
             brace_stack.push(if open_brace_is_object(&out) {
@@ -376,19 +383,10 @@ fn scan_word(src: &str, i: usize) -> usize {
     j - i
 }
 
-fn scan_multi_punct(bytes: &[u8], i: usize) -> usize {
-    let four = bytes
-        .get(i..i + 4)
-        .map(|s| std::str::from_utf8(s).unwrap_or(""))
-        .unwrap_or("");
-    let three = bytes
-        .get(i..i + 3)
-        .map(|s| std::str::from_utf8(s).unwrap_or(""))
-        .unwrap_or("");
-    let two = bytes
-        .get(i..i + 2)
-        .map(|s| std::str::from_utf8(s).unwrap_or(""))
-        .unwrap_or("");
+fn scan_multi_punct(src: &str, i: usize) -> usize {
+    let four = src.get(i..i + 4).unwrap_or("");
+    let three = src.get(i..i + 3).unwrap_or("");
+    let two = src.get(i..i + 2).unwrap_or("");
     if matches!(four, ">>>=") {
         return 4;
     }
@@ -426,7 +424,7 @@ fn scan_multi_punct(bytes: &[u8], i: usize) -> usize {
     ) {
         return 2;
     }
-    let c = char_at(unsafe { std::str::from_utf8_unchecked(bytes) }, i);
+    let c = char_at(src, i);
     c.len_utf8()
 }
 

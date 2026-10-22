@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use tempfile::TempDir;
 
 fn brief_bin() -> &'static str {
     env!("CARGO_BIN_EXE_brief")
@@ -14,9 +15,9 @@ fn brief_bin() -> &'static str {
 
 fn write(p: &Path, content: &str) {
     if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent).unwrap();
+        fs::create_dir_all(parent).expect("create parent dirs");
     }
-    fs::write(p, content).unwrap();
+    fs::write(p, content).expect("write test file");
 }
 
 fn run_in(cwd: &Path, args: &[&str]) -> Output {
@@ -35,12 +36,20 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Temp layout built by [`proj_and_elsewhere`]. `dir` owns the temp
+/// directory and deletes it on drop.
+struct ProjAndElsewhere {
+    dir: TempDir,
+    proj: PathBuf,
+    elsewhere: PathBuf,
+}
+
 /// `<td>/proj` with a custom `lede` shortcode and an llm default target,
 /// next to `<td>/elsewhere`, whose `brief.toml` is broken. Running from
 /// `elsewhere` proves the cwd plays no part.
-fn proj_and_elsewhere() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let td = tempfile::TempDir::new().unwrap();
-    let base = td.path().canonicalize().unwrap();
+fn proj_and_elsewhere() -> ProjAndElsewhere {
+    let dir = TempDir::new().expect("create temp dir");
+    let base = dir.path().canonicalize().expect("canonicalize temp dir");
     let proj = base.join("proj");
     let elsewhere = base.join("elsewhere");
     write(
@@ -50,12 +59,20 @@ fn proj_and_elsewhere() -> (tempfile::TempDir, PathBuf, PathBuf) {
     );
     write(&proj.join("docs/guide.brf"), "# Guide\n\n@lede[hi] text.\n");
     write(&elsewhere.join("brief.toml"), "[compile]\nnope = 1\n");
-    (td, proj, elsewhere)
+    ProjAndElsewhere {
+        dir,
+        proj,
+        elsewhere,
+    }
 }
 
 #[test]
 fn compile_uses_the_files_project_not_the_cwd() {
-    let (_td, _proj, elsewhere) = proj_and_elsewhere();
+    let ProjAndElsewhere {
+        dir: _dir,
+        elsewhere,
+        ..
+    } = proj_and_elsewhere();
     let out = run_in(&elsewhere, &["compile", "../proj/docs/guide.brf"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert_eq!(stderr(&out), "");
@@ -67,8 +84,8 @@ fn compile_uses_the_files_project_not_the_cwd() {
 
 #[test]
 fn a_cwd_brief_toml_does_not_configure_a_standalone_file() {
-    let (td, proj, _elsewhere) = proj_and_elsewhere();
-    let lonely = td.path().join("lonely/a.brf");
+    let ProjAndElsewhere { dir, proj, .. } = proj_and_elsewhere();
+    let lonely = dir.path().join("lonely/a.brf");
     write(&lonely, "@lede[hi]\n");
     let out = run_in(&proj, &["compile", lonely.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
@@ -82,7 +99,7 @@ fn a_cwd_brief_toml_does_not_configure_a_standalone_file() {
 
 #[test]
 fn config_flag_replaces_the_config_but_keeps_the_root() {
-    let td = tempfile::TempDir::new().unwrap();
+    let td = TempDir::new().unwrap();
     let root = td.path();
     write(&root.join("brief.toml"), "");
     write(&root.join("a.brf"), "# A {#top}\n");
@@ -107,7 +124,11 @@ fn config_flag_replaces_the_config_but_keeps_the_root() {
 
 #[test]
 fn compile_convert_uses_the_markdown_files_project() {
-    let (_td, proj, elsewhere) = proj_and_elsewhere();
+    let ProjAndElsewhere {
+        dir: _dir,
+        proj,
+        elsewhere,
+    } = proj_and_elsewhere();
     write(&proj.join("note.md"), "# Note\n\nBody.\n");
     let out = run_in(&elsewhere, &["compile", "--convert", "../proj/note.md"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -122,7 +143,11 @@ fn compile_convert_uses_the_markdown_files_project() {
 
 #[test]
 fn reverse_convert_uses_the_files_project_not_the_cwd() {
-    let (_td, _proj, elsewhere) = proj_and_elsewhere();
+    let ProjAndElsewhere {
+        dir: _dir,
+        elsewhere,
+        ..
+    } = proj_and_elsewhere();
     let out = run_in(
         &elsewhere,
         &["convert", "../proj/docs/guide.brf", "--stdout"],
@@ -133,7 +158,7 @@ fn reverse_convert_uses_the_files_project_not_the_cwd() {
 
 #[test]
 fn reverse_convert_reports_a_bad_project_config() {
-    let td = tempfile::TempDir::new().unwrap();
+    let td = TempDir::new().unwrap();
     let root = td.path().canonicalize().unwrap();
     write(&root.join("brief.toml"), "[compile]\nnope = 1\n");
     write(&root.join("a.brf"), "# A\n");
@@ -151,9 +176,9 @@ fn reverse_convert_reports_a_bad_project_config() {
 
 /// A project whose `draft.brf` does not parse, and a `guide.brf` that does
 /// not reference it.
-fn project_with_broken_draft() -> (tempfile::TempDir, PathBuf) {
-    let td = tempfile::TempDir::new().unwrap();
-    let root = td.path().canonicalize().unwrap();
+fn project_with_broken_draft() -> (TempDir, PathBuf) {
+    let td = TempDir::new().expect("create temp dir");
+    let root = td.path().canonicalize().expect("canonicalize temp dir");
     write(&root.join("brief.toml"), "");
     write(&root.join("draft.brf"), "# Draft {#d}\n\n*unfinished\n");
     write(&root.join("guide.brf"), "# Guide\n\nText.\n");

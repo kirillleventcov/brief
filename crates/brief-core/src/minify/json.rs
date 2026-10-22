@@ -14,11 +14,16 @@ use serde::de::IgnoredAny;
 /// Validate `source` as a single JSON document and strip insignificant
 /// whitespace. Number text, string escapes, key order and duplicate keys are
 /// kept byte-for-byte.
+///
+/// # Errors
+///
+/// Returns [`MinifyError`] carrying serde_json's message if `source` is not
+/// valid JSON.
 pub fn minify_json(source: &str) -> Result<MinifyOutput, MinifyError> {
     serde_json::from_str::<IgnoredAny>(source).map_err(|e| MinifyError::new(e.to_string()))?;
     let mut out = String::with_capacity(source.len());
     strip_whitespace(source, &mut out);
-    Ok(MinifyOutput::body(out))
+    Ok(MinifyOutput::from_body(out))
 }
 
 /// Validate `source` as JSONL — one JSON document per line — and strip each
@@ -26,6 +31,11 @@ pub fn minify_json(source: &str) -> Result<MinifyOutput, MinifyError> {
 /// only of JSON whitespace are dropped from the output. If any line fails to
 /// parse, the whole minification fails (caller emits the original block
 /// verbatim).
+///
+/// # Errors
+///
+/// Returns [`MinifyError`] naming the 1-based line number of the first line
+/// that is not valid JSON.
 pub fn minify_jsonl(source: &str) -> Result<MinifyOutput, MinifyError> {
     let mut out = String::with_capacity(source.len());
     let mut first = true;
@@ -37,14 +47,14 @@ pub fn minify_jsonl(source: &str) -> Result<MinifyOutput, MinifyError> {
             continue;
         }
         serde_json::from_str::<IgnoredAny>(line)
-            .map_err(|e| MinifyError::new(format!("line {}: {}", i + 1, e)))?;
+            .map_err(|e| MinifyError::new(format!("line {}: {e}", i + 1)))?;
         if !first {
             out.push('\n');
         }
         strip_whitespace(line, &mut out);
         first = false;
     }
-    Ok(MinifyOutput::body(out))
+    Ok(MinifyOutput::from_body(out))
 }
 
 fn is_json_whitespace(b: u8) -> bool {

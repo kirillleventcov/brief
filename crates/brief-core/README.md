@@ -11,32 +11,31 @@ LLM-friendly. The format spec doubles as a quickstart and lives in
 ## Use it from Rust
 
 ```rust
-use brief::config::Config;
 use brief::emit::html;
-use brief::lexer::lex;
-use brief::parser::parse;
-use brief::resolve::resolve;
+use brief::lexer;
+use brief::parser;
+use brief::resolve;
 use brief::shortcode::Registry;
 use brief::span::SourceMap;
-use brief::validate::{ValidateOpts, validate};
+use brief::validate::{self, ValidateOptions};
 
-let src = SourceMap::new("hello.brf", "# Hello\nworld\n".to_string());
-let tokens = lex(&src).expect("lex");
-let (mut doc, mut diags) = parse(tokens, &src);
-let registry = Registry::default();
-resolve(&mut doc, &registry, &mut diags);
-validate(&doc, ValidateOpts::default(), &mut diags);
-let rendered = html::render(&doc, &Config::default());
-println!("{}", rendered);
+let src = SourceMap::new("hello.brf", "# Hello\nworld\n");
+let tokens = lexer::lex(&src).expect("lex");
+let (mut doc, mut diagnostics) = parser::parse(tokens, &src);
+let registry = Registry::with_builtins();
+diagnostics.extend(resolve::resolve(&mut doc, &registry));
+diagnostics.extend(validate::validate(&doc, &ValidateOptions::default(), &src));
+let rendered = html::render(&doc, &registry);
+println!("{rendered}");
 ```
 
 Convert Markdown to Brief:
 
 ```rust
-use brief::convert::convert;
+use brief::convert;
 
-let result = convert("# Hello\n\nworld\n", "hello.md");
-println!("{}", result.source);
+let result = convert::convert("# Hello\n\nworld\n", "hello.md");
+println!("{}", result.brief_source);
 ```
 
 ## What's in the box

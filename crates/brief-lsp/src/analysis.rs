@@ -10,16 +10,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use brief::{
-    ast::{Block, Document, Inline},
-    config::Config,
-    diag::{Diagnostic, Severity},
-    lexer, parser,
-    project::{self, Project, ProjectIndex},
-    span::{SourceMap, Span},
-};
-
-pub use brief::project::{RefSite, collect_refs};
+use brief::ast::{Block, Document, Inline};
+use brief::config::Config;
+use brief::diag::{Diagnostic, Severity};
+use brief::project::{self, Project, ProjectIndex, RefSite};
+use brief::span::{SourceMap, Span};
+use brief::{lexer, parser};
 
 // ---------------------------------------------------------------------------
 // Project snapshot
@@ -41,39 +37,42 @@ pub struct ProjectSnapshot {
     pub config_error: Option<String>,
 }
 
-/// Build a snapshot for a known project root (a directory that contains
-/// `brief.toml`). Index diagnostics from other files are dropped here: the
-/// editor shows those when their own file is open, and a `@ref` into a
-/// broken file reports B0605 through the index's `broken` set.
-pub fn load_snapshot(root: &Path) -> ProjectSnapshot {
-    let (project, config_error) = match Project::discover(root, None) {
-        Ok(p) => (p, None),
-        Err(e) => (
-            Project::from_config(Some(root.to_path_buf()), None, Config::default()),
-            Some(e),
-        ),
-    };
-    let index = project::build_index(root).0;
-    ProjectSnapshot {
-        root: root.to_path_buf(),
-        project,
-        index,
-        config_error,
+impl ProjectSnapshot {
+    /// Build a snapshot for a known project root (a directory that contains
+    /// `brief.toml`). Index diagnostics from other files are dropped here: the
+    /// editor shows those when their own file is open, and a `@ref` into a
+    /// broken file reports B0605 through the index's `broken` set.
+    pub fn load(root: &Path) -> Self {
+        let (project, config_error) = match Project::discover(root, None) {
+            Ok(p) => (p, None),
+            Err(e) => (
+                Project::from_config(Some(root.to_path_buf()), None, Config::default()),
+                Some(e),
+            ),
+        };
+        let index = project::build_index(root).index;
+        Self {
+            root: root.to_path_buf(),
+            project,
+            index,
+            config_error,
+        }
     }
 }
 
 /// Project-relative forward-slash path for `doc_path` under `root`, in the
 /// same form `build_index` uses as keys. `None` when the file is outside
 /// the root.
-pub fn rel_path(root: &Path, doc_path: &Path) -> Option<String> {
+pub fn relative_path(root: &Path, doc_path: &Path) -> Option<String> {
     let canon = doc_path
         .canonicalize()
         .unwrap_or_else(|_| doc_path.to_path_buf());
     canon.strip_prefix(root).ok().map(|p| {
-        p.components()
+        let parts: Vec<_> = p
+            .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/")
+            .collect();
+        parts.join("/")
     })
 }
 
@@ -92,15 +91,16 @@ pub struct BufferEntry {
 }
 
 impl BufferEntry {
-    fn of(src: &SourceMap) -> BufferEntry {
+    /// Judge the buffer in `src` exactly as `build_index` judges a file.
+    fn from_source(src: &SourceMap) -> Self {
         match lexer::lex(src) {
-            Err(_) => BufferEntry {
+            Err(_) => Self {
                 anchors: BTreeSet::new(),
                 broken: true,
             },
             Ok(tokens) => {
                 let (doc, diags) = parser::parse(tokens, src);
-                BufferEntry {
+                Self {
                     anchors: project::collect_anchors(&doc),
                     broken: diags.iter().any(|d| d.severity == Severity::Error),
                 }
@@ -133,11 +133,11 @@ pub fn analyze(
     overlay: &BTreeMap<String, BufferEntry>,
 ) -> Analysis {
     let src = SourceMap::new(doc_path.to_string_lossy(), text.to_string());
-    let entry = BufferEntry::of(&src);
+    let entry = BufferEntry::from_source(&src);
 
     let checked = match snapshot {
         Some(s) => {
-            let rel = rel_path(&s.root, doc_path);
+            let rel = relative_path(&s.root, doc_path);
             let mut index = s.index.clone();
             let own = rel.as_ref().map(|r| (r, &entry));
             for (p, e) in overlay.iter().chain(own) {
@@ -174,6 +174,8 @@ pub struct HeadingInfo {
     pub span: Span,
 }
 
+/// Every heading in `doc`, in document order, including headings nested in
+/// blockquotes, block shortcodes and list items.
 pub fn collect_headings(doc: &Document) -> Vec<HeadingInfo> {
     let mut out = Vec::new();
     for b in &doc.blocks {
@@ -229,28 +231,31 @@ fn push_inline_text(nodes: &[Inline], out: &mut String) {
             | Inline::Underline { content, .. }
             | Inline::Strike { content, .. } => push_inline_text(content, out),
             Inline::HardBreak { .. } => out.push(' '),
-            Inline::Shortcode { content, .. } => {
-                if let Some(c) = content {
-                    push_inline_text(c, out);
-                }
-            }
+            Inline::Shortcode {
+                content: Some(c), ..
+            } => push_inline_text(c, out),
+            // A shortcode without content, or an inline kind added to
+            // brief-core later, carries no plain text.
+            _ => {}
         }
     }
 }
 
 /// The `@ref` whose span contains `byte`, if any.
 pub fn ref_at(doc: &Document, byte: usize) -> Option<RefSite> {
-    collect_refs(doc)
+    project::collect_refs(doc)
         .into_iter()
         .find(|r| span_contains(r.span, byte))
 }
 
-/// The anchored heading whose span contains `byte`, if any.
-pub fn heading_anchor_at(doc: &Document, byte: usize) -> Option<(Span, String)> {
+/// Anchor of the anchored heading whose span contains `byte`, if any.
+pub fn heading_anchor_at(doc: &Document, byte: usize) -> Option<String> {
     collect_headings(doc)
         .into_iter()
-        .find(|h| h.anchor.is_some() && span_contains(h.span, byte))
-        .map(|h| (h.span, h.anchor.unwrap()))
+        .find_map(|h| match h.anchor {
+            Some(anchor) if span_contains(h.span, byte) => Some(anchor),
+            _ => None,
+        })
 }
 
 /// Span of the heading declaring `anchor`, if any.
@@ -267,12 +272,27 @@ fn span_contains(span: Span, byte: usize) -> bool {
     byte >= s && byte <= e
 }
 
-/// Split a raw `@ref` target into (path, anchor). Best-effort — full
+/// A raw `@ref` target split into its parts.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RefTarget {
+    /// Project-relative path of the referenced file.
+    pub path: String,
+    /// Heading anchor after `#`, if any.
+    pub anchor: Option<String>,
+}
+
+/// Split a raw `@ref` target into path and anchor. Best-effort — full
 /// validation is the resolver's job; navigation just needs the parts.
-pub fn split_target(target: &str) -> (String, Option<String>) {
+pub fn split_target(target: &str) -> RefTarget {
     match target.trim().split_once('#') {
-        Some((p, a)) => (p.to_string(), Some(a.to_string())),
-        None => (target.trim().to_string(), None),
+        Some((p, a)) => RefTarget {
+            path: p.to_string(),
+            anchor: Some(a.to_string()),
+        },
+        None => RefTarget {
+            path: target.trim().to_string(),
+            anchor: None,
+        },
     }
 }
 
@@ -283,10 +303,12 @@ pub fn split_target(target: &str) -> (String, Option<String>) {
 /// Heading outline as a forest of indices into the `collect_headings`
 /// slice. A heading owns every following heading of a deeper level.
 pub struct SymbolNode {
-    pub idx: usize,
+    /// Index of this heading in the `collect_headings` slice.
+    pub index: usize,
     pub children: Vec<SymbolNode>,
 }
 
+/// Nest `headings` (as returned by `collect_headings`) into an outline.
 pub fn nest_headings(headings: &[HeadingInfo]) -> Vec<SymbolNode> {
     let mut pos = 0;
     nest_from(headings, &mut pos, 0)
@@ -299,10 +321,10 @@ fn nest_from(headings: &[HeadingInfo], pos: &mut usize, min_level: u8) -> Vec<Sy
         if level < min_level {
             break;
         }
-        let idx = *pos;
+        let index = *pos;
         *pos += 1;
         let children = nest_from(headings, pos, level + 1);
-        out.push(SymbolNode { idx, children });
+        out.push(SymbolNode { index, children });
     }
     out
 }
@@ -314,7 +336,7 @@ fn nest_from(headings: &[HeadingInfo], pos: &mut usize, min_level: u8) -> Vec<Sy
 /// What the cursor is in the middle of typing, derived from the current
 /// line up to the cursor.
 #[derive(Debug, PartialEq, Eq)]
-pub enum CompletionCtx {
+pub enum CompletionContext {
     /// `@` plus a partial name; `prefix` excludes the `@`.
     ShortcodeName { prefix: String },
     /// Inside an unclosed `@ref[`, before any `#`.
@@ -323,17 +345,19 @@ pub enum CompletionCtx {
     RefAnchor { path: String, prefix: String },
 }
 
-pub fn completion_context(line_prefix: &str) -> Option<CompletionCtx> {
+/// The completion context for `line_prefix` (the current line up to the
+/// cursor), or `None` when the cursor is not in a completable position.
+pub fn completion_context(line_prefix: &str) -> Option<CompletionContext> {
     // Inside an unclosed `@ref[` target?
     if let Some(idx) = line_prefix.rfind("@ref[") {
         let after = &line_prefix[idx + 5..];
         if !after.contains(']') {
             return Some(match after.split_once('#') {
-                Some((path, frag)) => CompletionCtx::RefAnchor {
+                Some((path, frag)) => CompletionContext::RefAnchor {
                     path: path.to_string(),
                     prefix: frag.to_string(),
                 },
-                None => CompletionCtx::RefPath {
+                None => CompletionContext::RefPath {
                     prefix: after.to_string(),
                 },
             });
@@ -355,7 +379,7 @@ pub fn completion_context(line_prefix: &str) -> Option<CompletionCtx> {
         if i >= 2 && bytes[i - 2].is_ascii_alphanumeric() {
             return None;
         }
-        return Some(CompletionCtx::ShortcodeName {
+        return Some(CompletionContext::ShortcodeName {
             prefix: line_prefix[i..].to_string(),
         });
     }
@@ -369,7 +393,7 @@ pub fn completion_context(line_prefix: &str) -> Option<CompletionCtx> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brief::diag::{Code, Severity};
+    use brief::diag::Code;
     use std::fs;
     use tempfile::TempDir;
 
@@ -419,7 +443,7 @@ mod tests {
             "[shortcodes.note]\nkind = \"block\"\ntemplate_html = \"<div>{{content}}</div>\"\n",
             &[],
         );
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         assert!(snap.config_error.is_none());
         assert!(snap.project.registry.get("note").is_some());
         assert!(
@@ -431,7 +455,7 @@ mod tests {
     #[test]
     fn custom_shortcode_accepted_unknown_rejected() {
         let (_td, root) = project("[shortcodes.note]\nkind = \"block\"\n", &[]);
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         let path = root.join("doc.brf");
 
         let a = analyze(&path, "@note\nbody\n@end\n", Some(&snap), &empty_overlay());
@@ -464,7 +488,7 @@ mod tests {
     #[test]
     fn strict_heading_levels_honored_from_config() {
         let (_td, root) = project("[compile]\nstrict_heading_levels = true\n", &[]);
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         let path = root.join("doc.brf");
         let text = "# A\n\n### Skipped\n";
 
@@ -482,7 +506,7 @@ mod tests {
     #[test]
     fn bad_brief_toml_reports_error_and_falls_back() {
         let (_td, root) = project("this is [ not toml\n", &[]);
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         assert!(snap.config_error.is_some());
         // Builtins still work so diagnostics keep flowing.
         let a = analyze(
@@ -499,7 +523,7 @@ mod tests {
     #[test]
     fn ref_diagnostics_match_compiler() {
         let (_td, root) = project("", &[("other.brf", "# Other {#x}\n")]);
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         let path = root.join("cur.brf");
 
         let ok = analyze(
@@ -543,7 +567,7 @@ mod tests {
         // Disk says other.brf declares {#old}; the open buffer renamed it
         // to {#new}. Diagnostics must follow the buffer.
         let (_td, root) = project("", &[("other.brf", "# Other {#old}\n")]);
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         let path = root.join("cur.brf");
         let mut overlay = empty_overlay();
         overlay.insert(
@@ -578,7 +602,7 @@ mod tests {
     #[test]
     fn bad_brief_toml_message_matches_the_cli() {
         let (_td, root) = project("[compile]\nnope = 1\n", &[]);
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         let err = snap.config_error.expect("bad config");
         let prefix = format!("bad config {}: ", root.join("brief.toml").display());
         assert!(err.starts_with(&prefix), "{}", err);
@@ -590,7 +614,7 @@ mod tests {
         // compile. Before the shared front-end this reported "anchor not
         // found" (B0602), pointing the user at the wrong problem.
         let (_td, root) = project("", &[("draft.brf", "# D {#d}\n\n*unfinished\n")]);
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         let a = analyze(
             &root.join("cur.brf"),
             "See @ref[draft.brf#d](the draft).\n",
@@ -604,7 +628,7 @@ mod tests {
     #[test]
     fn unrelated_broken_file_reports_nothing() {
         let (_td, root) = project("", &[("draft.brf", "*unfinished\n")]);
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         let a = analyze(
             &root.join("cur.brf"),
             "# Cur\n",
@@ -623,7 +647,7 @@ mod tests {
                 ("clean.brf", "# C {#c}\n"),
             ],
         );
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         let path = root.join("cur.brf");
         let text = "See @ref[draft.brf#d](D) and @ref[clean.brf#c](C).\n";
 
@@ -658,7 +682,7 @@ mod tests {
     #[test]
     fn buffer_entry_judges_like_the_indexer() {
         let (_td, root) = project("", &[]);
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         let path = root.join("cur.brf");
         let ok = analyze(&path, "# T {#t}\n", Some(&snap), &empty_overlay());
         assert_eq!(
@@ -686,7 +710,7 @@ mod tests {
         // cur.brf does not exist on disk at all; the buffer declares the
         // anchor it references.
         let (_td, root) = project("", &[]);
-        let snap = load_snapshot(&root);
+        let snap = ProjectSnapshot::load(&root);
         let path = root.join("cur.brf");
         let a = analyze(
             &path,
@@ -707,9 +731,9 @@ mod tests {
         let at = src.find("@ref").unwrap() + 2;
         let site = ref_at(&doc, at).expect("ref under cursor");
         assert_eq!(site.target, "docs/other.brf#sec");
-        let (p, a) = split_target(&site.target);
-        assert_eq!(p, "docs/other.brf");
-        assert_eq!(a.as_deref(), Some("sec"));
+        let target = split_target(&site.target);
+        assert_eq!(target.path, "docs/other.brf");
+        assert_eq!(target.anchor.as_deref(), Some("sec"));
         assert!(ref_at(&doc, 0).is_none());
     }
 
@@ -725,7 +749,10 @@ mod tests {
 | @ref[c.brf](C) | y |
 ";
         let doc = parse_doc(src);
-        let targets: Vec<String> = collect_refs(&doc).into_iter().map(|r| r.target).collect();
+        let targets: Vec<String> = project::collect_refs(&doc)
+            .into_iter()
+            .map(|r| r.target)
+            .collect();
         assert_eq!(targets, vec!["a.brf", "b.brf#x", "c.brf"]);
     }
 
@@ -733,7 +760,7 @@ mod tests {
     fn heading_lookup_by_position_and_anchor() {
         let src = "# Title {#top}\n\nBody.\n\n## Section {#sec}\n";
         let doc = parse_doc(src);
-        let (_, anchor) = heading_anchor_at(&doc, 2).expect("cursor on heading");
+        let anchor = heading_anchor_at(&doc, 2).expect("cursor on heading");
         assert_eq!(anchor, "top");
         assert!(heading_anchor_at(&doc, src.find("Body").unwrap()).is_none());
         let span = heading_span_for_anchor(&doc, "sec").expect("anchor exists");
@@ -778,7 +805,7 @@ mod tests {
 
     #[test]
     fn completion_context_detection() {
-        use CompletionCtx::*;
+        use CompletionContext::*;
         assert_eq!(
             completion_context("some text @"),
             Some(ShortcodeName {
@@ -824,15 +851,15 @@ mod tests {
         assert_eq!(completion_context("plain text"), None);
     }
 
-    // -- rel_path ---------------------------------------------------------------
+    // -- relative_path ----------------------------------------------------------
 
     #[test]
-    fn rel_path_forward_slashes_and_outside_root() {
+    fn relative_path_forward_slashes_and_outside_root() {
         let (_td, root) = project("", &[("docs/deep.brf", "# D {#d}\n")]);
         assert_eq!(
-            rel_path(&root, &root.join("docs/deep.brf")).as_deref(),
+            relative_path(&root, &root.join("docs/deep.brf")).as_deref(),
             Some("docs/deep.brf")
         );
-        assert!(rel_path(&root, Path::new("/elsewhere/x.brf")).is_none());
+        assert!(relative_path(&root, Path::new("/elsewhere/x.brf")).is_none());
     }
 }

@@ -2,31 +2,63 @@
 //!
 //! Walks a `pulldown-cmark` event stream and emits Brief source text. Every
 //! Markdown construct that has no clean Brief equivalent is reported as a
-//! `Diag` carrying a `Hole` code; nothing is silently dropped.
+//! `ConvertDiagnostic` carrying a `Hole` code; nothing is silently dropped.
 
+use pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, MetadataBlockKind,
+    Options, Parser, Tag, TagEnd,
+};
+use std::collections::BTreeMap;
+use std::mem;
+use std::ops::Range;
+
+/// Output of [`convert`]: the generated Brief source plus one diagnostic per
+/// Markdown construct that had no clean Brief equivalent.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ConvertResult {
+    /// The generated Brief source, ending in exactly one newline (empty when
+    /// the input produced no output).
     pub brief_source: String,
-    pub diagnostics: Vec<Diag>,
+    /// Lossy-conversion reports, in emission order.
+    pub diagnostics: Vec<ConvertDiagnostic>,
 }
 
+/// One lossy spot found while converting Markdown to Brief.
 #[derive(Clone, Debug)]
-pub struct Diag {
+#[non_exhaustive]
+pub struct ConvertDiagnostic {
+    /// What kind of information was lost or rewritten.
     pub hole: Hole,
-    pub line: usize, // 1-indexed
-    pub col: usize,  // 1-indexed
+    /// 1-indexed source line of the offending Markdown, or 0 when the hole
+    /// is not tied to one position (link titles, table cells).
+    pub line: usize,
+    /// 1-indexed source column of the offending Markdown, or 0 when `line`
+    /// is 0.
+    pub col: usize,
+    /// The offending Markdown source (truncated to 80 chars), or a
+    /// reconstruction of it.
     pub original: String,
+    /// Human-readable detail specific to this occurrence.
     pub note: String,
 }
 
+/// Kind of Markdown construct that has no clean Brief equivalent.
+///
+/// [`Hole::slug`] gives a stable machine-readable code and [`Hole::message`]
+/// a generic description.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Hole {
     SetextHeading,
     DefinitionListMultipleDefs,
-    DoubleEmphasis, // **x**, __x__, ~~x~~
+    /// `**x**`, `__x__`, or `~~x~~`.
+    DoubleEmphasis,
     EscapedSigil,
-    AsteriskEmphasis, // *em* (Markdown italic)
-    AltBullet,        // * or + bullet
+    /// `*em*` (Markdown asterisk italic).
+    AsteriskEmphasis,
+    /// `*` or `+` bullet.
+    AltBullet,
     OrderedRenumber,
     NestIndentNormalize,
     TildeFence,
@@ -49,6 +81,7 @@ pub enum Hole {
 
 impl Hole {
     /// Stable kebab-case slug used in TODO comments and stderr report lines.
+    #[must_use]
     pub fn slug(self) -> &'static str {
         match self {
             Hole::SetextHeading => "setext-heading",
@@ -79,6 +112,7 @@ impl Hole {
     }
 
     /// Short human-readable label for stderr.
+    #[must_use]
     pub fn message(self) -> &'static str {
         match self {
             Hole::SetextHeading => "setext heading rewritten to ATX",
@@ -117,11 +151,10 @@ impl Hole {
     }
 }
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-
 /// Convert a Markdown document to Brief source.
 ///
 /// `source_path` is used only for diagnostic location strings.
+#[must_use]
 pub fn convert(input: &str, source_path: &str) -> ConvertResult {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -136,7 +169,7 @@ pub fn convert(input: &str, source_path: &str) -> ConvertResult {
     opts.insert(Options::ENABLE_DEFINITION_LIST);
 
     let line_offsets = compute_line_offsets(input);
-    let events: Vec<(Event<'_>, std::ops::Range<usize>)> =
+    let events: Vec<(Event<'_>, Range<usize>)> =
         Parser::new_ext(input, opts).into_offset_iter().collect();
 
     // Pass 1: render each footnote definition's body to Brief using a fresh
@@ -145,12 +178,11 @@ pub fn convert(input: &str, source_path: &str) -> ConvertResult {
     // source; Brief's `@footnote[body]` is inline at the reference site, so
     // we must have the rendered body ready before pass 2 visits the
     // FootnoteReference event.
-    let mut footnote_defs: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    let mut footnote_diags: Vec<Diag> = Vec::new();
+    let mut footnote_defs: BTreeMap<String, String> = BTreeMap::new();
+    let mut footnote_diags: Vec<ConvertDiagnostic> = Vec::new();
     {
         let mut current_label: Option<String> = None;
-        let mut current_events: Vec<(Event<'_>, std::ops::Range<usize>)> = Vec::new();
+        let mut current_events: Vec<(Event<'_>, Range<usize>)> = Vec::new();
         for (event, range) in &events {
             match event {
                 Event::Start(Tag::FootnoteDefinition(label)) => {
@@ -202,12 +234,12 @@ pub fn convert(input: &str, source_path: &str) -> ConvertResult {
     walker.finish()
 }
 
-struct Walker<'a> {
-    src: &'a str,
+struct Walker<'src> {
+    src: &'src str,
     _source_path: String,
     line_offsets: Vec<usize>,
     out: String,
-    diags: Vec<Diag>,
+    diags: Vec<ConvertDiagnostic>,
     /// True while inside a paragraph (between Start(Paragraph) and End).
     in_paragraph: bool,
     /// Set while we are inside a fenced/indented code block. Suppresses
@@ -227,15 +259,15 @@ struct Walker<'a> {
     dl: Option<DefinitionListState>,
     /// Outer definition lists suspended while a nested one is open.
     dl_stack: Vec<DefinitionListState>,
-    /// Stack of (dest_url, optional diagnostic to emit on End) for active links/images.
-    link_stack: Vec<(String, Option<(Hole, String)>)>,
+    /// Stack of active links/images, popped on their End event.
+    link_stack: Vec<LinkFrame>,
     /// Footnote labels → body text (rendered as a flat string).
-    footnote_defs: std::collections::BTreeMap<String, String>,
+    footnote_defs: BTreeMap<String, String>,
     /// Hole TODO comment lines pending insertion before the next block.
     pending_hole_comments: Vec<String>,
     in_metadata: bool,
     metadata_buf: String,
-    metadata_kind: Option<pulldown_cmark::MetadataBlockKind>,
+    metadata_kind: Option<MetadataBlockKind>,
     /// Stack of currently-open inline HTML rewrites (`<sub>`, `<sup>`, `<kbd>`).
     /// On a matching close tag we pop and emit `]`.
     html_replace_stack: Vec<HtmlInlineKind>,
@@ -245,7 +277,7 @@ struct Walker<'a> {
 }
 
 struct TableState {
-    aligns: Vec<pulldown_cmark::Alignment>,
+    aligns: Vec<Alignment>,
     rows: Vec<Vec<String>>,
     current_row: Vec<String>,
     current_cell: String,
@@ -269,6 +301,15 @@ struct DefinitionListState {
     def_split: bool,
 }
 
+/// An open link or image awaiting its End event.
+struct LinkFrame {
+    dest_url: String,
+    /// Link title, emitted as the `title:` keyword (always `None` for images).
+    title: Option<String>,
+    /// Hole and note reported once the link text is known.
+    pending_hole: Option<(Hole, String)>,
+}
+
 struct ListFrame {
     ordered: bool,
     next_index: u64,
@@ -280,7 +321,8 @@ struct ListFrame {
 
 enum Container {
     Quote,
-    Alert(#[allow(dead_code)] Hole, &'static str),
+    /// GFM alert blockquote; the payload is the `@callout` kind.
+    Alert(&'static str),
     LinkPending,
     ImagePending,
     /// Paragraph buffer; on pop we flush pending HTML comments then this content.
@@ -299,7 +341,7 @@ enum Container {
     Details {
         summary: String,
         opener: String,
-        range: std::ops::Range<usize>,
+        range: Range<usize>,
     },
 }
 
@@ -320,7 +362,7 @@ impl HtmlInlineKind {
     }
 }
 
-impl<'a> Walker<'a> {
+impl<'src> Walker<'src> {
     fn write(&mut self, s: &str) {
         if let Some(d) = self.dl.as_mut() {
             if d.in_term {
@@ -332,11 +374,11 @@ impl<'a> Walker<'a> {
                 return;
             }
         }
-        if let Some(t) = self.table.as_mut() {
-            if t.in_cell {
-                t.current_cell.push_str(s);
-                return;
-            }
+        if let Some(t) = self.table.as_mut()
+            && t.in_cell
+        {
+            t.current_cell.push_str(s);
+            return;
         }
         if let Some(buf) = self.out_stack.last_mut() {
             buf.push_str(s);
@@ -355,11 +397,11 @@ impl<'a> Walker<'a> {
                 return;
             }
         }
-        if let Some(t) = self.table.as_mut() {
-            if t.in_cell {
-                t.current_cell.push(c);
-                return;
-            }
+        if let Some(t) = self.table.as_mut()
+            && t.in_cell
+        {
+            t.current_cell.push(c);
+            return;
         }
         if let Some(buf) = self.out_stack.last_mut() {
             buf.push(c);
@@ -390,10 +432,10 @@ impl<'a> Walker<'a> {
                 return d.current_def.ends_with(c);
             }
         }
-        if let Some(t) = self.table.as_ref() {
-            if t.in_cell {
-                return t.current_cell.ends_with(c);
-            }
+        if let Some(t) = self.table.as_ref()
+            && t.in_cell
+        {
+            return t.current_cell.ends_with(c);
         }
         if let Some(buf) = self.out_stack.last() {
             buf.ends_with(c)
@@ -402,7 +444,7 @@ impl<'a> Walker<'a> {
         }
     }
 
-    fn new(src: &'a str, source_path: &str, line_offsets: Vec<usize>) -> Self {
+    fn new(src: &'src str, source_path: &str, line_offsets: Vec<usize>) -> Self {
         Walker {
             src,
             _source_path: source_path.to_string(),
@@ -418,7 +460,7 @@ impl<'a> Walker<'a> {
             dl: None,
             dl_stack: Vec::new(),
             link_stack: Vec::new(),
-            footnote_defs: std::collections::BTreeMap::new(),
+            footnote_defs: BTreeMap::new(),
             pending_hole_comments: Vec::new(),
             in_metadata: false,
             metadata_buf: String::new(),
@@ -428,19 +470,19 @@ impl<'a> Walker<'a> {
         }
     }
 
-    fn visit(&mut self, event: Event<'_>, range: std::ops::Range<usize>) {
+    fn visit(&mut self, event: Event<'_>, range: Range<usize>) {
         match event {
             Event::Start(Tag::List(start)) => {
                 self.flush_pending_hole_comments();
                 let ordered = start.is_some();
-                if let Some(n) = start {
-                    if n != 1 {
-                        self.push_diag(
-                            Hole::OrderedRenumber,
-                            range.clone(),
-                            format!("ordered list started at {}; renumbered from 1", n),
-                        );
-                    }
+                if let Some(n) = start
+                    && n != 1
+                {
+                    self.push_diag(
+                        Hole::OrderedRenumber,
+                        range,
+                        format!("ordered list started at {}; renumbered from 1", n),
+                    );
                 }
                 // Nested list opens inside a parent Item whose text hasn't
                 // closed with a newline yet. Ensure one is in place.
@@ -460,7 +502,6 @@ impl<'a> Walker<'a> {
             Event::Start(Tag::Item) => {
                 let depth = self.list_stack.len().saturating_sub(1);
                 let (line, col) = self.pos(range.start);
-                let _ = line;
                 // Check for non-2-space nesting against parent frame.
                 if depth > 0 {
                     let parent = &self.list_stack[depth - 1];
@@ -500,7 +541,7 @@ impl<'a> Walker<'a> {
                     if first == Some(b'*') || first == Some(b'+') {
                         self.push_diag(
                             Hole::AltBullet,
-                            range.clone(),
+                            range,
                             format!(
                                 "`{}` bullet rewritten to `-`",
                                 first.map(|b| b as char).unwrap_or('?')
@@ -569,12 +610,12 @@ impl<'a> Walker<'a> {
             Event::Start(Tag::Heading { level, id, .. }) => {
                 self.flush_pending_hole_comments();
                 let n = match level {
-                    pulldown_cmark::HeadingLevel::H1 => 1,
-                    pulldown_cmark::HeadingLevel::H2 => 2,
-                    pulldown_cmark::HeadingLevel::H3 => 3,
-                    pulldown_cmark::HeadingLevel::H4 => 4,
-                    pulldown_cmark::HeadingLevel::H5 => 5,
-                    pulldown_cmark::HeadingLevel::H6 => 6,
+                    HeadingLevel::H1 => 1,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    HeadingLevel::H4 => 4,
+                    HeadingLevel::H5 => 5,
+                    HeadingLevel::H6 => 6,
                 };
                 // Detect setext: the source span at `range` does not start with `#`.
                 let snippet = self.src.get(range.clone()).unwrap_or("");
@@ -592,7 +633,7 @@ impl<'a> Walker<'a> {
                     if safe != raw {
                         self.push_diag(
                             Hole::HeadingAnchorSlugged,
-                            range.clone(),
+                            range,
                             format!("anchor `{}` rewritten to `{}`", raw, safe),
                         );
                     }
@@ -629,7 +670,7 @@ impl<'a> Walker<'a> {
                 if first == Some(b'*') {
                     self.push_diag(
                         Hole::AsteriskEmphasis,
-                        range.clone(),
+                        range,
                         "Markdown `*italic*` rewritten to Brief `_italic_`".into(),
                     );
                 }
@@ -641,7 +682,7 @@ impl<'a> Walker<'a> {
             Event::Start(Tag::Strong) => {
                 self.push_diag(
                     Hole::DoubleEmphasis,
-                    range.clone(),
+                    range,
                     "doubled emphasis marker rewritten to single `*`".into(),
                 );
                 self.write_char('*');
@@ -652,7 +693,7 @@ impl<'a> Walker<'a> {
             Event::Start(Tag::Strikethrough) => {
                 self.push_diag(
                     Hole::DoubleEmphasis,
-                    range.clone(),
+                    range,
                     "doubled strikethrough rewritten to single `~`".into(),
                 );
                 self.write_char('~');
@@ -684,7 +725,6 @@ impl<'a> Walker<'a> {
             }
             Event::Start(Tag::CodeBlock(kind)) => {
                 self.flush_pending_hole_comments();
-                use pulldown_cmark::CodeBlockKind;
                 self.in_code_block = true;
                 match kind {
                     CodeBlockKind::Fenced(lang) => {
@@ -693,7 +733,7 @@ impl<'a> Walker<'a> {
                         if snippet.trim_start().starts_with('~') {
                             self.push_diag(
                                 Hole::TildeFence,
-                                range.clone(),
+                                range,
                                 "`~~~` fence rewritten to ```` ``` ```` fence".into(),
                             );
                         }
@@ -708,7 +748,7 @@ impl<'a> Walker<'a> {
                     CodeBlockKind::Indented => {
                         self.push_diag(
                             Hole::IndentedCodeBlock,
-                            range.clone(),
+                            range,
                             "indented code block rewritten to fenced block".into(),
                         );
                         self.write("```\n");
@@ -737,7 +777,7 @@ impl<'a> Walker<'a> {
                         // intent.
                         self.push_diag(
                             Hole::EscapedSigil,
-                            range.clone(),
+                            range,
                             format!(
                                 "escaped emphasis sigil(s) in literal text: {:?}",
                                 t.chars().take(40).collect::<String>()
@@ -755,48 +795,47 @@ impl<'a> Walker<'a> {
             }
             Event::Start(Tag::BlockQuote(kind)) => {
                 self.flush_pending_hole_comments();
-                use pulldown_cmark::BlockQuoteKind;
                 let container = match kind {
                     None => Container::Quote,
                     Some(BlockQuoteKind::Note) => {
                         self.push_diag(
                             Hole::GfmAlert,
-                            range.clone(),
+                            range,
                             "GFM alert mapped to `@callout(kind: note)`".into(),
                         );
-                        Container::Alert(Hole::GfmAlert, "note")
+                        Container::Alert("note")
                     }
                     Some(BlockQuoteKind::Tip) => {
                         self.push_diag(
                             Hole::GfmAlert,
-                            range.clone(),
+                            range,
                             "GFM alert mapped to `@callout(kind: tip)`".into(),
                         );
-                        Container::Alert(Hole::GfmAlert, "tip")
+                        Container::Alert("tip")
                     }
                     Some(BlockQuoteKind::Important) => {
                         self.push_diag(
                             Hole::GfmAlert,
-                            range.clone(),
+                            range,
                             "GFM alert mapped to `@callout(kind: important)`".into(),
                         );
-                        Container::Alert(Hole::GfmAlert, "important")
+                        Container::Alert("important")
                     }
                     Some(BlockQuoteKind::Warning) => {
                         self.push_diag(
                             Hole::GfmAlert,
-                            range.clone(),
+                            range,
                             "GFM alert mapped to `@callout(kind: warning)`".into(),
                         );
-                        Container::Alert(Hole::GfmAlert, "warning")
+                        Container::Alert("warning")
                     }
                     Some(BlockQuoteKind::Caution) => {
                         self.push_diag(
                             Hole::GfmAlert,
-                            range.clone(),
+                            range,
                             "GFM alert mapped to `@callout(kind: caution)`".into(),
                         );
-                        Container::Alert(Hole::GfmAlert, "caution")
+                        Container::Alert("caution")
                     }
                 };
                 self.out_stack.push(String::new());
@@ -822,7 +861,7 @@ impl<'a> Walker<'a> {
                         for line in trimmed.split('\n') {
                             if line.is_empty() {
                                 if !cur.is_empty() {
-                                    groups.push(std::mem::take(&mut cur));
+                                    groups.push(mem::take(&mut cur));
                                 }
                                 // Consecutive blanks: drop, no-op (only one separator
                                 // matters between two non-empty groups).
@@ -854,12 +893,12 @@ impl<'a> Walker<'a> {
                             // where the break originated.
                             self.push_diag(
                                 Hole::BlockquoteParagraphSplit,
-                                range.clone(),
+                                range,
                                 "in-quote paragraph break rewritten to adjacent blockquotes".into(),
                             );
                         }
                     }
-                    Container::Alert(_, kind) => {
+                    Container::Alert(kind) => {
                         self.write("@callout(kind: ");
                         self.write(kind);
                         self.write(")\n");
@@ -887,7 +926,7 @@ impl<'a> Walker<'a> {
                 if !is_clean_dashes {
                     self.push_diag(
                         Hole::AltHorizontalRule,
-                        range.clone(),
+                        range,
                         format!("`{}` rewritten to `---`", snippet),
                     );
                 }
@@ -899,48 +938,29 @@ impl<'a> Walker<'a> {
                 title,
                 ..
             }) => {
-                use pulldown_cmark::LinkType;
-                // Capture a non-empty title to emit as `title:` kwarg.
-                let link_title = if title.is_empty() {
-                    None
-                } else {
-                    Some(title.to_string())
-                };
-                let mut diag: Option<(Hole, String)> = None;
-                match link_type {
-                    LinkType::Autolink | LinkType::Email => {
-                        diag = Some((
-                            Hole::AutolinkRewrap,
-                            format!("autolink `<{}>` wrapped in `@link[..](..)`", dest_url),
-                        ));
-                    }
+                let pending_hole = match link_type {
+                    LinkType::Autolink | LinkType::Email => Some((
+                        Hole::AutolinkRewrap,
+                        format!("autolink `<{}>` wrapped in `@link[..](..)`", dest_url),
+                    )),
                     LinkType::Reference
                     | LinkType::ReferenceUnknown
                     | LinkType::Collapsed
                     | LinkType::CollapsedUnknown
                     | LinkType::Shortcut
-                    | LinkType::ShortcutUnknown => {
-                        diag = Some((
-                            Hole::RefLinkInlined,
-                            "reference-style link resolved inline".into(),
-                        ));
-                    }
-                    LinkType::Inline => {}
-                    _ => {}
-                }
-                // Store (url, optional_title, optional_diag) via a tuple.
-                // We encode the title into the url string using a sentinel separator
-                // so we can reuse the existing link_stack without changing its type.
-                // Instead, push title into a separate parallel stack field by
-                // storing both in a combined tuple stored in out_stack label.
-                // Simplest approach: store title in a new wrapper. Use an existing
-                // field trick: push url\x00title so End can split on \x00.
-                let url_with_title = if let Some(ref t) = link_title {
-                    format!("{}\x00{}", dest_url, t)
-                } else {
-                    dest_url.to_string()
+                    | LinkType::ShortcutUnknown => Some((
+                        Hole::RefLinkInlined,
+                        "reference-style link resolved inline".into(),
+                    )),
+                    // Inline links (and any other kind) convert cleanly.
+                    _ => None,
                 };
-                self.link_stack.push((url_with_title, diag));
+                self.link_stack.push(LinkFrame {
+                    dest_url: dest_url.to_string(),
+                    // A non-empty title is emitted as the `title:` kwarg.
+                    title: (!title.is_empty()).then(|| title.to_string()),
+                    pending_hole,
+                });
                 self.out_stack.push(String::new());
                 self.container_stack.push(Container::LinkPending);
             }
@@ -948,16 +968,13 @@ impl<'a> Walker<'a> {
                 let (text, _) = self
                     .pop_container(|c| matches!(c, Container::LinkPending))
                     .expect("link buffer");
-                let (url_with_title, diag) = self.link_stack.pop().expect("link stack");
-                // Split url and optional title.
-                let (url, opt_title) = if let Some(idx) = url_with_title.find('\x00') {
-                    let (u, t) = url_with_title.split_at(idx);
-                    (u.to_string(), Some(t[1..].to_string()))
-                } else {
-                    (url_with_title, None)
-                };
-                if let Some((hole, note)) = diag {
-                    self.diags.push(Diag {
+                let LinkFrame {
+                    dest_url: url,
+                    title,
+                    pending_hole,
+                } = self.link_stack.pop().expect("link stack");
+                if let Some((hole, note)) = pending_hole {
+                    self.diags.push(ConvertDiagnostic {
                         hole,
                         line: 0,
                         col: 0,
@@ -966,7 +983,7 @@ impl<'a> Walker<'a> {
                     });
                 }
                 let url = brief_safe_url(&url);
-                if let Some(t) = opt_title {
+                if let Some(t) = title {
                     self.write("@link(title: \"");
                     self.write(&t);
                     self.write("\")[");
@@ -985,7 +1002,7 @@ impl<'a> Walker<'a> {
             Event::Start(Tag::Image {
                 dest_url, title, ..
             }) => {
-                let diag = if title.is_empty() {
+                let pending_hole = if title.is_empty() {
                     None
                 } else {
                     Some((
@@ -993,7 +1010,11 @@ impl<'a> Walker<'a> {
                         format!("image title `{}` dropped", title),
                     ))
                 };
-                self.link_stack.push((dest_url.to_string(), diag));
+                self.link_stack.push(LinkFrame {
+                    dest_url: dest_url.to_string(),
+                    title: None,
+                    pending_hole,
+                });
                 self.out_stack.push(String::new());
                 self.container_stack.push(Container::ImagePending);
             }
@@ -1001,9 +1022,13 @@ impl<'a> Walker<'a> {
                 let (alt, _) = self
                     .pop_container(|c| matches!(c, Container::ImagePending))
                     .expect("image buffer");
-                let (src, diag) = self.link_stack.pop().expect("link stack");
-                if let Some((hole, note)) = diag {
-                    self.diags.push(Diag {
+                let LinkFrame {
+                    dest_url: src,
+                    pending_hole,
+                    ..
+                } = self.link_stack.pop().expect("link stack");
+                if let Some((hole, note)) = pending_hole {
+                    self.diags.push(ConvertDiagnostic {
                         hole,
                         line: 0,
                         col: 0,
@@ -1039,7 +1064,7 @@ impl<'a> Walker<'a> {
             }
             Event::End(TagEnd::TableHead) | Event::End(TagEnd::TableRow) => {
                 if let Some(t) = self.table.as_mut() {
-                    let row = std::mem::take(&mut t.current_row);
+                    let row = mem::take(&mut t.current_row);
                     t.rows.push(row);
                 }
             }
@@ -1051,7 +1076,7 @@ impl<'a> Walker<'a> {
             }
             Event::End(TagEnd::TableCell) => {
                 if let Some(t) = self.table.as_mut() {
-                    let cell = std::mem::take(&mut t.current_cell);
+                    let cell = mem::take(&mut t.current_cell);
                     t.current_row.push(cell);
                     t.in_cell = false;
                 }
@@ -1063,18 +1088,18 @@ impl<'a> Walker<'a> {
                     // nest: emit the outer list up to here, then the inner
                     // one as a sibling, and resume the outer after it.
                     if outer.in_def {
-                        let def = std::mem::take(&mut outer.current_def);
+                        let def = mem::take(&mut outer.current_def);
                         if !def.trim().is_empty() {
                             outer.items.push((outer.current_term.clone(), def));
                         }
                         outer.def_split = true;
                     }
-                    let items = std::mem::take(&mut outer.items);
+                    let items = mem::take(&mut outer.items);
                     self.write_dl(&items);
                     self.dl_stack.push(outer);
                     self.push_diag(
                         Hole::NestedDefinitionList,
-                        range.clone(),
+                        range,
                         "nested definition list flattened into a sibling `@dl` block".into(),
                     );
                 }
@@ -1133,7 +1158,7 @@ impl<'a> Walker<'a> {
                 if crossed_to_two {
                     self.push_diag(
                         Hole::DefinitionListMultipleDefs,
-                        range.clone(),
+                        range,
                         "definition list term repeated for each definition (Brief v0.4 limitation)"
                             .into(),
                     );
@@ -1143,7 +1168,7 @@ impl<'a> Walker<'a> {
                 if let Some(d) = self.dl.as_mut() {
                     d.in_def = false;
                     let term = d.current_term.clone();
-                    let def = std::mem::take(&mut d.current_def);
+                    let def = mem::take(&mut d.current_def);
                     // A definition split by a nested list was emitted up to
                     // the split; only content after the nested list is new.
                     if !(d.def_split && def.trim().is_empty()) {
@@ -1157,10 +1182,9 @@ impl<'a> Walker<'a> {
                 self.metadata_kind = Some(kind);
             }
             Event::End(TagEnd::MetadataBlock(_)) => {
-                use pulldown_cmark::MetadataBlockKind;
                 self.in_metadata = false;
                 let kind = self.metadata_kind.take();
-                let body = std::mem::take(&mut self.metadata_buf);
+                let body = mem::take(&mut self.metadata_buf);
                 match kind {
                     Some(MetadataBlockKind::PlusesStyle) => {
                         // TOML markdown frontmatter has a clean Brief equivalent;
@@ -1175,7 +1199,7 @@ impl<'a> Walker<'a> {
                     _ => {
                         self.push_diag(
                             Hole::Frontmatter,
-                            range.clone(),
+                            range,
                             "frontmatter dropped, replaced with TODO comment".into(),
                         );
                         // Flush the pending hole comment (just pushed by push_diag)
@@ -1210,26 +1234,25 @@ impl<'a> Walker<'a> {
                     self.write_char('[');
                     return;
                 }
-                if let Some(kind) = classify_inline_html_close(trimmed) {
-                    if self.html_replace_stack.last().copied() == Some(kind) {
-                        self.html_replace_stack.pop();
-                        self.write_char(']');
-                        return;
-                    }
-                    // Mismatched close — fall through to TODO so we don't
-                    // emit a stray `]` that would corrupt the output.
+                if let Some(kind) = classify_inline_html_close(trimmed)
+                    && self.html_replace_stack.last().copied() == Some(kind)
+                {
+                    self.html_replace_stack.pop();
+                    self.write_char(']');
+                    return;
                 }
+                // A mismatched close tag falls through to the TODO so we
+                // don't emit a stray `]` that would corrupt the output.
                 if is_inline_br(trimmed) {
                     // Brief hard break: backslash at end of line.
                     self.write_char('\\');
                     self.write_char('\n');
                     return;
                 }
-                let snippet = s.to_string();
                 self.push_diag(
                     Hole::InlineHtml,
-                    range.clone(),
-                    format!("`{}` preserved as TODO comment", snippet.trim()),
+                    range,
+                    format!("`{}` preserved as TODO comment", trimmed),
                 );
                 // push_diag already queued a pending_hole_comments entry;
                 // it will be flushed before the next block-level event.
@@ -1348,7 +1371,7 @@ impl<'a> Walker<'a> {
     /// Emit a buffered HTML block: a recognizable `<details>` shape becomes
     /// `@details`, or opens/closes a multi-event `Details` container;
     /// anything else takes the TODO + `/* */` comment fallback.
-    fn emit_html_block(&mut self, range: std::ops::Range<usize>, buf: &str) {
+    fn emit_html_block(&mut self, range: Range<usize>, buf: &str) {
         match classify_details_block(buf) {
             DetailsShape::Closed {
                 summary,
@@ -1430,7 +1453,6 @@ impl<'a> Walker<'a> {
     }
 
     /// Convert a byte offset into 1-indexed (line, column).
-    #[allow(dead_code)] // used by later tasks
     fn pos(&self, offset: usize) -> (usize, usize) {
         match self.line_offsets.binary_search(&offset) {
             Ok(line) => (line + 1, 1),
@@ -1441,27 +1463,20 @@ impl<'a> Walker<'a> {
         }
     }
 
-    #[allow(dead_code)] // used by later tasks
-    fn push_diag(&mut self, hole: Hole, range: std::ops::Range<usize>, note: String) {
+    fn push_diag(&mut self, hole: Hole, range: Range<usize>, note: String) {
         let (line, col) = self.pos(range.start);
-        let original = self
-            .src
-            .get(range.clone())
-            .unwrap_or("")
-            .chars()
-            .take(80)
-            .collect::<String>();
-        self.diags.push(Diag {
-            hole,
-            line,
-            col,
-            original,
-            note: note.clone(),
-        });
+        let original: String = self.src.get(range).unwrap_or("").chars().take(80).collect();
         // Surface every hole as a `// TODO[B-hole:slug]:` line so a reviewer
         // can grep the converted corpus. Flushed before the next block.
         self.pending_hole_comments
             .push(format!("// TODO[B-hole:{}]: {}", hole.slug(), note));
+        self.diags.push(ConvertDiagnostic {
+            hole,
+            line,
+            col,
+            original,
+            note,
+        });
     }
 
     fn flush_pending_hole_comments(&mut self) {
@@ -1471,7 +1486,7 @@ impl<'a> Walker<'a> {
             Some(f) if f.item_content_col > 0 => " ".repeat(f.item_content_col - 1),
             _ => String::new(),
         };
-        for c in std::mem::take(&mut self.pending_hole_comments) {
+        for c in mem::take(&mut self.pending_hole_comments) {
             // Write to top buffer (or `out`).
             if let Some(buf) = self.out_stack.last_mut() {
                 buf.push_str(&indent);
@@ -1487,7 +1502,7 @@ impl<'a> Walker<'a> {
 
     /// Emit a buffered HTML block as the existing TODO + `/* */` comment
     /// fallback. Used when the block isn't a recognizable `<details>`.
-    fn fallback_html_block(&mut self, range: std::ops::Range<usize>, buf: &str) {
+    fn fallback_html_block(&mut self, range: Range<usize>, buf: &str) {
         self.html_block_comment(
             range,
             buf,
@@ -1495,7 +1510,7 @@ impl<'a> Walker<'a> {
         );
     }
 
-    fn html_block_comment(&mut self, range: std::ops::Range<usize>, buf: &str, note: String) {
+    fn html_block_comment(&mut self, range: Range<usize>, buf: &str, note: String) {
         self.push_diag(Hole::HtmlBlock, range, note);
         // Flush the pending hole comment (just pushed by push_diag) so it
         // appears immediately before the block comment, not deferred.
@@ -1512,7 +1527,6 @@ impl<'a> Walker<'a> {
     }
 
     fn emit_table(&mut self, state: TableState) {
-        use pulldown_cmark::Alignment;
         let needs_align = state.aligns.iter().any(|a| !matches!(a, Alignment::None));
         if needs_align {
             self.write("@t(align: [");
@@ -1537,7 +1551,7 @@ impl<'a> Walker<'a> {
                 self.write(" ");
                 let trimmed = cell.trim();
                 let (escaped, escaped_pipe) = if trimmed.is_empty() {
-                    self.diags.push(Diag {
+                    self.diags.push(ConvertDiagnostic {
                         hole: Hole::EmptyTableCell,
                         line: 0,
                         col: 0,
@@ -1559,7 +1573,7 @@ impl<'a> Walker<'a> {
             self.write("\n");
         }
         if saw_pipe_escape {
-            self.diags.push(Diag {
+            self.diags.push(ConvertDiagnostic {
                 hole: Hole::TableCellPipeEscape,
                 line: 0,
                 col: 0,
@@ -1692,17 +1706,19 @@ fn classify_details_block(buf: &str) -> DetailsShape {
     if !starts_open {
         return DetailsShape::Unknown;
     }
-    let after_open = match find_after_open_tag(trimmed, "details") {
-        Some(idx) => idx,
-        None => return DetailsShape::Unknown,
+    let Some(after_open) = find_after_open_tag(trimmed, "details") else {
+        return DetailsShape::Unknown;
     };
     let inner = &trimmed[after_open..];
     // Strip a single optional leading newline.
     let inner = inner.strip_prefix('\n').unwrap_or(inner);
-    let summary = extract_summary(inner);
     // Text between `<details>` and `<summary>` is body content too.
-    let (summary_text, before_summary, after_summary) = match summary {
-        Some(((text, len), end)) => (text, inner[..end - len].trim(), &inner[end..]),
+    let (summary_text, before_summary, after_summary) = match extract_summary(inner) {
+        Some(summary) => (
+            summary.text,
+            inner[..summary.start].trim(),
+            &inner[summary.end..],
+        ),
         None => (String::new(), "", inner),
     };
     let join_body = |main: &str| {
@@ -1767,10 +1783,18 @@ fn find_after_open_tag(s: &str, name: &str) -> Option<usize> {
     Some(start + needle.len() + close + 1)
 }
 
-/// Pull a `<summary>...</summary>` out of `s`. Returns `((text, byte_len),
-/// end_byte_offset_of_close_tag)` when found.
-#[allow(clippy::type_complexity)]
-fn extract_summary(s: &str) -> Option<((String, usize), usize)> {
+/// A `<summary>...</summary>` element found by [`extract_summary`].
+struct Summary {
+    /// Tag-stripped, trimmed summary text.
+    text: String,
+    /// Byte offset of the opening `<summary` tag.
+    start: usize,
+    /// Byte offset just past the closing `</summary>` tag.
+    end: usize,
+}
+
+/// Pull a `<summary>...</summary>` out of `s`, if present.
+fn extract_summary(s: &str) -> Option<Summary> {
     let lower = s.to_ascii_lowercase();
     let open_idx = lower.find("<summary")?;
     let after_open_attrs = &s[open_idx..];
@@ -1781,7 +1805,11 @@ fn extract_summary(s: &str) -> Option<((String, usize), usize)> {
     let close_rel = lower_after.find("</summary>")?;
     let summary_text = strip_tags(&after_body[..close_rel]).trim().to_string();
     let close_end = body_start + close_rel + "</summary>".len();
-    Some(((summary_text, close_end - open_idx), close_end))
+    Some(Summary {
+        text: summary_text,
+        start: open_idx,
+        end: close_end,
+    })
 }
 
 /// Rough HTML-to-text: drops anything that looks like a tag.
@@ -1814,7 +1842,7 @@ fn strip_tags(s: &str) -> String {
 /// also escape sigils that have valid left-context and sit at the end of
 /// the string (conservatively treating the boundary as "next char unknown").
 fn escape_brief_inline_text(s: &str) -> String {
-    use crate::inline::{is_inline_sigil, is_open_marker_at, is_punct};
+    use crate::inline;
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -1822,7 +1850,7 @@ fn escape_brief_inline_text(s: &str) -> String {
         let b = bytes[i];
         if matches!(b, b'*' | b'_' | b'+' | b'~') {
             // Check the shared predicate first (handles mid-string case).
-            let should_escape = is_open_marker_at(bytes, i) || {
+            let should_escape = inline::is_open_marker_at(bytes, i) || {
                 // Also escape a sigil at the end of the text fragment if it
                 // has valid left-context: the next text event may start with
                 // a non-space char, making this a valid emphasis opener in
@@ -1833,8 +1861,8 @@ fn escape_brief_inline_text(s: &str) -> String {
                     let prev_ok = match prev {
                         None => true,
                         Some(b' ') => true,
-                        Some(pb) if is_inline_sigil(pb) => true,
-                        Some(pb) if is_punct(pb) => true,
+                        Some(pb) if inline::is_inline_sigil(pb) => true,
+                        Some(pb) if inline::is_punct(pb) => true,
                         _ => false,
                     };
                     // prev must not be the same marker (doubled-marker rule)
@@ -1898,6 +1926,10 @@ fn compute_line_offsets(s: &str) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::Block;
+    use crate::diag::Severity;
+    use crate::span::SourceMap;
+    use crate::{lexer, parser};
 
     #[test]
     fn converts_toml_frontmatter_cleanly() {
@@ -1939,9 +1971,9 @@ mod tests {
     fn converted_toml_frontmatter_round_trips_through_compiler() {
         let md = "+++\ntitle = \"hi\"\n+++\n\n# Doc\n";
         let res = convert(md, "in.md");
-        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
-        let toks = crate::lexer::lex(&src).expect("lex ok");
-        let (doc, diags) = crate::parser::parse(toks, &src);
+        let src = SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = lexer::lex(&src).expect("lex ok");
+        let (doc, diags) = parser::parse(toks, &src);
         assert!(diags.is_empty(), "{:?}\n---\n{}", diags, res.brief_source);
         assert!(doc.metadata.is_some());
     }
@@ -1953,12 +1985,12 @@ mod tests {
         // closes, producing B0204 + B0207 in Brief.
         let md = "*patch exceeds ~10 ops, any value exceeds ~50 lines*\n";
         let res = convert(md, "in.md");
-        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
-        let toks = crate::lexer::lex(&src).expect("lex ok");
-        let (_doc, diags) = crate::parser::parse(toks, &src);
+        let src = SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = lexer::lex(&src).expect("lex ok");
+        let (_doc, diags) = parser::parse(toks, &src);
         let errors: Vec<_> = diags
             .iter()
-            .filter(|d| d.severity == crate::diag::Severity::Error)
+            .filter(|d| d.severity == Severity::Error)
             .collect();
         assert!(
             errors.is_empty(),
@@ -1973,12 +2005,12 @@ mod tests {
         // Production report pattern #2: `### 8.6 Set an attribute (href, aria-*, …)`.
         let md = "### 8.6 Set an attribute (href, aria-*, …)\n";
         let res = convert(md, "in.md");
-        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
-        let toks = crate::lexer::lex(&src).expect("lex ok");
-        let (_doc, diags) = crate::parser::parse(toks, &src);
+        let src = SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = lexer::lex(&src).expect("lex ok");
+        let (_doc, diags) = parser::parse(toks, &src);
         let errors: Vec<_> = diags
             .iter()
-            .filter(|d| d.severity == crate::diag::Severity::Error)
+            .filter(|d| d.severity == Severity::Error)
             .collect();
         assert!(
             errors.is_empty(),
@@ -1997,12 +2029,12 @@ mod tests {
     fn empty_blockquote_line_splits_into_adjacent_quotes() {
         let md = "> first paragraph\n> still first\n>\n> second paragraph\n";
         let res = convert(md, "in.md");
-        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
-        let toks = crate::lexer::lex(&src).expect("lex ok");
-        let (doc, diags) = crate::parser::parse(toks, &src);
+        let src = SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = lexer::lex(&src).expect("lex ok");
+        let (doc, diags) = parser::parse(toks, &src);
         let errors: Vec<_> = diags
             .iter()
-            .filter(|d| d.severity == crate::diag::Severity::Error)
+            .filter(|d| d.severity == Severity::Error)
             .collect();
         assert!(
             errors.is_empty(),
@@ -2020,7 +2052,7 @@ mod tests {
         let blockquote_count = doc
             .blocks
             .iter()
-            .filter(|b| matches!(b, crate::ast::Block::Blockquote { .. }))
+            .filter(|b| matches!(b, Block::Blockquote { .. }))
             .count();
         assert_eq!(
             blockquote_count, 2,
@@ -2034,12 +2066,12 @@ mod tests {
         // Production report pattern #4.
         let md = "| Kind | Example |\n| --- | --- |\n| separator | \"semantic\"\\|\"utility\" |\n";
         let res = convert(md, "in.md");
-        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
-        let toks = crate::lexer::lex(&src).expect("lex ok");
-        let (_doc, diags) = crate::parser::parse(toks, &src);
+        let src = SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = lexer::lex(&src).expect("lex ok");
+        let (_doc, diags) = parser::parse(toks, &src);
         let errors: Vec<_> = diags
             .iter()
-            .filter(|d| d.severity == crate::diag::Severity::Error)
+            .filter(|d| d.severity == Severity::Error)
             .collect();
         assert!(
             errors.is_empty(),
@@ -2059,12 +2091,12 @@ mod tests {
         // Production report pattern #5.
         let md = "| Value | Type | Note |\n| --- | --- | --- |\n| true/false | Boolean |  |\n";
         let res = convert(md, "in.md");
-        let src = crate::span::SourceMap::new("in.brf", res.brief_source.clone());
-        let toks = crate::lexer::lex(&src).expect("lex ok");
-        let (_doc, diags) = crate::parser::parse(toks, &src);
+        let src = SourceMap::new("in.brf", res.brief_source.clone());
+        let toks = lexer::lex(&src).expect("lex ok");
+        let (_doc, diags) = parser::parse(toks, &src);
         let errors: Vec<_> = diags
             .iter()
-            .filter(|d| d.severity == crate::diag::Severity::Error)
+            .filter(|d| d.severity == Severity::Error)
             .collect();
         assert!(
             errors.is_empty(),

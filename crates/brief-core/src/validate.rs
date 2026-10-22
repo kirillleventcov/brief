@@ -1,27 +1,30 @@
+//! Whole-document checks that run after parsing: heading level steps,
+//! duplicate heading ids and same-page `#fragment` links.
+
 use crate::ast::{Block, Document, Inline};
 use crate::diag::{Code, Diagnostic};
-use crate::slug::Heading;
+use crate::slug::{self, Heading};
 use crate::span::{SourceMap, Span};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub struct ValidateOpts {
+/// Options for [`validate`].
+#[derive(Clone, Debug, Default)]
+pub struct ValidateOptions {
+    /// Report B0503 when a heading is more than one level deeper than the
+    /// previous top-level heading.
     pub strict_heading_levels: bool,
 }
 
-impl Default for ValidateOpts {
-    fn default() -> Self {
-        ValidateOpts {
-            strict_heading_levels: false,
-        }
-    }
-}
-
-pub fn validate(doc: &Document, opts: &ValidateOpts, src: &SourceMap) -> Vec<Diagnostic> {
+/// Runs every document-level check on `doc` and returns the diagnostics.
+/// `src` is the source `doc` was parsed from, used for line numbers in
+/// messages.
+#[must_use]
+pub fn validate(doc: &Document, opts: &ValidateOptions, src: &SourceMap) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     if opts.strict_heading_levels {
         check_heading_monotonic(doc, &mut diags);
     }
-    let headings = crate::slug::headings(doc);
+    let headings = slug::headings(doc);
     check_duplicate_ids(&headings, src, &mut diags);
     check_fragment_links(&headings, doc, &mut diags);
     diags
@@ -50,7 +53,7 @@ fn check_duplicate_ids(headings: &[Heading], src: &SourceMap, diags: &mut Vec<Di
     let mut seen: BTreeMap<&str, Span> = BTreeMap::new();
     for h in headings {
         if let Some(first_span) = seen.get(h.id.as_str()) {
-            let (first_line, _) = src.line_col(first_span.start);
+            let first_line = src.line_column(first_span.start).line;
             diags.push(
                 Diagnostic::new(Code::DuplicateHeadingAnchor, h.span)
                     .label(format!(
@@ -93,7 +96,7 @@ fn check_fragment_links(headings: &[Heading], doc: &Document, diags: &mut Vec<Di
         if fragment_resolves(frag, ids) {
             return;
         }
-        let slug = crate::slug::slugify(frag);
+        let slug = slug::slugify(frag);
         let help = if ids.contains(slug.as_str()) {
             format!("did you mean `#{}`?", slug)
         } else if ids.is_empty() {
@@ -166,11 +169,11 @@ fn walk_block_inlines(block: &Block, f: &mut impl FnMut(&Inline)) {
             }
         }
         Block::Table { header, rows, .. } => {
-            for cell in header
+            let cells = header
                 .cells
                 .iter()
-                .chain(rows.iter().flat_map(|r| &r.cells))
-            {
+                .chain(rows.iter().flat_map(|r| &r.cells));
+            for cell in cells {
                 walk_inlines(cell, f);
             }
         }
@@ -203,17 +206,19 @@ fn walk_inlines(nodes: &[Inline], f: &mut impl FnMut(&Inline)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shortcode::Registry;
+    use crate::{lexer, parser, resolve};
 
     /// Parse, resolve (so link URLs are bound to `url`) and validate.
     fn check(input: &str) -> Vec<Diagnostic> {
         let src = SourceMap::new("t.brf", input);
-        let tokens = crate::lexer::lex(&src).expect("lex");
-        let (mut doc, diags) = crate::parser::parse(tokens, &src);
+        let tokens = lexer::lex(&src).expect("lex");
+        let (mut doc, diags) = parser::parse(tokens, &src);
         assert!(diags.is_empty(), "{:?}", diags);
-        let reg = crate::shortcode::Registry::with_builtins();
-        let diags = crate::resolve::resolve(&mut doc, &reg);
+        let reg = Registry::with_builtins();
+        let diags = resolve::resolve(&mut doc, &reg);
         assert!(diags.is_empty(), "{:?}", diags);
-        validate(&doc, &ValidateOpts::default(), &src)
+        validate(&doc, &ValidateOptions::default(), &src)
     }
 
     fn summary(diags: &[Diagnostic]) -> Vec<(Code, Span, &str, &str)> {
@@ -395,9 +400,9 @@ mod tests {
     fn unresolved_links_are_checked_too() {
         // brief-web validates before resolving, while the URL is positional.
         let src = SourceMap::new("t.brf", "# Doc\n\n@link[a](#nope)\n");
-        let tokens = crate::lexer::lex(&src).expect("lex");
-        let (doc, _) = crate::parser::parse(tokens, &src);
-        let codes: Vec<Code> = validate(&doc, &ValidateOpts::default(), &src)
+        let tokens = lexer::lex(&src).expect("lex");
+        let (doc, _) = parser::parse(tokens, &src);
+        let codes: Vec<Code> = validate(&doc, &ValidateOptions::default(), &src)
             .iter()
             .map(|d| d.code)
             .collect();

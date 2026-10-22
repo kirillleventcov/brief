@@ -3,9 +3,10 @@
 //! These exercise the binary via `std::process::Command`. Per-test temp dirs
 //! keep artifacts isolated.
 
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::str;
 
 fn brief_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_brief"))
@@ -18,10 +19,12 @@ fn fmt_in(cwd: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(cwd)
         .output()
-        .unwrap()
+        .expect("run brief fmt")
 }
 
 fn fmt_stdin(args: &[&str], input: &str) -> Output {
+    use std::io::Write as _;
+
     let mut child = Command::new(brief_bin())
         .arg("fmt")
         .args(args)
@@ -29,33 +32,37 @@ fn fmt_stdin(args: &[&str], input: &str) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
+        .expect("spawn brief fmt");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("stdin is piped")
         .write_all(input.as_bytes())
-        .unwrap();
-    child.wait_with_output().unwrap()
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for brief fmt")
 }
 
 fn write(path: &Path, contents: &str) {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
+        fs::create_dir_all(parent).expect("create parent dirs");
     }
-    std::fs::write(path, contents).unwrap();
+    fs::write(path, contents).expect("write test file");
 }
 
 fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap()
+    fs::read_to_string(path).expect("read test file")
 }
 
 fn stdout(out: &Output) -> String {
-    String::from_utf8(out.stdout.clone()).unwrap()
+    str::from_utf8(&out.stdout)
+        .expect("stdout is UTF-8")
+        .to_owned()
 }
 
 fn stderr(out: &Output) -> String {
-    String::from_utf8(out.stderr.clone()).unwrap()
+    str::from_utf8(&out.stderr)
+        .expect("stderr is UTF-8")
+        .to_owned()
 }
 
 const DIRTY: &str = "hello   \n\n\nworld\n";
@@ -96,36 +103,39 @@ fn summary_counts_reformatted_and_unchanged_files() {
 #[test]
 fn unchanged_file_is_not_rewritten() {
     use std::os::unix::fs::MetadataExt;
+
     let td = tempfile::tempdir().unwrap();
     let doc = td.path().join("doc.brf");
     write(&doc, CLEAN);
-    let before = std::fs::metadata(&doc).unwrap().ino();
+    let before = fs::metadata(&doc).unwrap().ino();
     let out = fmt_in(td.path(), &["doc.brf"]);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         stderr(&out),
         "brief: 0 files reformatted, 1 file unchanged\n"
     );
-    assert_eq!(std::fs::metadata(&doc).unwrap().ino(), before);
+    assert_eq!(fs::metadata(&doc).unwrap().ino(), before);
 }
 
 #[cfg(unix)]
 #[test]
 fn rewrite_replaces_file_atomically_and_keeps_permissions() {
+    use std::fs::Permissions;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     let td = tempfile::tempdir().unwrap();
     let doc = td.path().join("doc.brf");
     write(&doc, DIRTY);
-    std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o640)).unwrap();
-    let before = std::fs::metadata(&doc).unwrap().ino();
+    fs::set_permissions(&doc, Permissions::from_mode(0o640)).unwrap();
+    let before = fs::metadata(&doc).unwrap().ino();
     let out = fmt_in(td.path(), &["doc.brf"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
-    let meta = std::fs::metadata(&doc).unwrap();
+    let meta = fs::metadata(&doc).unwrap();
     // A new inode means a renamed temp file, not an in-place truncation.
     assert_ne!(meta.ino(), before);
     assert_eq!(meta.permissions().mode() & 0o777, 0o640);
     assert_eq!(read(&doc), CLEAN);
-    let entries: Vec<_> = std::fs::read_dir(td.path())
+    let entries: Vec<_> = fs::read_dir(td.path())
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
@@ -135,14 +145,16 @@ fn rewrite_replaces_file_atomically_and_keeps_permissions() {
 #[cfg(unix)]
 #[test]
 fn rewrite_through_symlink_keeps_the_link() {
+    use std::os::unix::fs as unix_fs;
+
     let td = tempfile::tempdir().unwrap();
     let real = td.path().join("real.brf");
     let link = td.path().join("link.brf");
     write(&real, DIRTY);
-    std::os::unix::fs::symlink(&real, &link).unwrap();
+    unix_fs::symlink(&real, &link).unwrap();
     let out = fmt_in(td.path(), &["link.brf"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
-    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
     assert_eq!(read(&real), CLEAN);
 }
 
@@ -411,7 +423,7 @@ fn formatter_is_idempotent_on_real_repo_doc() {
     // The flagship doc shipped with the repo should round-trip through the
     // formatter without any further change after the first pass. This is
     // the broadest "real input" smoke test we can run.
-    let learn = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let learn = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("LearnXinYminutes.brf");
     let td = tempfile::tempdir().unwrap();

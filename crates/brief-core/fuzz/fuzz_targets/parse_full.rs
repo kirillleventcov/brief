@@ -1,13 +1,12 @@
 #![no_main]
 
 use brief::ast::{Block, Inline};
+use brief::diag;
 use brief::emit::{html, llm};
-use brief::lexer;
-use brief::parser;
-use brief::resolve;
 use brief::shortcode::Registry;
 use brief::span::{SourceMap, Span};
-use brief::validate::{self, ValidateOpts};
+use brief::validate::{self, ValidateOptions};
+use brief::{lexer, parser, resolve};
 use libfuzzer_sys::fuzz_target;
 
 /// Every span must slice the source cleanly: in bounds, both ends on char
@@ -42,6 +41,8 @@ fn check_inlines(src: &str, seq: &[Inline]) {
                     check_inlines(src, c);
                 }
             }
+            // `Inline` is non-exhaustive; new variants need a case above.
+            _ => {}
         }
     }
 }
@@ -85,6 +86,8 @@ fn check_blocks(src: &str, blocks: &[Block]) {
                     check_inlines(src, &it.definition);
                 }
             }
+            // `Block` is non-exhaustive; new variants need a case above.
+            _ => {}
         }
     }
 }
@@ -112,15 +115,15 @@ fuzz_target!(|data: &[u8]| {
     let (mut doc, mut diags) = parser::parse(tokens, &src);
     let registry = Registry::with_builtins();
     diags.extend(resolve::resolve(&mut doc, &registry));
-    diags.extend(validate::validate(&doc, &ValidateOpts::default(), &src));
+    diags.extend(validate::validate(&doc, &ValidateOptions::default(), &src));
     check_blocks(input, &doc.blocks);
     for d in &diags {
         check(input, d.span);
     }
-    let _ = brief::diag::render_all(&diags, &src);
+    let _ = diag::render_all(&diags, &src);
 
     // Emitters must not panic on any well-typed AST the parser produces, even
     // for inputs that produced diagnostics — diagnostics are non-fatal.
     let _ = html::render(&doc, &registry);
-    let _ = llm::render(&doc, &registry, &llm::Opts::default());
+    let _ = llm::render(&doc, &registry, &llm::Options::default());
 });

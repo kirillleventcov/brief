@@ -4,15 +4,17 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use brief::inline;
+
 fn bench(name: &str, line: &str) {
     const N: usize = 200_000;
     // warmup
     for _ in 0..1000 {
-        black_box(brief::inline::parse_inline(black_box(line), 0));
+        black_box(inline::parse_inline(black_box(line), 0));
     }
     let t = Instant::now();
     for _ in 0..N {
-        black_box(brief::inline::parse_inline(black_box(line), 0));
+        black_box(inline::parse_inline(black_box(line), 0));
     }
     let per = t.elapsed().as_secs_f64() / N as f64;
     println!(

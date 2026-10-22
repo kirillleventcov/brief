@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use tempfile::TempDir;
 
 fn brief_bin() -> &'static str {
     env!("CARGO_BIN_EXE_brief")
@@ -10,14 +11,14 @@ fn brief_bin() -> &'static str {
 
 fn write(p: &Path, content: &str) {
     if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent).unwrap();
+        fs::create_dir_all(parent).expect("create parent dirs");
     }
-    fs::write(p, content).unwrap();
+    fs::write(p, content).expect("write test file");
 }
 
 #[test]
 fn project_compile_resolves_valid_ref_to_html() {
-    let td = tempfile::TempDir::new().unwrap();
+    let td = TempDir::new().unwrap();
     let root = td.path();
     write(&root.join("brief.toml"), "");
     write(&root.join("a.brf"), "# Top {#top}\n\nbody.\n");
@@ -44,7 +45,7 @@ fn project_compile_resolves_valid_ref_to_html() {
 
 #[test]
 fn project_compile_links_relative_to_the_compiled_file() {
-    let td = tempfile::TempDir::new().unwrap();
+    let td = TempDir::new().unwrap();
     let root = td.path();
     write(&root.join("brief.toml"), "");
     write(&root.join("guide.brf"), "# Guide\n\n## Install Steps\n");
@@ -77,7 +78,7 @@ fn project_compile_links_relative_to_the_compiled_file() {
 
 #[test]
 fn project_compile_reports_missing_anchor() {
-    let td = tempfile::TempDir::new().unwrap();
+    let td = TempDir::new().unwrap();
     let root = td.path();
     write(&root.join("brief.toml"), "");
     write(&root.join("a.brf"), "# A {#real}\n");
@@ -96,7 +97,7 @@ fn project_compile_reports_missing_anchor() {
 
 #[test]
 fn ref_outside_project_is_b0604() {
-    let td = tempfile::TempDir::new().unwrap();
+    let td = TempDir::new().unwrap();
     let root = td.path();
     // No brief.toml.
     write(&root.join("lonely.brf"), "@ref[other.brf](X)\n");
@@ -113,7 +114,7 @@ fn ref_outside_project_is_b0604() {
 
 #[test]
 fn prepass_errors_render_against_their_own_source() {
-    let td = tempfile::TempDir::new().unwrap();
+    let td = TempDir::new().unwrap();
     let root = td.path().canonicalize().unwrap();
     write(&root.join("brief.toml"), "");
     // a.brf has a parse error: a heading with too many '#'
@@ -172,7 +173,7 @@ fn explain_b0604_mentions_brief_toml() {
 
 #[test]
 fn adding_brief_toml_makes_ref_valid() {
-    let td = tempfile::TempDir::new().unwrap();
+    let td = TempDir::new().unwrap();
     let root = td.path();
     write(&root.join("a.brf"), "# A {#x}\n");
     write(&root.join("b.brf"), "@ref[a.brf#x](X)\n");

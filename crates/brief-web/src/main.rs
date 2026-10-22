@@ -3,24 +3,22 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use brief_web::scaffold::ScaffoldOpts;
+use brief_web::scaffold::ScaffoldOptions;
 use brief_web::server::{ReloadBroadcaster, ReloadEvent, ServerOptions};
-use brief_web::watch::{default_watch_paths, watch};
-use brief_web::{BuildError, BuildOutcome, Builder, scaffold, server};
+use brief_web::{BuildError, BuildOutcome, Builder, scaffold, server, watch};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
 
 #[derive(Parser)]
 #[command(name = "brief-web", version, about = "Static-site generator for Brief")]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    command: Command,
 }
 
 #[derive(Subcommand)]
-enum Cmd {
+enum Command {
     /// Scaffold a new brief-web project.
     Init {
         /// Target directory (defaults to current directory).
@@ -64,13 +62,13 @@ enum Cmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.cmd {
-        Cmd::Init { path, multi, force } => init(path, multi, force),
-        Cmd::Build {
+    match cli.command {
+        Command::Init { path, multi, force } => init(path, multi, force),
+        Command::Build {
             path,
             deny_warnings,
         } => build(path, deny_warnings),
-        Cmd::Serve {
+        Command::Serve {
             path,
             host,
             port,
@@ -81,13 +79,11 @@ fn main() -> ExitCode {
 }
 
 fn init(path: PathBuf, multi: bool, force: bool) -> ExitCode {
-    match scaffold::create(
-        &path,
-        &ScaffoldOpts {
-            multi_page: multi,
-            force,
-        },
-    ) {
+    let options = ScaffoldOptions {
+        multi_page: multi,
+        force,
+    };
+    match scaffold::create(&path, &options) {
         Ok(()) => {
             eprintln!(
                 "brief-web: scaffolded project at {}{}",
@@ -105,7 +101,7 @@ fn init(path: PathBuf, multi: bool, force: bool) -> ExitCode {
 }
 
 fn build(path: PathBuf, deny_warnings: bool) -> ExitCode {
-    let mut builder = match Builder::new(&path) {
+    let mut builder = match Builder::try_new(&path) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("brief-web: {}", e);
@@ -151,7 +147,7 @@ fn serve(
     no_watch: bool,
     deny_warnings: bool,
 ) -> ExitCode {
-    let mut builder = match Builder::new(&path) {
+    let mut builder = match Builder::try_new(&path) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("brief-web: {}", e);
@@ -181,41 +177,46 @@ fn serve(
     let out_root = builder.out_dir();
     let bcast = ReloadBroadcaster::new();
 
-    if !no_watch {
-        let shared = Arc::new(Mutex::new(builder.clone()));
-        let project_dir = builder.project_dir.clone();
+    // Held for the full server lifetime: dropping it stops the watcher.
+    let _watch_handles = if no_watch {
+        None
+    } else {
         let src_dir = builder.src_dir();
         let theme_dir = builder.theme_dir();
-        let watch_paths = default_watch_paths(&project_dir, &src_dir, theme_dir.as_deref());
+        let watch_paths =
+            watch::default_watch_paths(&builder.project_dir, &src_dir, theme_dir.as_deref());
         let bcast_for_watch = bcast.clone();
-        let handles = watch(&watch_paths, move || {
-            let b = shared.lock().unwrap();
-            match b.build() {
-                Ok(o) => {
-                    print_warnings(&o);
-                    eprintln!("brief-web: rebuilt {} pages", o.pages_built);
-                    bcast_for_watch.broadcast(ReloadEvent::Reload);
-                }
-                // The builder writes nothing until every page is clean, so
-                // the server keeps serving the last good output.
-                Err(e) => {
-                    print_report(&e);
-                    eprintln!("brief-web: rebuild failed: {}", e.message);
-                    bcast_for_watch.broadcast(ReloadEvent::BuildError(e.message));
-                }
+        // Only the watcher's debounce thread rebuilds, so it owns the builder.
+        let started = watch::watch(&watch_paths, move || match builder.build() {
+            Ok(o) => {
+                print_warnings(&o);
+                eprintln!("brief-web: rebuilt {} pages", o.pages_built);
+                bcast_for_watch.broadcast(ReloadEvent::Reload);
+            }
+            // The builder writes nothing until every page is clean, so
+            // the server keeps serving the last good output.
+            Err(e) => {
+                print_report(&e);
+                eprintln!("brief-web: rebuild failed: {}", e.message);
+                bcast_for_watch.broadcast(ReloadEvent::BuildError(e.message));
             }
         });
-        // Hold the watcher alive for the full server lifetime.
-        Box::leak(Box::new(handles));
-    }
+        match started {
+            Ok(handles) => Some(handles),
+            Err(e) => {
+                eprintln!("brief-web: cannot start file watcher: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    };
 
-    let opts = ServerOptions {
+    let options = ServerOptions {
         host,
         port,
         root: out_root,
         broadcaster: bcast,
     };
-    if let Err(e) = server::run(opts) {
+    if let Err(e) = server::run(options) {
         eprintln!("brief-web: server error: {}", e);
         return ExitCode::from(1);
     }

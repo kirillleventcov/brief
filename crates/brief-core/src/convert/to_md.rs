@@ -1,43 +1,67 @@
 //! Brief-to-Markdown converter.
 //!
 //! Walks the parsed `Document` and emits GFM-flavoured Markdown. Every Brief
-//! construct that has no clean Markdown equivalent is reported as an `MdDiag`
-//! carrying an `MdHole` code; nothing is silently dropped. Where GFM offers a
+//! construct that has no clean Markdown equivalent is reported as an
+//! `MdDiagnostic` carrying an `MdHole` code; nothing is silently dropped. Where GFM offers a
 //! syntax the Markdown→Brief converter already reads (TOML `+++` frontmatter,
 //! `{#anchor}` heading attributes, `> [!NOTE]` alerts, `term`/`: definition`
 //! lists), that syntax is chosen so a round-trip re-converts cleanly.
 
-use crate::ast::{Block, CodeAttrs, Document, Inline, ShortArgs, TaskState};
+use crate::ast::{Block, CodeAttrs, Document, Inline, ResolvedRef, ShortcodeArgs, TaskState};
 use crate::emit::html::{escape_html_into, expand_template};
 use crate::shortcode::{ArgValue, Registry};
 use crate::span::{SourceMap, Span};
-use std::fmt::Write;
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
+/// Output of [`to_markdown`]: the exported Markdown plus one diagnostic per
+/// Brief construct that had no clean Markdown equivalent.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct MdResult {
+    /// The generated Markdown, ending in exactly one newline (empty when the
+    /// document rendered nothing).
     pub markdown: String,
-    pub diagnostics: Vec<MdDiag>,
+    /// Lossy-conversion reports, in emission order.
+    pub diagnostics: Vec<MdDiagnostic>,
 }
 
+/// One lossy spot found while exporting Brief to Markdown.
 #[derive(Clone, Debug)]
-pub struct MdDiag {
+#[non_exhaustive]
+pub struct MdDiagnostic {
+    /// What kind of information was lost or rewritten.
     pub hole: MdHole,
-    pub line: usize, // 1-indexed
-    pub col: usize,  // 1-indexed
+    /// 1-indexed source line of the offending Brief construct.
+    pub line: usize,
+    /// 1-indexed source column of the offending Brief construct.
+    pub col: usize,
+    /// Human-readable detail specific to this occurrence.
     pub note: String,
 }
 
+/// Kind of Brief construct that has no clean Markdown equivalent.
+///
+/// [`MdHole::slug`] gives a stable machine-readable code and
+/// [`MdHole::message`] a generic description.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum MdHole {
+    /// `+underline+` emitted as inline `<u>` HTML.
     Underline,
+    /// A `//` or `/* */` comment was dropped.
     Comment,
+    /// A custom shortcode was expanded via its HTML template or unwrapped.
     CustomShortcode,
+    /// A code fence attribute (`@nominify`, `@minify`, ...) was dropped.
     CodeAttrs,
+    /// An `@ref` target could not be turned into a Markdown link.
     RefUnresolved,
 }
 
 impl MdHole {
     /// Stable kebab-case slug used in stderr report lines.
+    #[must_use]
     pub fn slug(self) -> &'static str {
         match self {
             MdHole::Underline => "underline-html",
@@ -49,6 +73,7 @@ impl MdHole {
     }
 
     /// Short human-readable label for stderr.
+    #[must_use]
     pub fn message(self) -> &'static str {
         match self {
             MdHole::Underline => "Brief underline `+x+` emitted as inline HTML `<u>`",
@@ -64,13 +89,15 @@ impl MdHole {
 
 /// Convert a parsed (and ideally resolved) Brief document to Markdown.
 ///
-/// `src` is the SourceMap the document was parsed from; it is used to locate
+/// `src` is the `SourceMap` the document was parsed from; it is used to locate
 /// comments (which the parser strips before the AST is built) and to map
 /// spans to line/column pairs for diagnostics. Run the resolver first so
 /// positional shortcode arguments are bound to their keyword slots.
-pub fn to_markdown(doc: &Document, reg: &Registry, src: &SourceMap) -> MdResult {
-    let mut ctx = Ctx {
-        reg,
+/// `registry` supplies `template_html` for custom shortcodes.
+#[must_use]
+pub fn to_markdown(doc: &Document, registry: &Registry, src: &SourceMap) -> MdResult {
+    let mut ctx = Context {
+        registry,
         src,
         resolved_refs: &doc.resolved_refs,
         diags: Vec::new(),
@@ -102,24 +129,24 @@ pub fn to_markdown(doc: &Document, reg: &Registry, src: &SourceMap) -> MdResult 
     }
 }
 
-struct Ctx<'a> {
-    reg: &'a Registry,
-    src: &'a SourceMap,
-    resolved_refs: &'a std::collections::BTreeMap<Span, crate::ast::ResolvedRef>,
-    diags: Vec<MdDiag>,
+struct Context<'doc> {
+    registry: &'doc Registry,
+    src: &'doc SourceMap,
+    resolved_refs: &'doc BTreeMap<Span, ResolvedRef>,
+    diags: Vec<MdDiagnostic>,
     /// Rendered footnote bodies in reference order; emitted as `[^n]:`
     /// definitions at the end of the document.
     footnotes: Vec<String>,
     in_footnote: bool,
 }
 
-impl<'a> Ctx<'a> {
+impl Context<'_> {
     fn hole(&mut self, hole: MdHole, span: Span, note: impl Into<String>) {
-        let (line, col) = self.src.line_col(span.start);
-        self.diags.push(MdDiag {
+        let position = self.src.line_column(span.start);
+        self.diags.push(MdDiagnostic {
             hole,
-            line,
-            col,
+            line: position.line,
+            col: position.column,
             note: note.into(),
         });
     }
@@ -127,7 +154,7 @@ impl<'a> Ctx<'a> {
 
 /// Render a block sequence; blocks are separated by a single blank line.
 /// Each rendered block ends with `\n`, so joining on `\n` yields the blank.
-fn render_blocks(blocks: &[Block], ctx: &mut Ctx) -> String {
+fn render_blocks(blocks: &[Block], ctx: &mut Context) -> String {
     let mut parts: Vec<String> = Vec::new();
     for b in blocks {
         let mut s = String::new();
@@ -139,7 +166,7 @@ fn render_blocks(blocks: &[Block], ctx: &mut Ctx) -> String {
     parts.join("\n")
 }
 
-fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String) {
+fn render_block(b: &Block, ctx: &mut Context, out: &mut String) {
     match b {
         Block::Heading {
             level,
@@ -151,7 +178,7 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String) {
                 out.push('#');
             }
             out.push(' ');
-            render_inline_seq(content, ctx, out, false);
+            render_inline_seq(content, ctx, out, /* raw */ false);
             if let Some(a) = anchor {
                 let _ = write!(out, " {{#{}}}", a);
             }
@@ -161,7 +188,7 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String) {
             if content.is_empty() {
                 return;
             }
-            render_inline_seq(content, ctx, out, false);
+            render_inline_seq(content, ctx, out, /* raw */ false);
             out.push('\n');
         }
         Block::List { ordered, items, .. } => {
@@ -178,7 +205,7 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String) {
                         TaskState::Todo => "[ ] ",
                     });
                 }
-                render_inline_seq(&it.content, ctx, out, false);
+                render_inline_seq(&it.content, ctx, out, /* raw */ false);
                 out.push('\n');
                 let indent = " ".repeat(marker.len());
                 for c in &it.children {
@@ -262,10 +289,10 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String) {
             let mut parts: Vec<String> = Vec::new();
             for it in items {
                 let mut s = String::new();
-                render_inline_seq(&it.term, ctx, &mut s, false);
+                render_inline_seq(&it.term, ctx, &mut s, /* raw */ false);
                 s.push('\n');
                 s.push_str(": ");
-                render_inline_seq(&it.definition, ctx, &mut s, false);
+                render_inline_seq(&it.definition, ctx, &mut s, /* raw */ false);
                 s.push('\n');
                 parts.push(s);
             }
@@ -283,26 +310,26 @@ fn render_block(b: &Block, ctx: &mut Ctx, out: &mut String) {
 
 fn render_block_shortcode(
     name: &str,
-    args: &ShortArgs,
+    args: &ShortcodeArgs,
     children: &[Block],
     span: Span,
-    ctx: &mut Ctx,
+    ctx: &mut Context,
     out: &mut String,
 ) {
-    if let Some(sc) = ctx.reg.get(name) {
-        if let Some(t) = &sc.template_html {
-            let inner = render_blocks(children, ctx);
-            out.push_str(&expand_template(t, args, inner.trim_end()));
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            ctx.hole(
-                MdHole::CustomShortcode,
-                span,
-                format!("`@{}` expanded via its `template_html`", name),
-            );
-            return;
+    if let Some(sc) = ctx.registry.get(name)
+        && let Some(t) = &sc.template_html
+    {
+        let inner = render_blocks(children, ctx);
+        out.push_str(&expand_template(t, args, inner.trim_end()));
+        if !out.ends_with('\n') {
+            out.push('\n');
         }
+        ctx.hole(
+            MdHole::CustomShortcode,
+            span,
+            format!("`@{}` expanded via its `template_html`", name),
+        );
+        return;
     }
     match name {
         "callout" => {
@@ -332,7 +359,7 @@ fn render_block_shortcode(
             let mut body = String::new();
             for c in children {
                 if let Block::Paragraph { content, .. } = c {
-                    render_inline_seq(content, ctx, &mut body, true);
+                    render_inline_seq(content, ctx, &mut body, /* raw */ true);
                     body.push('\n');
                 } else {
                     render_block(c, ctx, &mut body);
@@ -357,11 +384,11 @@ fn render_block_shortcode(
     }
 }
 
-fn render_table_row(cells: &[Vec<Inline>], ctx: &mut Ctx, out: &mut String) {
+fn render_table_row(cells: &[Vec<Inline>], ctx: &mut Context, out: &mut String) {
     out.push('|');
     for cell in cells {
         let mut s = String::new();
-        render_inline_seq(cell, ctx, &mut s, false);
+        render_inline_seq(cell, ctx, &mut s, /* raw */ false);
         let _ = write!(out, " {} |", s.replace('|', "\\|"));
     }
     out.push('\n');
@@ -380,25 +407,23 @@ fn quote_prefix(inner: &str, out: &mut String) {
     }
 }
 
-fn render_inline_seq(seq: &[Inline], ctx: &mut Ctx, out: &mut String, raw: bool) {
+fn render_inline_seq(seq: &[Inline], ctx: &mut Context, out: &mut String, raw: bool) {
     let mut after_break = false;
     for n in seq {
         // The parser joins continuation lines with a space, so the Text
         // that follows a HardBreak carries a leading space; Markdown would
         // render it as indentation, so trim it.
-        if after_break {
-            if let Inline::Text { value, .. } = n {
-                render_text(value.trim_start(), out, raw);
-                after_break = false;
-                continue;
-            }
+        if after_break && let Inline::Text { value, .. } = n {
+            render_text(value.trim_start(), out, raw);
+            after_break = false;
+            continue;
         }
         after_break = matches!(n, Inline::HardBreak { .. });
         render_inline(n, ctx, out, raw);
     }
 }
 
-fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String, raw: bool) {
+fn render_inline(node: &Inline, ctx: &mut Context, out: &mut String, raw: bool) {
     match node {
         Inline::Text { value, .. } => render_text(value, out, raw),
         Inline::HardBreak { .. } => out.push_str("\\\n"),
@@ -439,30 +464,30 @@ fn render_inline(node: &Inline, ctx: &mut Ctx, out: &mut String, raw: bool) {
 
 fn render_inline_shortcode(
     name: &str,
-    args: &ShortArgs,
+    args: &ShortcodeArgs,
     content: Option<&[Inline]>,
     span: Span,
-    ctx: &mut Ctx,
+    ctx: &mut Context,
     out: &mut String,
     raw: bool,
 ) {
-    if let Some(sc) = ctx.reg.get(name) {
-        if let Some(t) = &sc.template_html {
-            let inner = content
-                .map(|c| {
-                    let mut s = String::new();
-                    render_inline_seq(c, ctx, &mut s, raw);
-                    s
-                })
-                .unwrap_or_default();
-            out.push_str(&expand_template(t, args, &inner));
-            ctx.hole(
-                MdHole::CustomShortcode,
-                span,
-                format!("`@{}` expanded via its `template_html`", name),
-            );
-            return;
-        }
+    if let Some(sc) = ctx.registry.get(name)
+        && let Some(t) = &sc.template_html
+    {
+        let inner = content
+            .map(|c| {
+                let mut s = String::new();
+                render_inline_seq(c, ctx, &mut s, raw);
+                s
+            })
+            .unwrap_or_default();
+        out.push_str(&expand_template(t, args, &inner));
+        ctx.hole(
+            MdHole::CustomShortcode,
+            span,
+            format!("`@{}` expanded via its `template_html`", name),
+        );
+        return;
     }
     match name {
         "link" => {
@@ -494,7 +519,7 @@ fn render_inline_shortcode(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             out.push_str("![");
-            render_text(alt, out, false);
+            render_text(alt, out, /* raw */ false);
             out.push_str("](");
             out.push_str(src);
             out.push(')');
@@ -509,7 +534,7 @@ fn render_inline_shortcode(
         "math" => {
             out.push('$');
             if let Some(c) = content {
-                render_inline_seq(c, ctx, out, true);
+                render_inline_seq(c, ctx, out, /* raw */ true);
             }
             out.push('$');
         }
@@ -525,7 +550,7 @@ fn render_inline_shortcode(
             }
             ctx.in_footnote = true;
             let mut body = String::new();
-            render_inline_seq(c, ctx, &mut body, false);
+            render_inline_seq(c, ctx, &mut body, /* raw */ false);
             ctx.in_footnote = false;
             ctx.footnotes.push(body);
             let _ = write!(out, "[^{}]", ctx.footnotes.len());
@@ -552,7 +577,7 @@ fn render_inline_shortcode(
             // when a whole tree is converted in place.
             if let Some(r) = resolved {
                 out.push('[');
-                render_text(&display, out, false);
+                render_text(&display, out, /* raw */ false);
                 out.push_str("](");
                 out.push_str(&r.href("md"));
                 out.push(')');
@@ -578,7 +603,7 @@ fn render_inline_shortcode(
             match path.strip_suffix(".brf") {
                 Some(stem) if !stem.is_empty() => {
                     out.push('[');
-                    render_text(&display, out, false);
+                    render_text(&display, out, /* raw */ false);
                     out.push_str("](");
                     out.push_str(stem);
                     out.push_str(".md");
@@ -589,7 +614,7 @@ fn render_inline_shortcode(
                     out.push(')');
                 }
                 _ => {
-                    render_text(&display, out, false);
+                    render_text(&display, out, /* raw */ false);
                     ctx.hole(
                         MdHole::RefUnresolved,
                         span,
@@ -680,7 +705,7 @@ fn fence_len(body: &str) -> usize {
 /// the emitter never sees them. Re-scan the source with the parser's own
 /// line rules (comments exist only at block position, never inside code
 /// fences or frontmatter) and report each one as dropped.
-fn scan_comments(src: &SourceMap, diags: &mut Vec<MdDiag>) {
+fn scan_comments(src: &SourceMap, diags: &mut Vec<MdDiagnostic>) {
     let mut in_fence = false;
     let mut in_block_comment = false;
     let mut in_frontmatter = false;
@@ -715,7 +740,7 @@ fn scan_comments(src: &SourceMap, diags: &mut Vec<MdDiag>) {
         }
         let col = line.len() - t.len() + 1;
         if t.starts_with("//") {
-            diags.push(MdDiag {
+            diags.push(MdDiagnostic {
                 hole: MdHole::Comment,
                 line: lineno,
                 col,
@@ -724,7 +749,7 @@ fn scan_comments(src: &SourceMap, diags: &mut Vec<MdDiag>) {
             continue;
         }
         if t.starts_with("/*") {
-            diags.push(MdDiag {
+            diags.push(MdDiagnostic {
                 hole: MdHole::Comment,
                 line: lineno,
                 col,

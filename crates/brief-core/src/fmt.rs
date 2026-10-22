@@ -11,15 +11,15 @@
 //! parsed AST.
 
 use crate::ast::Block;
-use crate::lexer;
-use crate::parser;
 use crate::span::SourceMap;
 use crate::token::{Token, TokenKind};
+use crate::{lexer, parser};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+/// Options controlling [`format`] and [`check`].
 #[derive(Debug, Clone, Default)]
-pub struct Opts {
+pub struct Options {
     /// Sort top-level keys of frontmatter alphabetically. Off by default
     /// because re-emitting TOML loses comment positions and is therefore
     /// considered a controversial transform — opt in explicitly.
@@ -41,7 +41,10 @@ enum Kind {
     TableRow { table: usize, row: usize },
 }
 
-pub fn format(source: &str, opts: &Opts) -> String {
+/// Format `source` into canonical Brief and return the result. Never
+/// fails: a source the lexer rejects only has its line endings normalized.
+#[must_use]
+pub fn format(source: &str, opts: &Options) -> String {
     // Strip a leading UTF-8 BOM. fmt produces canonical sources; the BOM
     // is allowed by the lexer but adds no value.
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
@@ -149,10 +152,10 @@ struct Layout {
 }
 
 /// A lexed copy of the source, for mapping parser spans back to lines.
-struct Scan<'a> {
-    src: &'a SourceMap,
-    toks: &'a [Token],
-    line_starts: &'a [usize],
+struct Scan<'src> {
+    src: &'src SourceMap,
+    toks: &'src [Token],
+    line_starts: &'src [usize],
 }
 
 impl Scan<'_> {
@@ -427,13 +430,19 @@ fn render_row(indent: &str, cells: &[&str], widths: &[usize]) -> String {
     out
 }
 
+/// Whether [`format`] would rewrite a source. Two-state by nature, so it is
+/// deliberately exhaustive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckResult {
+    /// The source is already canonically formatted.
     Unchanged,
+    /// Formatting would modify the source.
     WouldChange,
 }
 
-pub fn check(source: &str, opts: &Opts) -> CheckResult {
+/// Report whether formatting `source` with `opts` would change it.
+#[must_use]
+pub fn check(source: &str, opts: &Options) -> CheckResult {
     if format(source, opts) == source {
         CheckResult::Unchanged
     } else {
@@ -446,7 +455,7 @@ mod tests {
     use super::*;
 
     fn fmt(s: &str) -> String {
-        format(s, &Opts::default())
+        format(s, &Options::default())
     }
 
     #[test]
@@ -558,7 +567,7 @@ mod tests {
 
     #[test]
     fn frontmatter_sort_when_opted_in() {
-        let opts = Opts {
+        let opts = Options {
             sort_frontmatter: true,
         };
         let src = "+++\nz = 1\na = 2\n+++\n# Doc\n";
@@ -575,7 +584,7 @@ mod tests {
 
     #[test]
     fn frontmatter_with_invalid_toml_unchanged_body() {
-        let opts = Opts {
+        let opts = Options {
             sort_frontmatter: true,
         };
         let src = "+++\nfoo === 1\n+++\n";
@@ -644,7 +653,7 @@ mod tests {
 
     #[test]
     fn idempotent_with_sort_frontmatter() {
-        let opts = Opts {
+        let opts = Options {
             sort_frontmatter: true,
         };
         let src = "+++\nz = 1\na = 2\nm = \"x\"\n+++\nbody\n";
@@ -656,13 +665,13 @@ mod tests {
     #[test]
     fn check_returns_unchanged_for_canonical_input() {
         let src = "hello\n";
-        assert_eq!(check(src, &Opts::default()), CheckResult::Unchanged);
+        assert_eq!(check(src, &Options::default()), CheckResult::Unchanged);
     }
 
     #[test]
     fn check_returns_would_change_for_dirty_input() {
         let src = "hello   \n";
-        assert_eq!(check(src, &Opts::default()), CheckResult::WouldChange);
+        assert_eq!(check(src, &Options::default()), CheckResult::WouldChange);
     }
 
     #[test]

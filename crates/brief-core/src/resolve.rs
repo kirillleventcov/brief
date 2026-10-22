@@ -1,12 +1,24 @@
-use crate::ast::{Block, Document, Inline};
+//! Shortcode resolution: checks every shortcode invocation against the
+//! [`Registry`], binds positional arguments, rewrites deprecated aliases,
+//! and resolves cross-document `@ref` targets against a project index.
+
+use crate::ast::{Block, Document, Inline, ResolvedRef, ShortcodeArgs};
 use crate::diag::{Code, Diagnostic};
 use crate::project::ProjectIndex;
-use crate::shortcode::{ArgType, ArgValue, Registry, ShortKindOpt, Shortcode};
+use crate::shortcode::{ArgType, ArgValue, Registry, Shortcode, ShortcodeKind};
+use crate::slug;
 use crate::span::Span;
+use std::collections::BTreeMap;
+use std::path::{Component, Path};
 
-pub struct ResolveProject<'a> {
-    pub index: &'a ProjectIndex,
-    pub current: &'a std::path::Path,
+/// Project context for resolving `@ref` invocations: the index of every
+/// document under the project root and the path of the document being
+/// resolved.
+pub struct ResolveProject<'project> {
+    /// Anchors and compile status of every indexed document.
+    pub index: &'project ProjectIndex,
+    /// Project-relative path of the document being resolved.
+    pub current: &'project Path,
 }
 
 /// Resolve without project context. Equivalent to
@@ -16,6 +28,10 @@ pub fn resolve(doc: &mut Document, registry: &Registry) -> Vec<Diagnostic> {
     resolve_with_project(doc, registry, None)
 }
 
+/// Validate every shortcode in `doc` against `registry` and, when `project`
+/// is given, resolve `@ref` targets into [`Document::resolved_refs`].
+/// Returns the diagnostics produced; `doc` is rewritten in place
+/// (positional arguments bound, deprecated aliases canonicalized).
 pub fn resolve_with_project(
     doc: &mut Document,
     registry: &Registry,
@@ -25,7 +41,7 @@ pub fn resolve_with_project(
     for block in &mut doc.blocks {
         resolve_block(block, registry, &mut diags);
     }
-    let mut resolved = std::collections::BTreeMap::new();
+    let mut resolved = BTreeMap::new();
     for block in &doc.blocks {
         scan_refs_block(block, project, &mut diags, &mut resolved);
     }
@@ -37,7 +53,7 @@ fn scan_refs_block(
     block: &Block,
     project: Option<&ResolveProject<'_>>,
     diags: &mut Vec<Diagnostic>,
-    out: &mut std::collections::BTreeMap<crate::span::Span, crate::ast::ResolvedRef>,
+    out: &mut BTreeMap<Span, ResolvedRef>,
 ) {
     match block {
         Block::Heading { content, .. } | Block::Paragraph { content, .. } => {
@@ -89,12 +105,11 @@ fn scan_refs_block(
 }
 
 fn scan_refs_inline(
-    node: &crate::ast::Inline,
+    node: &Inline,
     project: Option<&ResolveProject<'_>>,
     diags: &mut Vec<Diagnostic>,
-    out: &mut std::collections::BTreeMap<crate::span::Span, crate::ast::ResolvedRef>,
+    out: &mut BTreeMap<Span, ResolvedRef>,
 ) {
-    use crate::ast::Inline;
     match node {
         Inline::Bold { content, .. }
         | Inline::Italic { content, .. }
@@ -117,7 +132,7 @@ fn scan_refs_inline(
                 Some(p) => p,
                 None => {
                     diags.push(
-                        Diagnostic::new(crate::diag::Code::RefNoProject, *span)
+                        Diagnostic::new(Code::RefNoProject, *span)
                             .label("`@ref` requires a `brief.toml`-rooted project")
                             .help("create a `brief.toml` at the project root to enable cross-document references"),
                     );
@@ -130,7 +145,7 @@ fn scan_refs_inline(
                 Some([]) | None => None,
                 _ => {
                     diags.push(
-                        Diagnostic::new(crate::diag::Code::RefBadTarget, *span)
+                        Diagnostic::new(Code::RefBadTarget, *span)
                             .label("@ref body must be a plain path; emphasis and nested shortcodes are not allowed"),
                     );
                     return;
@@ -138,8 +153,7 @@ fn scan_refs_inline(
             };
             let Some(body_text) = body_text else {
                 diags.push(
-                    Diagnostic::new(crate::diag::Code::RefBadTarget, *span)
-                        .label("@ref body cannot be empty"),
+                    Diagnostic::new(Code::RefBadTarget, *span).label("@ref body cannot be empty"),
                 );
                 return;
             };
@@ -154,9 +168,7 @@ fn scan_refs_inline(
             //  string so downstream emitters don't blow up.)
             match parse_target(&body_text) {
                 Err(reason) => {
-                    diags.push(
-                        Diagnostic::new(crate::diag::Code::RefBadTarget, *span).label(reason),
-                    );
+                    diags.push(Diagnostic::new(Code::RefBadTarget, *span).label(reason));
                 }
                 Ok((path, anchor)) => match project.index.anchors.get(&path) {
                     // A target that does not compile has untrustworthy
@@ -182,7 +194,7 @@ fn scan_refs_inline(
                             .collect::<Vec<_>>()
                             .join(", ");
                         diags.push(
-                            Diagnostic::new(crate::diag::Code::RefMissingFile, *span)
+                            Diagnostic::new(Code::RefMissingFile, *span)
                                 .label(format!("file `{}` not found in project", path))
                                 .help(if suggestion.is_empty() {
                                     "no `.brf` files were indexed under this project root"
@@ -205,7 +217,7 @@ fn scan_refs_inline(
                                 .collect::<Vec<_>>()
                                 .join(", ");
                             diags.push(
-                                Diagnostic::new(crate::diag::Code::RefMissingAnchor, *span)
+                                Diagnostic::new(Code::RefMissingAnchor, *span)
                                     .label(format!("anchor `{}` not found in `{}`", a, path))
                                     .help(if listed.is_empty() {
                                         format!("`{}` defines no anchors", path)
@@ -219,7 +231,7 @@ fn scan_refs_inline(
                         let relative_path = (current != path).then(|| relative_to(&current, &path));
                         out.insert(
                             *span,
-                            crate::ast::ResolvedRef {
+                            ResolvedRef {
                                 target_path: path.clone(),
                                 target_anchor: anchor,
                                 display,
@@ -241,16 +253,16 @@ fn scan_refs_inline(
     }
 }
 
-fn is_current(current: &std::path::Path, path: &str) -> bool {
+fn is_current(current: &Path, path: &str) -> bool {
     path_key(current) == path
 }
 
 /// `current` in the forward-slash form `ProjectIndex` keys use. A leading
 /// `./` is dropped so it cannot defeat the comparison.
-fn path_key(current: &std::path::Path) -> String {
+fn path_key(current: &Path) -> String {
     let mut cur = String::new();
     for c in current.components() {
-        if let std::path::Component::CurDir = c {
+        if let Component::CurDir = c {
             continue;
         }
         if !cur.is_empty() {
@@ -315,9 +327,9 @@ fn parse_target(s: &str) -> Result<(String, Option<String>), String> {
             if a.is_empty() {
                 return Err("@ref anchor after `#` cannot be empty".to_string());
             }
-            if !crate::slug::is_heading_id(a) {
+            if !slug::is_heading_id(a) {
                 let rule = "heading ids are lowercase letters, digits, `-` and `_`";
-                let slug = crate::slug::slugify(a);
+                let slug = slug::slugify(a);
                 return Err(if slug.is_empty() {
                     format!("invalid anchor `{}`; {}", a, rule)
                 } else {
@@ -362,7 +374,7 @@ fn resolve_block(block: &mut Block, reg: &Registry, diags: &mut Vec<Diagnostic>)
             rows,
             span,
         } => {
-            check_shortcode("t", args, reg, true, *span, diags);
+            check_shortcode("t", args, reg, /* is_block */ true, *span, diags);
             for cell in &mut header.cells {
                 for n in cell {
                     resolve_inline(n, reg, diags);
@@ -392,7 +404,7 @@ fn resolve_block(block: &mut Block, reg: &Registry, diags: &mut Vec<Diagnostic>)
             children,
             span,
         } => {
-            check_shortcode(name, args, reg, true, *span, diags);
+            check_shortcode(name, args, reg, /* is_block */ true, *span, diags);
             for c in children {
                 resolve_block(c, reg, diags);
             }
@@ -416,7 +428,7 @@ fn resolve_inline(node: &mut Inline, reg: &Registry, diags: &mut Vec<Diagnostic>
             content,
             span,
         } => {
-            check_shortcode(name, args, reg, false, *span, diags);
+            check_shortcode(name, args, reg, /* is_block */ false, *span, diags);
             if let Some(c) = content {
                 for n in c {
                     resolve_inline(n, reg, diags);
@@ -429,7 +441,7 @@ fn resolve_inline(node: &mut Inline, reg: &Registry, diags: &mut Vec<Diagnostic>
 
 fn check_shortcode(
     name: &str,
-    args: &mut crate::ast::ShortArgs,
+    args: &mut ShortcodeArgs,
     reg: &Registry,
     is_block: bool,
     span: Span,
@@ -458,7 +470,7 @@ fn check_shortcode(
     };
     let form_ok = matches!(
         (&sc.kind, is_block),
-        (ShortKindOpt::Block, true) | (ShortKindOpt::Inline, false) | (ShortKindOpt::Both, _)
+        (ShortcodeKind::Block, true) | (ShortcodeKind::Inline, false) | (ShortcodeKind::Both, _)
     );
     if !form_ok {
         diags.push(Diagnostic::new(Code::FormMismatch, span).label(format!(
@@ -471,26 +483,24 @@ fn check_shortcode(
 
     // Deprecation alias rewrite for @callout(kind:).
     // Must run before the oneof check so the canonical value passes validation.
-    if name == "callout" {
-        if let Some(v) = args.keyword.get("kind") {
-            if let Some(s) = v.as_str() {
-                let (canonical, label_msg): (Option<&str>, Option<&str>) = match s {
-                    "info" => (
-                        Some("note"),
-                        Some("`kind: info` is deprecated; use `kind: note`"),
-                    ),
-                    "danger" => (
-                        Some("caution"),
-                        Some("`kind: danger` is deprecated; use `kind: caution`"),
-                    ),
-                    _ => (None, None),
-                };
-                if let (Some(canonical), Some(msg)) = (canonical, label_msg) {
-                    diags.push(Diagnostic::warning(Code::DeprecatedCalloutKind, span).label(msg));
-                    args.keyword
-                        .insert("kind".into(), ArgValue::Str(canonical.into()));
-                }
-            }
+    if name == "callout"
+        && let Some(s) = args.keyword.get("kind").and_then(|v| v.as_str())
+    {
+        let (canonical, label_msg): (Option<&str>, Option<&str>) = match s {
+            "info" => (
+                Some("note"),
+                Some("`kind: info` is deprecated; use `kind: note`"),
+            ),
+            "danger" => (
+                Some("caution"),
+                Some("`kind: danger` is deprecated; use `kind: caution`"),
+            ),
+            _ => (None, None),
+        };
+        if let (Some(canonical), Some(msg)) = (canonical, label_msg) {
+            diags.push(Diagnostic::warning(Code::DeprecatedCalloutKind, span).label(msg));
+            args.keyword
+                .insert("kind".into(), ArgValue::Str(canonical.into()));
         }
     }
 
@@ -503,16 +513,15 @@ fn check_shortcode(
                     .label(format!("missing required argument `{}` for `{}`", kw, name)),
             );
         }
-        if let (Some(allowed), Some(v)) = (&spec.oneof, args.keyword.get(kw)) {
-            if let Some(s) = v.as_str() {
-                if !allowed.iter().any(|a| a == s) {
-                    diags.push(Diagnostic::new(Code::BadEnumValue, span).label(format!(
-                        "`{}` is not in {{{}}}",
-                        s,
-                        allowed.join(", ")
-                    )));
-                }
-            }
+        if let (Some(allowed), Some(v)) = (&spec.oneof, args.keyword.get(kw))
+            && let Some(s) = v.as_str()
+            && !allowed.iter().any(|a| a == s)
+        {
+            diags.push(Diagnostic::new(Code::BadEnumValue, span).label(format!(
+                "`{}` is not in {{{}}}",
+                s,
+                allowed.join(", ")
+            )));
         }
     }
     check_url_arg(name, args, span, diags);
@@ -527,12 +536,7 @@ fn url_arg(name: &str) -> Option<&'static str> {
     }
 }
 
-fn check_url_arg(
-    name: &str,
-    args: &crate::ast::ShortArgs,
-    span: Span,
-    diags: &mut Vec<Diagnostic>,
-) {
+fn check_url_arg(name: &str, args: &ShortcodeArgs, span: Span, diags: &mut Vec<Diagnostic>) {
     let Some(kw) = url_arg(name) else { return };
     let Some(url) = args.keyword.get(kw).and_then(|v| v.as_str()) else {
         return;
@@ -555,12 +559,11 @@ fn check_url_arg(
 /// done the way browsers parse: leading whitespace and control characters
 /// are skipped, and control characters inside the scheme are ignored, so
 /// ` JaVa\tScRiPt:` is caught as `javascript`.
+#[must_use]
 pub fn disallowed_scheme(url: &str) -> Option<String> {
     let mut scheme = String::new();
-    for c in url
-        .trim_start_matches(|c: char| c.is_whitespace() || c.is_control())
-        .chars()
-    {
+    let trimmed = url.trim_start_matches(|c: char| c.is_whitespace() || c.is_control());
+    for c in trimmed.chars() {
         match c {
             ':' if !scheme.is_empty() => {
                 return (!matches!(scheme.as_str(), "http" | "https" | "mailto")).then_some(scheme);
@@ -576,7 +579,7 @@ pub fn disallowed_scheme(url: &str) -> Option<String> {
 
 fn bind_positional(
     sc: &Shortcode,
-    args: &mut crate::ast::ShortArgs,
+    args: &mut ShortcodeArgs,
     span: Span,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -595,12 +598,7 @@ fn bind_positional(
     }
 }
 
-fn typecheck_args(
-    sc: &Shortcode,
-    args: &crate::ast::ShortArgs,
-    span: Span,
-    diags: &mut Vec<Diagnostic>,
-) {
+fn typecheck_args(sc: &Shortcode, args: &ShortcodeArgs, span: Span, diags: &mut Vec<Diagnostic>) {
     for (kw, v) in &args.keyword {
         let Some(spec) = sc.arguments.get(kw) else {
             let mut d = Diagnostic::new(Code::UnknownArg, span)
@@ -642,7 +640,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn parse_only(src: &str) -> crate::ast::Document {
-        use crate::{lexer, parser, span::SourceMap};
+        use crate::span::SourceMap;
+        use crate::{lexer, parser};
         let src = SourceMap::new("t.brf", src);
         let tokens = lexer::lex(&src).expect("lex");
         let (doc, _) = parser::parse(tokens, &src);

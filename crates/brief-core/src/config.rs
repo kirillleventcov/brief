@@ -1,8 +1,16 @@
+//! `brief.toml`: the per-project configuration every tool loads.
+//!
+//! These are options structs: each implements `Default` (the value an
+//! absent key takes), so code building one by hand can name only the fields
+//! it cares about and fill the rest with `..Default::default()`.
+
 use crate::shortcode::{Registry, Shortcode};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 
+/// A parsed `brief.toml`.
 // Every config struct carries `deny_unknown_fields`: a typoed or
 // unsupported key must be a load error, not a silent no-op — the same
 // strictness the language itself promises.
@@ -13,10 +21,12 @@ pub struct Config {
     pub project: Project,
     #[serde(default)]
     pub compile: Compile,
+    /// User-defined shortcodes, keyed by name; they extend the built-ins.
     #[serde(default)]
     pub shortcodes: BTreeMap<String, Shortcode>,
 }
 
+/// The `[project]` table: descriptive metadata only.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Project {
@@ -26,17 +36,22 @@ pub struct Project {
     pub version: String,
 }
 
+/// The `[compile]` table: options that change what a compile produces.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Compile {
+    /// Report a heading that skips a level (`#` straight to `###`).
     #[serde(default)]
     pub strict_heading_levels: bool,
+    /// Target used when the command line names none: `html`, `llm` or
+    /// `json`.
     #[serde(default)]
     pub default_target: Option<String>,
     #[serde(default)]
     pub llm: LlmCompile,
 }
 
+/// The `[compile.llm]` table: how the LLM target treats code blocks.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LlmCompile {
@@ -97,13 +112,22 @@ fn default_preserve_code_fences() -> bool {
     true
 }
 
+/// Read and parse the config file at `path`.
+///
+/// # Errors
+///
+/// Returns the I/O or TOML error, rendered as a string, when the file
+/// cannot be read or is not a valid `brief.toml` (unknown keys included).
 pub fn load(path: &Path) -> Result<Config, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
     toml::from_str(&text).map_err(|e| e.to_string())
 }
 
-pub fn registry_from(cfg: &Config) -> Registry {
-    let mut reg = Registry::with_builtins();
-    reg.extend(cfg.shortcodes.clone());
-    reg
+/// The shortcode registry `config` defines: the built-ins plus every
+/// shortcode declared under `[shortcodes]`.
+#[must_use]
+pub fn registry_from(config: &Config) -> Registry {
+    let mut registry = Registry::with_builtins();
+    registry.extend(config.shortcodes.clone());
+    registry
 }

@@ -10,25 +10,40 @@
 //! - String prefixes: `L"…"`, `u8"…"`, `u"…"`, `U"…"` (wide / UTF
 //!   literals).
 //! - C++ raw strings `R"delim(…)delim"` (and prefixed forms like
-//!   `LR"delim(…)delim"`, `u8R"…"`, etc.) — only when `is_cpp` is true.
+//!   `LR"delim(…)delim"`, `u8R"…"`, etc.) — only in [`Dialect::Cpp`].
 //! - Block comments do **not** nest.
 //!
 //! Strategy: aggressive (Strategy A) **between** preprocessor lines.
 //! Around `#`-lines we still emit a leading and trailing newline.
 //!
-//! `is_cpp` toggles the C++-only features (raw strings). For C tags
-//! (`c`, `h`) it's false; for C++ tags (`cpp`, `c++`, `cc`, `cxx`,
-//! `hpp`, `hxx`) it's true.
+//! [`Dialect`] toggles the C++-only features (raw strings). C tags (`c`,
+//! `h`) use [`Dialect::C`]; C++ tags (`cpp`, `c++`, `cc`, `cxx`, `hpp`,
+//! `hxx`) use [`Dialect::Cpp`].
 
-use super::c_common::{Token, TokenKind, safe_block_comment};
+use super::c_common::{self, Token, TokenKind};
 use super::{MinifyError, MinifyOptions, MinifyOutput, MinifyWarning};
 
+/// Source language accepted by [`minify`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Dialect {
+    /// C: no raw string literals.
+    C,
+    /// C++: additionally recognizes raw string literals (`R"delim(…)delim"`).
+    Cpp,
+}
+
+/// Minify C or C++ source, depending on `dialect`.
+///
+/// # Errors
+///
+/// Returns [`MinifyError`] on unterminated comments, string/char literals,
+/// or malformed raw strings.
 pub fn minify(
     source: &str,
     opts: &MinifyOptions,
-    is_cpp: bool,
+    dialect: Dialect,
 ) -> Result<MinifyOutput, MinifyError> {
-    let toks = tokenize(source, is_cpp)?;
+    let toks = tokenize(source, dialect == Dialect::Cpp)?;
     emit(&toks, opts.keep_comments)
 }
 
@@ -145,7 +160,7 @@ fn tokenize(src: &str, is_cpp: bool) -> Result<Vec<Token<'_>>, MinifyError> {
             i += n;
             continue;
         }
-        let n = scan_multi_punct(bytes, i);
+        let n = scan_multi_punct(src, i);
         out.push(Token::new(TokenKind::Punct(&src[i..i + n])));
         i += n;
     }
@@ -173,7 +188,7 @@ fn emit(tokens: &[Token<'_>], keep_comments: bool) -> Result<MinifyOutput, Minif
                 if !keep_comments {
                     continue;
                 }
-                let block = safe_block_comment(body);
+                let block = c_common::safe_block_comment(body);
                 push_with_space(&mut out, &mut prev_emit_last, &block);
                 warnings.push(MinifyWarning::LineCommentConverted);
             }
@@ -181,7 +196,7 @@ fn emit(tokens: &[Token<'_>], keep_comments: bool) -> Result<MinifyOutput, Minif
                 if !keep_comments {
                     continue;
                 }
-                let block = safe_block_comment(body);
+                let block = c_common::safe_block_comment(body);
                 push_with_space(&mut out, &mut prev_emit_last, &block);
             }
             TokenKind::Word(s)
@@ -205,23 +220,18 @@ fn emit(tokens: &[Token<'_>], keep_comments: bool) -> Result<MinifyOutput, Minif
     if last_was_preproc && !out.ends_with('\n') {
         out.push('\n');
     }
-    Ok(MinifyOutput {
-        body: out,
-        warnings,
-    })
+    Ok(MinifyOutput::new(out, warnings))
 }
 
 fn push_with_space(out: &mut String, prev_emit_last: &mut Option<char>, s: &str) {
     if s.is_empty() {
         return;
     }
-    use super::c_common::needs_space;
-    if let Some(prev) = *prev_emit_last {
-        if let Some(next) = s.chars().next() {
-            if needs_space(prev, next) {
-                out.push(' ');
-            }
-        }
+    if let Some(prev) = *prev_emit_last
+        && let Some(next) = s.chars().next()
+        && c_common::needs_space(prev, next)
+    {
+        out.push(' ');
     }
     out.push_str(s);
     *prev_emit_last = s.chars().next_back();
@@ -273,13 +283,13 @@ fn try_scan_string(src: &str, i: usize, is_cpp: bool) -> Result<Option<usize>, M
             if k >= bytes.len() {
                 return Err(MinifyError::new("unterminated raw string"));
             }
-            if bytes[k] == b')' && k + 1 + delim.len() < bytes.len() {
-                if &bytes[k + 1..k + 1 + delim.len()] == delim
-                    && bytes.get(k + 1 + delim.len()) == Some(&b'"')
-                {
-                    let total = k + 1 + delim.len() + 1 - i;
-                    return Ok(Some(total));
-                }
+            if bytes[k] == b')'
+                && k + 1 + delim.len() < bytes.len()
+                && &bytes[k + 1..k + 1 + delim.len()] == delim
+                && bytes.get(k + 1 + delim.len()) == Some(&b'"')
+            {
+                let total = k + 1 + delim.len() + 1 - i;
+                return Ok(Some(total));
             }
             k += 1;
         }
@@ -356,15 +366,9 @@ fn scan_word(src: &str, i: usize) -> usize {
     j - i
 }
 
-fn scan_multi_punct(bytes: &[u8], i: usize) -> usize {
-    let three = bytes
-        .get(i..i + 3)
-        .map(|s| std::str::from_utf8(s).unwrap_or(""))
-        .unwrap_or("");
-    let two = bytes
-        .get(i..i + 2)
-        .map(|s| std::str::from_utf8(s).unwrap_or(""))
-        .unwrap_or("");
+fn scan_multi_punct(src: &str, i: usize) -> usize {
+    let three = src.get(i..i + 3).unwrap_or("");
+    let two = src.get(i..i + 2).unwrap_or("");
     if matches!(three, "<<=" | ">>=" | "..." | "->*") {
         return 3;
     }
@@ -393,7 +397,7 @@ fn scan_multi_punct(bytes: &[u8], i: usize) -> usize {
     ) {
         return 2;
     }
-    let c = char_at(unsafe { std::str::from_utf8_unchecked(bytes) }, i);
+    let c = char_at(src, i);
     c.len_utf8()
 }
 
@@ -410,10 +414,14 @@ mod tests {
     use super::*;
 
     fn min_c(s: &str) -> String {
-        minify(s, &MinifyOptions::default(), false).unwrap().body
+        minify(s, &MinifyOptions::default(), Dialect::C)
+            .unwrap()
+            .body
     }
     fn min_cpp(s: &str) -> String {
-        minify(s, &MinifyOptions::default(), true).unwrap().body
+        minify(s, &MinifyOptions::default(), Dialect::Cpp)
+            .unwrap()
+            .body
     }
 
     #[test]
@@ -527,7 +535,7 @@ mod tests {
             &MinifyOptions {
                 keep_comments: true,
             },
-            false,
+            Dialect::C,
         )
         .unwrap();
         assert!(r.body.starts_with("/* hi*/"));
@@ -556,7 +564,7 @@ mod tests {
             &MinifyOptions {
                 keep_comments: true,
             },
-            false,
+            Dialect::C,
         )
         .unwrap();
         let after_comment = r.body.split("*/").nth(1).unwrap_or("");
@@ -569,11 +577,11 @@ mod tests {
 
     #[test]
     fn c_unterminated_block_comment() {
-        assert!(minify("/* unterminated", &MinifyOptions::default(), false).is_err());
+        assert!(minify("/* unterminated", &MinifyOptions::default(), Dialect::C).is_err());
     }
 
     #[test]
     fn c_unterminated_string() {
-        assert!(minify("char* s = \"oops", &MinifyOptions::default(), false).is_err());
+        assert!(minify("char* s = \"oops", &MinifyOptions::default(), Dialect::C).is_err());
     }
 }

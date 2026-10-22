@@ -1,26 +1,31 @@
-use brief::diag::{Code, Diagnostic, Severity, render_all};
+use brief::diag::{self, Code, Diagnostic, Severity};
 use brief::emit::{html, llm};
-use brief::lexer::lex;
-use brief::parser::parse;
-use brief::resolve::resolve;
+use brief::lexer;
+use brief::parser;
+use brief::resolve;
 use brief::shortcode::Registry;
 use brief::span::SourceMap;
-use brief::validate::{ValidateOpts, validate};
+use brief::validate::{self, ValidateOptions};
 
 fn compile(input: &str) -> (String, Vec<Code>) {
     let reg = Registry::with_builtins();
-    let opts = ValidateOpts::default();
+    let opts = ValidateOptions::default();
     let src = SourceMap::new("t.brf", input);
-    let tokens = match lex(&src) {
+    let tokens = match lexer::lex(&src) {
         Ok(t) => t,
-        Err(d) => return (render_all(&d, &src), d.iter().map(|x| x.code).collect()),
+        Err(d) => {
+            return (
+                diag::render_all(&d, &src),
+                d.iter().map(|x| x.code).collect(),
+            );
+        }
     };
-    let (mut doc, mut diags) = parse(tokens, &src);
-    diags.extend(resolve(&mut doc, &reg));
-    diags.extend(validate(&doc, &opts, &src));
+    let (mut doc, mut diags) = parser::parse(tokens, &src);
+    diags.extend(resolve::resolve(&mut doc, &reg));
+    diags.extend(validate::validate(&doc, &opts, &src));
     if !diags.is_empty() {
         return (
-            render_all(&diags, &src),
+            diag::render_all(&diags, &src),
             diags.iter().map(|x| x.code).collect(),
         );
     }
@@ -70,13 +75,13 @@ fn t_12_7_llm_token_reduction() {
     let brief_src = "## Quarterly Results\n\nThe team delivered *strong* numbers this quarter, with *revenue* up 23%.\n\n@t\n| Region | Q3 | Q4\n| EMEA | 1.2M | 1.5M\n";
     let md_equivalent = "## Quarterly Results\n\nThe team delivered **strong** numbers this quarter, with **revenue** up 23%.\n\n| Region | Q3   | Q4   |\n|--------|------|------|\n| EMEA   | 1.2M | 1.5M |\n";
     let src = SourceMap::new("t.brf", brief_src);
-    let tokens = lex(&src).unwrap();
-    let (mut doc, diags) = parse(tokens, &src);
+    let tokens = lexer::lex(&src).unwrap();
+    let (mut doc, diags) = parser::parse(tokens, &src);
     assert!(diags.is_empty(), "{:?}", diags);
     let reg = Registry::with_builtins();
-    let r = resolve(&mut doc, &reg);
+    let r = resolve::resolve(&mut doc, &reg);
     assert!(r.is_empty(), "{:?}", r);
-    let (llm_out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
+    let llm_out = llm::render(&doc, &reg, &llm::Options::default()).text;
     assert!(
         llm_out.chars().count() < md_equivalent.chars().count(),
         "brief llm ({}) should be shorter than markdown ({}):\n--- brief ---\n{}\n--- md ---\n{}",
@@ -164,9 +169,9 @@ fn block_comment_stripped() {
 #[test]
 fn explain_runs() {
     // Sanity: the Code enum knows how to format codes.
-    assert_eq!(Code::HeadingTooDeep.as_str(), "B0301");
-    assert_eq!(Code::EmphasisSameMarker.as_str(), "B0204");
-    assert_eq!(Code::OrderedListSequence.as_str(), "B0501");
+    assert_eq!(Code::HeadingTooDeep.to_string(), "B0301");
+    assert_eq!(Code::EmphasisSameMarker.to_string(), "B0204");
+    assert_eq!(Code::OrderedListSequence.to_string(), "B0501");
 }
 
 #[test]
@@ -268,13 +273,13 @@ fn footnote_html_renders_inline_emphasis_in_body() {
 fn footnote_llm_uses_pandoc_style() {
     let brief_src = "First.@footnote[a]\n\nSecond.@footnote[b]\n";
     let src = SourceMap::new("t.brf", brief_src);
-    let tokens = lex(&src).unwrap();
-    let (mut doc, diags) = parse(tokens, &src);
+    let tokens = lexer::lex(&src).unwrap();
+    let (mut doc, diags) = parser::parse(tokens, &src);
     assert!(diags.is_empty(), "{:?}", diags);
     let reg = Registry::with_builtins();
-    let r = resolve(&mut doc, &reg);
+    let r = resolve::resolve(&mut doc, &reg);
     assert!(r.is_empty(), "{:?}", r);
-    let (out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
+    let out = llm::render(&doc, &reg, &llm::Options::default()).text;
     assert!(out.contains("First.[^1]"), "{}", out);
     assert!(out.contains("Second.[^2]"), "{}", out);
     assert!(out.contains("[^1]: a"), "{}", out);
@@ -318,14 +323,13 @@ fn footnote_nested_in_body_not_double_numbered() {
 
 fn render_llm(input: &str) -> String {
     let src = SourceMap::new("t.brf", input);
-    let toks = lex(&src).unwrap();
-    let (mut doc, diags) = parse(toks, &src);
+    let toks = lexer::lex(&src).expect("lex test input");
+    let (mut doc, diags) = parser::parse(toks, &src);
     assert!(diags.is_empty(), "{:?}", diags);
     let reg = Registry::with_builtins();
-    let r = resolve(&mut doc, &reg);
+    let r = resolve::resolve(&mut doc, &reg);
     assert!(r.is_empty(), "{:?}", r);
-    let (out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
-    out
+    llm::render(&doc, &reg, &llm::Options::default()).text
 }
 
 #[test]
@@ -614,18 +618,18 @@ fn task_list_ordered_double_space_is_plain_text() {
 /// Helper that returns (html, all_diags) without short-circuiting on warnings.
 fn compile_with_diags(input: &str) -> (String, Vec<Diagnostic>) {
     let reg = Registry::with_builtins();
-    let opts = ValidateOpts::default();
+    let opts = ValidateOptions::default();
     let src = SourceMap::new("t.brf", input);
-    let tokens = match lex(&src) {
+    let tokens = match lexer::lex(&src) {
         Ok(t) => t,
-        Err(d) => return (render_all(&d, &src), d),
+        Err(d) => return (diag::render_all(&d, &src), d),
     };
-    let (mut doc, mut diags) = parse(tokens, &src);
-    diags.extend(resolve(&mut doc, &reg));
-    diags.extend(validate(&doc, &opts, &src));
+    let (mut doc, mut diags) = parser::parse(tokens, &src);
+    diags.extend(resolve::resolve(&mut doc, &reg));
+    diags.extend(validate::validate(&doc, &opts, &src));
     let has_errors = diags.iter().any(|d| d.severity == Severity::Error);
     if has_errors {
-        return (render_all(&diags, &src), diags);
+        return (diag::render_all(&diags, &src), diags);
     }
     (html::render(&doc, &reg), diags)
 }
@@ -647,13 +651,13 @@ fn link_title_llm() {
         "t.brf",
         "see @link(title: \"alt text\")[here](https://x.example)\n",
     );
-    let toks = lex(&src).unwrap();
-    let (mut doc, diags) = parse(toks, &src);
+    let toks = lexer::lex(&src).expect("lex test input");
+    let (mut doc, diags) = parser::parse(toks, &src);
     assert!(diags.is_empty(), "{:?}", diags);
     let reg = Registry::with_builtins();
-    let r = resolve(&mut doc, &reg);
+    let r = resolve::resolve(&mut doc, &reg);
     assert!(r.is_empty(), "{:?}", r);
-    let (out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
+    let out = llm::render(&doc, &reg, &llm::Options::default()).text;
     assert!(
         out.contains("[here](https://x.example \"alt text\")"),
         "{}",
@@ -742,16 +746,16 @@ fn callout_kind_info_deprecated_emits_warning_and_rewrites() {
 #[test]
 fn callout_kind_info_llm_shows_note() {
     let src = SourceMap::new("t.brf", "@callout(kind: info)\nbody\n@end\n");
-    let toks = lex(&src).unwrap();
-    let (mut doc, diags) = parse(toks, &src);
+    let toks = lexer::lex(&src).expect("lex test input");
+    let (mut doc, diags) = parser::parse(toks, &src);
     assert!(diags.is_empty(), "{:?}", diags);
     let reg = Registry::with_builtins();
-    let r = resolve(&mut doc, &reg);
+    let r = resolve::resolve(&mut doc, &reg);
     // Should have exactly one warning (DeprecatedCalloutKind)
     assert_eq!(r.len(), 1, "expected one warning: {:?}", r);
     assert_eq!(r[0].code, Code::DeprecatedCalloutKind);
     assert_eq!(r[0].severity, Severity::Warning);
-    let (out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
+    let out = llm::render(&doc, &reg, &llm::Options::default()).text;
     assert!(out.contains("[!note]"), "expected [!note]: {}", out);
 }
 
@@ -774,12 +778,12 @@ fn callout_kind_danger_deprecated_emits_warning_and_rewrites_to_caution() {
 
 #[test]
 fn callout_deprecated_kind_warning_in_resolve() {
-    // Unit test: resolve() returns the warning Diagnostic with Severity::Warning.
+    // Unit test: resolve::resolve() returns the warning Diagnostic with Severity::Warning.
     let src = SourceMap::new("t.brf", "@callout(kind: info)\nbody\n@end\n");
-    let toks = lex(&src).unwrap();
-    let (mut doc, _parse_diags) = parse(toks, &src);
+    let toks = lexer::lex(&src).unwrap();
+    let (mut doc, _parse_diags) = parser::parse(toks, &src);
     let reg = Registry::with_builtins();
-    let diags = resolve(&mut doc, &reg);
+    let diags = resolve::resolve(&mut doc, &reg);
     let warn = diags.iter().find(|d| d.code == Code::DeprecatedCalloutKind);
     assert!(
         warn.is_some(),
@@ -792,11 +796,11 @@ fn callout_deprecated_kind_warning_in_resolve() {
 // --- 4.5 Heading anchors ---------------------------------------------------
 
 fn parse_doc(input: &str) -> (brief::ast::Document, Vec<brief::Diagnostic>) {
-    use brief::lexer::lex;
-    use brief::parser::parse;
+    use brief::lexer;
+    use brief::parser;
     let src = SourceMap::new("t.brf", input);
-    let toks = lex(&src).unwrap();
-    parse(toks, &src)
+    let toks = lexer::lex(&src).expect("lex test input");
+    parser::parse(toks, &src)
 }
 
 /// Test 1: valid anchor — AST, HTML, LLM.
@@ -948,14 +952,15 @@ fn llm_table_escapes_pipes_in_cells() {
     // separator into the flattened LLM table.
     let brief_src = "@t\n| a | b\n| x \\| y | `c|d`\n";
     let src = SourceMap::new("t.brf", brief_src);
-    let tokens = lex(&src).unwrap();
-    let (mut doc, diags) = parse(tokens, &src);
+    let tokens = lexer::lex(&src).unwrap();
+    let (mut doc, diags) = parser::parse(tokens, &src);
     assert!(diags.is_empty(), "{:?}", diags);
     let reg = Registry::with_builtins();
-    let r = resolve(&mut doc, &reg);
+    let r = resolve::resolve(&mut doc, &reg);
     assert!(r.is_empty(), "{:?}", r);
-    let (out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
-    for line in out.lines().filter(|l| l.starts_with('|')) {
+    let out = llm::render(&doc, &reg, &llm::Options::default()).text;
+    let table_rows = out.lines().filter(|l| l.starts_with('|'));
+    for line in table_rows {
         let unescaped = line.replace("\\|", "");
         assert_eq!(
             unescaped.matches('|').count(),
@@ -983,11 +988,11 @@ fn math_renders_verbatim_tex_escaped_once() {
     );
 
     let src = SourceMap::new("t.brf", input);
-    let (mut doc, diags) = parse(lex(&src).unwrap(), &src);
+    let (mut doc, diags) = parser::parse(lexer::lex(&src).unwrap(), &src);
     assert!(diags.is_empty(), "{:?}", diags);
     let reg = Registry::with_builtins();
-    assert!(resolve(&mut doc, &reg).is_empty());
-    let (out, _w) = llm::render(&doc, &reg, &llm::Opts::default());
+    assert!(resolve::resolve(&mut doc, &reg).is_empty());
+    let out = llm::render(&doc, &reg, &llm::Options::default()).text;
     assert!(out.contains("Energy $\\frac{a}{b} < c$."), "{}", out);
     assert!(
         out.contains("$$\\sum_{i=1}^{n} i < n^2\n\\\\ x_1$$\n"),

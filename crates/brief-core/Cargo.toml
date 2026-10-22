@@ -32,3 +32,6 @@ tempfile = "3"
 [lib]
 name = "brief"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

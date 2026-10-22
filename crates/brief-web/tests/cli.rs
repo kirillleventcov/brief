@@ -7,9 +7,9 @@ use std::process::{Command, Output};
 
 fn write(p: &Path, content: &str) {
     if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent).unwrap();
+        fs::create_dir_all(parent).expect("create test project directory");
     }
-    fs::write(p, content).unwrap();
+    fs::write(p, content).expect("write test project file");
 }
 
 fn build(project: &Path, extra: &[&str]) -> Output {
@@ -18,7 +18,7 @@ fn build(project: &Path, extra: &[&str]) -> Output {
         .arg(project)
         .args(extra)
         .output()
-        .unwrap()
+        .expect("run the brief-web binary")
 }
 
 #[test]
