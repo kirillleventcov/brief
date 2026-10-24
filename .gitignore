@@ -1,5 +1,8 @@
 /target
 docs/dist/
 examples/**/dist/
+examples/blog/
+examples/home/
 zed-extension/
 tree-sitter-brief
+
