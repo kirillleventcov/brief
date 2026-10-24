@@ -84,7 +84,7 @@ formatter handles this for you.
 Unordered list items can carry a task-state marker as their first content:
 
 ```brief
-- [x] ship v0.4
+- [x] ship v0.5
 - [ ] write release notes
 - plain bullet, not a task
 ```

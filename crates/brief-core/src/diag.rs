@@ -281,7 +281,7 @@ impl Code {
                 "Frontmatter content must be valid TOML. Brief deliberately uses TOML (not YAML) to match `brief.toml`. Fix the TOML syntax in the `+++ ... +++` block."
             }
             UnknownCodeAttribute => {
-                "Code-fence attributes are `@`-prefixed identifiers after the language tag (e.g. ```json @nominify). v0.4 recognizes `@nominify`, `@minify`, and `@minify-keep-comments`. Anything else is a compile error so typos are caught early."
+                "Code-fence attributes are `@`-prefixed identifiers after the language tag (e.g. ```json @nominify). v0.5 recognizes `@nominify`, `@minify`, and `@minify-keep-comments`. Anything else is a compile error so typos are caught early."
             }
             ConflictingCodeAttributes => {
                 "`@nominify` and `@minify` (or `@minify-keep-comments`) are mutually exclusive: one says \"never minify this block\" and the other says \"always minify this block.\" Drop one."

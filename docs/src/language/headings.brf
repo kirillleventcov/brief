@@ -42,10 +42,10 @@ text the way GitHub does it: lowercased, with every character that is not
 a letter, digit, space, `-` or `_` removed, and spaces turned into `-`.
 
 ```brief
-## What's *new* in 0.4
+## What's *new* in 0.5
 ```
 
-gets the id `whats-new-in-04`. A heading whose text leaves nothing behind
+gets the id `whats-new-in-05`. A heading whose text leaves nothing behind
 (only punctuation, say) gets the id `section`.
 
 To pin an id so links survive edits to the heading text, end the line

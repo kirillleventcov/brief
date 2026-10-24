@@ -63,10 +63,10 @@ A self-contained example showing most of what Brief offers:
 ```brief
 # Release notes
 
-The 0.4 release ships *strict* lists, _italic_ that doesn't fight you,
+The 0.5 release ships *strict* lists, _italic_ that doesn't fight you,
 and a real compiler.
 
-- [x] ship v0.4
+- [x] ship v0.5
 - [ ] write release notes
 - plain bullet, not a task
 

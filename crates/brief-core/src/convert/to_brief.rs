@@ -117,7 +117,7 @@ impl Hole {
         match self {
             Hole::SetextHeading => "setext heading rewritten to ATX",
             Hole::DefinitionListMultipleDefs => {
-                "definition list term repeated for each of multiple Markdown definitions (Brief v0.4 limitation)"
+                "definition list term repeated for each of multiple Markdown definitions (Brief v0.5 limitation)"
             }
             Hole::DoubleEmphasis => "doubled emphasis marker rewritten to single",
             Hole::EscapedSigil => {
@@ -1159,7 +1159,7 @@ impl<'src> Walker<'src> {
                     self.push_diag(
                         Hole::DefinitionListMultipleDefs,
                         range,
-                        "definition list term repeated for each definition (Brief v0.4 limitation)"
+                        "definition list term repeated for each definition (Brief v0.5 limitation)"
                             .into(),
                     );
                 }
